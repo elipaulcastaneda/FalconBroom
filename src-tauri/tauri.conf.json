@@ -1,0 +1,10 @@
+{
+  "build": {"beforeDevCommand": "", "beforeBuildCommand": ""},
+  "package": {"productName": "FalconBroom UI", "version": "0.1.0"},
+  "tauri": {
+    "allowlist": {"http": {"all": true}, "fs": {"all": true}, "dialog": {"all": true}},
+    "bundle": {"active": true, "resources": ["py", "python_app"]},
+    "devPath": "http://127.0.0.1:5173",
+    "updater": {"active": false}
+  }
+}

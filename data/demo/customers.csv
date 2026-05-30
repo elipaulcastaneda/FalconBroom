@@ -1,0 +1,6 @@
+id,first_name,last_name,email,age,phone
+1,Alice,Smith,alice.smith@example.com,34,555-0100
+2,Bob,Jones,bob.jones@example.com,,555-0150
+3,Charlie,Brown,charlie.brown@example.com,28,
+4,Denise,White,denise.white@example.com,45,555-0199
+5,Ed,Green,ed.green@example.com,28,555-0100

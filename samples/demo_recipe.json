@@ -1,0 +1,9 @@
+{
+  "sources": [{"path": "data/demo/customers.csv"}],
+  "cleaning_steps": [
+    {"action": "impute", "column": "age", "params": {"strategy": "median"}},
+    {"action": "impute", "column": "phone", "params": {"strategy": "empty_string"}},
+    {"action": "normalize", "column": "email", "params": {}}
+  ],
+  "outputs": [{"path": "data/output/customers_cleaned.csv"}]
+}

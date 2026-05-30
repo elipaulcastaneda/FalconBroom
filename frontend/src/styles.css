@@ -1,0 +1,7 @@
+body{font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:12px}
+.container{max-width:1000px;margin:0 auto}
+input, textarea{width:100%;padding:8px;margin:6px 0;border:1px solid #ddd;border-radius:4px}
+pre{background:#f7f7fb;padding:8px;border-radius:6px;overflow:auto}
+.buttons{display:flex;gap:8px}
+.preview{display:flex;gap:12px}
+.preview > div{flex:1}

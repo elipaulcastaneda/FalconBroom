@@ -1,0 +1,16 @@
+fastapi>=0.95
+uvicorn[standard]>=0.22
+polars>=0.18
+# NOTE: On bleeding-edge Python versions (e.g. 3.14) some native wheels
+# may not yet be available on PyPI. We try a newer pre-release duckdb
+# wheel here — if it exists for your platform it may install. If not,
+# see README.md for recommended Python versions or use the pip flags
+# suggested below to prefer binary wheels or allow pre-releases.
+duckdb==1.6.0.dev12
+pydantic>=1.10
+python-dotenv>=1.0
+
+# Recommended pip invocation when using Python 3.14 (tries pre-releases
+# and prefers binary wheels when available):
+# python -m pip install --upgrade pip
+# python -m pip install --pre --prefer-binary -r requirements.txt
