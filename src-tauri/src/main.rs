@@ -4,7 +4,6 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use tauri::{Manager, State};
 
 struct BackendChild(Arc<Mutex<Option<Child>>>);
 
@@ -26,73 +25,58 @@ impl Drop for BackendChild {
     }
 }
 
-fn resource_dir() -> Option<PathBuf> {
-    tauri::api::path::resource_dir()
+fn project_root() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let src_tauri = cwd.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    if src_tauri.eq_ignore_ascii_case("src-tauri") {
+        return cwd.parent().map(|p| p.to_path_buf());
+    }
+
+    let mut candidate = cwd.clone();
+    candidate.push("src-tauri");
+    if candidate.exists() {
+        return Some(cwd);
+    }
+
+    None
 }
 
-fn find_bundled_python() -> Option<PathBuf> {
-    // Look for `resource_dir()/py` venv
-    resource_dir().and_then(|mut p| {
-        p.push("py");
-        if cfg!(target_os = "windows") {
-            p.push("Scripts");
-            p.push("python.exe");
-            if p.exists() {
-                return Some(p);
-            }
-        } else {
-            let mut p2 = p.clone();
-            p2.push("bin");
-            p2.push("python3");
-            if p2.exists() {
-                return Some(p2);
-            }
-            let mut p3 = p.clone();
-            p3.push("bin");
-            p3.push("python");
-            if p3.exists() {
-                return Some(p3);
-            }
+fn find_project_venv_python() -> Option<PathBuf> {
+    let mut root = project_root()?;
+    root.push(".venv");
+    if cfg!(target_os = "windows") {
+        root.push("Scripts");
+        root.push("python.exe");
+        if root.exists() {
+            return Some(root);
         }
-        None
-    })
-}
-
-fn find_system_python() -> Option<PathBuf> {
-    let candidates = if cfg!(target_os = "windows") {
-        vec!["python", "py"]
     } else {
-        vec!["python3", "python"]
-    };
-    for c in candidates {
-        if let Ok(output) = Command::new(c).arg("--version").output() {
-            if output.status.success() {
-                if let Ok(full) = which::which(c) {
-                    return Some(full);
-                }
-            }
+        let mut p = root.clone();
+        p.push("bin");
+        p.push("python3");
+        if p.exists() {
+            return Some(p);
+        }
+        let mut p2 = root.clone();
+        p2.push("bin");
+        p2.push("python");
+        if p2.exists() {
+            return Some(p2);
         }
     }
     None
 }
 
 fn find_python_executable() -> Result<PathBuf, String> {
-    // Prefer bundled venv
-    if let Some(p) = find_bundled_python() {
-        return Ok(p);
-    }
-    // Then system python
-    if let Some(p) = find_system_python() {
-        return Ok(p);
-    }
-    Err("No suitable Python executable found. Install Python or bundle a venv into resources/py".into())
+    find_project_venv_python().ok_or_else(|| {
+        "No .venv Python found at the project root. Expected C:/Users/Elijah/FalconBroom/.venv/Scripts/python.exe".into()
+    })
 }
 
 fn spawn_backend() -> Result<Child, String> {
     let python = find_python_executable()?;
 
-    // Determine working directory for Python app: resource_dir()/python_app when bundled, else current dir
-    let workdir = resource_dir().map(|mut p| { p.push("python_app"); p }).unwrap_or_else(|| std::env::current_dir().unwrap());
+    let workdir = project_root().unwrap_or_else(|| std::env::current_dir().unwrap());
 
     let mut cmd = Command::new(python);
     cmd.args(&["-m", "uvicorn", "fbroom.main:app", "--port", "3008", "--host", "127.0.0.1"])
@@ -107,8 +91,7 @@ fn spawn_backend() -> Result<Child, String> {
 // Command exposed to frontend: opens native file dialog and posts the selected path to the backend /profile endpoint.
 #[tauri::command]
 fn pick_file_and_profile() -> Result<Value, String> {
-    // Open a native blocking file dialog (returns Option<std::path::PathBuf>)
-    let path = tauri::api::dialog::blocking::FileDialogBuilder::new()
+    let path = rfd::FileDialog::new()
         .add_filter("CSV", &["csv"])
         .pick_file();
 

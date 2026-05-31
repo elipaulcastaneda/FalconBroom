@@ -3,14 +3,15 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
-    "dev": "vite",
+    "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
     "build": "vite build",
-    "preview": "vite preview --port 5173"
+    "preview": "vite preview --port 5173",
+    "tauri:dev": "cd ..\\src-tauri && cargo tauri dev"
   },
   "dependencies": {
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "@tauri-apps/api": "^2.0.0"
+    "@tauri-apps/api": "^1.6.0"
   },
   "devDependencies": {
     "vite": "^5.0.0",

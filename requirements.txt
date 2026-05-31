@@ -9,6 +9,10 @@ polars>=0.18
 duckdb==1.6.0.dev12
 pydantic>=1.10
 python-dotenv>=1.0
+python-multipart>=0.0.9
+openpyxl>=3.1
+python-docx>=1.1
+python-pptx>=1.0
 
 # Recommended pip invocation when using Python 3.14 (tries pre-releases
 # and prefers binary wheels when available):

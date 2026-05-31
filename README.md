@@ -26,7 +26,12 @@ Next steps: scaffold a small Tauri frontend that calls the `/profile`, `/suggest
 Demo and file picking
 - A small demo dataset is available at `data/demo/customers.csv`.
 - A sample recipe is at `samples/demo_recipe.json` which runs imputations and normalization and writes to `data/output/customers_cleaned.csv`.
-- The frontend includes a Tauri-aware file picker button. When running inside Tauri, use the file picker; otherwise type the backend-accessible file path into the input.
+- The frontend now uploads files directly from the Source tab. Local exports of Google Workspace files work when you upload the exported `.docx`, `.xlsx`, or `.pptx` file.
+
+Google Drive authenticated fetches
+- To fetch Google Docs, Sheets, and Slides shortcuts directly from Drive, set `FALCONBROOM_GOOGLE_DRIVE_ACCESS_TOKEN` to a valid OAuth access token.
+- The backend will export Google Workspace files through the Drive API when a shortcut JSON contains a Drive URL or file ID.
+- If no token is configured, Google shortcut uploads still persist as metadata, and local exports continue to work.
 
 Example quick test:
 1. Start backend:
@@ -46,7 +51,7 @@ npm run dev
 3. Open the Vite UI at `http://127.0.0.1:5173` (or run the Tauri app which points to that dev path). Use the file picker or enter `data/demo/customers.csv`, click `Suggest` to populate the recipe editor, then `Preview` and `Apply`.
 
 Running the packaged Tauri app (native)
--------------------------------------
+--------------------------------------
 
 Prerequisites:
 - Rust toolchain (`rustup` + `cargo`) installed
@@ -75,16 +80,21 @@ python -m pip install -r requirements.txt
 
 To run the Tauri app in dev mode (it will spawn the Python backend automatically):
 
-```bash
+```powershell
 # from repo root
 cd frontend
 npm install
 npm run build   # build the frontend assets
 
-cd ..
-cd src-tauri
-# run the Tauri app; this will start the native window and the Rust wrapper which spawns the Python backend
+# run the Tauri app from the correct project folder
+cd ..\src-tauri
 cargo tauri dev
+```
+
+Or from `frontend`, use the helper script:
+
+```powershell
+npm run tauri:dev
 ```
 
 Notes:

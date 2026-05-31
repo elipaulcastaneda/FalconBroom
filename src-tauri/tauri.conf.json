@@ -1,10 +1,26 @@
 {
-  "build": {"beforeDevCommand": "", "beforeBuildCommand": ""},
-  "package": {"productName": "FalconBroom UI", "version": "0.1.0"},
-  "tauri": {
-    "allowlist": {"http": {"all": true}, "fs": {"all": true}, "dialog": {"all": true}},
-    "bundle": {"active": true, "resources": ["py", "python_app"]},
-    "devPath": "http://127.0.0.1:5173",
-    "updater": {"active": false}
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "FalconBroom UI",
+  "version": "0.1.0",
+  "identifier": "com.falconbroom.ui",
+  "build": {
+    "beforeDevCommand": "npm --prefix C:/Users/Elijah/FalconBroom/frontend run dev",
+    "beforeBuildCommand": "npm --prefix C:/Users/Elijah/FalconBroom/frontend run build",
+    "devUrl": "http://127.0.0.1:1420",
+    "frontendDist": "../frontend/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "FalconBroom UI",
+        "width": 1200,
+        "height": 900
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": []
   }
 }
