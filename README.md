@@ -33,6 +33,11 @@ Google Drive authenticated fetches
 - The backend will export Google Workspace files through the Drive API when a shortcut JSON contains a Drive URL or file ID.
 - If no token is configured, Google shortcut uploads still persist as metadata, and local exports continue to work.
 
+Source connector support
+- The API accepts local files, `file://` URIs, `http://` and `https://` downloads, `s3://bucket/key` objects, and warehouse-style URIs for SQLite or DuckDB.
+- Warehouse URIs materialize query results to a cached CSV before profiling or previewing them, for example `sqlite:///data/demo/sample.db?table=people` or `duckdb:///data/demo/sample.duckdb?query=SELECT%20*%20FROM%20people`.
+- Use `POST /resolve-source` to inspect how a source was resolved and where the materialized file lives.
+
 Example quick test:
 1. Start backend:
 

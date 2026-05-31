@@ -4,6 +4,7 @@ from uuid import uuid4
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from .connectors import resolve_source
 from .engine import Cleaner
 from .ingest import convert_uploaded_file
 from .recipe_schema import Recipe
@@ -51,6 +52,10 @@ class TextRecipeSpec(BaseModel):
 class JoinSuggestionSpec(BaseModel):
     left_path: str
     right_path: str
+
+
+class SourceResolveSpec(BaseModel):
+    path: str
 
 
 @app.get("/health")
@@ -104,6 +109,15 @@ def inspect(spec: SourceInspectSpec):
     try:
         inspection = cleaner.inspect_source(spec.path, offset=spec.offset, limit=spec.limit)
         return {"inspection": inspection}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/resolve-source")
+def resolve_source_endpoint(spec: SourceResolveSpec):
+    try:
+        resolved = resolve_source(spec.path)
+        return {"source": resolved.to_dict()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

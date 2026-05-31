@@ -1,4 +1,7 @@
 import json
+
+from .connectors import resolve_source
+
 try:
     import polars as pl
 except Exception:
@@ -9,6 +12,9 @@ def _read_table(path: str):
     if pl is None:
         raise RuntimeError("Polars not installed. See requirements.txt to install dependencies.")
 
+    resolved = resolve_source(path)
+    materialized_path = resolved.materialized_path
+
     read_kwargs = {
         "infer_schema_length": 1000,
         "ignore_errors": True,
@@ -16,12 +22,15 @@ def _read_table(path: str):
         "null_values": ["", "NA", "N/A", "null", "None"],
         "try_parse_dates": True,
     }
+    suffix = str(materialized_path).lower()
+    if suffix.endswith(".parquet"):
+        return pl.read_parquet(materialized_path)
     for separator in (",", "\t", ";"):
         try:
-            return pl.read_csv(path, separator=separator, **read_kwargs)
+            return pl.read_csv(materialized_path, separator=separator, **read_kwargs)
         except Exception:
             continue
-    return pl.read_csv(path, has_header=False, new_columns=["value"], **read_kwargs)
+    return pl.read_csv(materialized_path, has_header=False, new_columns=["value"], **read_kwargs)
 
 
 class Cleaner:
