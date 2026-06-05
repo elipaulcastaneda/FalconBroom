@@ -59,6 +59,8 @@ function loadUploadHistory() {
 
 export default function App() {
   const uploadInputRef = useRef(null)
+  const recipeNameRef = useRef(null)
+  const runFormatRef = useRef(null)
   const INSPECT_PAGE_SIZE = 100
   const [path, setPath] = useState("")
   const [instruction, setInstruction] = useState("")
@@ -71,9 +73,41 @@ export default function App() {
   const [recipeFromText, setRecipeFromText] = useState(null)
   const [recipeText, setRecipeText] = useState("")
   const [sourceInspection, setSourceInspection] = useState(null)
+  const [showAsTable, setShowAsTable] = useState(true)
+  const [diagnostics, setDiagnostics] = useState(null)
   const [inspectOffset, setInspectOffset] = useState(0)
   const [preview, setPreview] = useState(null)
   const [applyRes, setApplyRes] = useState(null)
+  const [recipeId, setRecipeId] = useState("")
+  const [recipeStatus, setRecipeStatus] = useState("")
+  const [historyList, setHistoryList] = useState([])
+  const [toasts, setToasts] = useState([])
+  const [toastArchive, setToastArchive] = useState([])
+  const [showToastPanel, setShowToastPanel] = useState(false)
+
+  const toastTimeouts = useRef({})
+
+  function removeToast(id) {
+    setToasts((t) => t.filter((x) => x.id !== id))
+    const to = toastTimeouts.current[id]
+    if (to) {
+      clearTimeout(to)
+      delete toastTimeouts.current[id]
+    }
+  }
+
+  function addToast(message, tone = "info", ttl = 4200) {
+    const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2,8)}`
+    setToasts((t) => [...t, { id, message, tone, ttl }])
+    // also record into archive for history panel (keep most recent 50)
+    const archived = { id, message, tone, ts: new Date().toISOString() }
+    setToastArchive((a) => [archived, ...a].slice(0, 50))
+    const to = setTimeout(() => {
+      setToasts((t) => t.filter((x) => x.id !== id))
+      delete toastTimeouts.current[id]
+    }, ttl)
+    toastTimeouts.current[id] = to
+  }
   const [uploadHistory, setUploadHistory] = useState(() => loadUploadHistory())
   const [theme, setTheme] = useState(() => window.localStorage.getItem("falconbroom-theme") || "dark")
   const [railCollapsed, setRailCollapsed] = useState(() => window.localStorage.getItem("falconbroom-rail-collapsed") === "true")
@@ -119,6 +153,7 @@ export default function App() {
     })
     const j = await res.json()
     setSourceInspection(j.inspection)
+    setDiagnostics(j.inspection?.diagnostics || null)
     setInspectOffset(nextOffset)
   }
 
@@ -173,7 +208,7 @@ export default function App() {
     try {
       await uploadSelectedFile(file)
     } catch (err) {
-      alert(`Upload failed: ${err.message || err}`)
+      addToast(`Upload failed: ${err.message || err}`, "error")
     } finally {
       e.target.value = ""
     }
@@ -237,15 +272,21 @@ export default function App() {
   async function doPreview() {
     try {
       const recipe = JSON.parse(recipeText)
-      const res = await fetch(`${BACKEND}/preview`, {
+      const url = `${BACKEND}/preview${recipeId ? `?recipe_id=${encodeURIComponent(recipeId)}` : ""}`
+      const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(recipe),
       })
       const j = await res.json()
       setPreview(j.preview)
+      if (j.schema_warnings) {
+        // lightweight notification
+        setApplyRes((prev) => ({ ...(prev || {}), schema_warnings: j.schema_warnings }))
+        addToast(`Schema warnings: ${JSON.stringify(j.schema_warnings)}`, "warn")
+      }
     } catch (e) {
-      alert("Invalid recipe JSON: " + e.message)
+      addToast("Invalid recipe JSON: " + e.message, "error")
     }
   }
 
@@ -260,9 +301,123 @@ export default function App() {
       const j = await res.json()
       setApplyRes(j.result)
     } catch (e) {
-      alert("Invalid recipe JSON: " + e.message)
+      addToast("Invalid recipe JSON: " + e.message, "error")
     }
   }
+
+  async function saveRecipe(name) {
+    try {
+      const recipe = JSON.parse(recipeText)
+      const res = await fetch(`${BACKEND}/recipes`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, recipe }),
+      })
+      const j = await res.json()
+      setRecipeId(j.id)
+      // fetch saved record to get status
+      const saved = await fetch(`${BACKEND}/recipes/${encodeURIComponent(j.id)}`)
+      const sdata = await saved.json()
+      setRecipeStatus(sdata.status || "draft")
+      addToast(`Saved recipe ${name}`, "success")
+    } catch (e) {
+      addToast("Failed to save recipe: " + e.message, "error")
+    }
+  }
+
+  async function approveSavedRecipe() {
+    if (!recipeId) {
+      addToast("No saved recipe to approve", "warn")
+      return
+    }
+    try {
+      const res = await fetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}/approve`, { method: "POST" })
+      const j = await res.json()
+      setRecipeStatus(j.status)
+      addToast(`Recipe ${recipeId} approved`, "success")
+    } catch (e) {
+      addToast("Failed to approve: " + e.message, "error")
+    }
+  }
+
+  async function runSavedRecipe(format = "csv") {
+    if (!recipeId) {
+      addToast("Save recipe before running", "warn")
+      return
+    }
+    try {
+      const res = await fetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}/run?export_format=${encodeURIComponent(format)}`, { method: "POST" })
+      const j = await res.json()
+      // add to history UI
+      setHistoryList((h) => [j.run, ...h])
+      addToast(`Run started: ${j.run.id}`, "info")
+    } catch (e) {
+      addToast("Failed to run recipe: " + e.message, "error")
+    }
+  }
+
+  async function fetchHistory() {
+    try {
+      const res = await fetch(`${BACKEND}/history`)
+      const j = await res.json()
+      setHistoryList(j.history || [])
+    } catch (e) {
+      addToast("Failed to fetch history: " + e.message, "error")
+    }
+  }
+
+  async function rollbackRun(runId) {
+    try {
+      const res = await fetch(`${BACKEND}/history/${encodeURIComponent(runId)}/rollback`, { method: "POST" })
+      const j = await res.json()
+      addToast(`Rollback created: ${j.rollback.rollback_path}`, "success")
+      fetchHistory()
+    } catch (e) {
+      addToast("Rollback failed: " + e.message, "error")
+    }
+  }
+
+  async function exportToSheets() {
+    if (!recipeId) {
+      addToast("Save recipe before exporting to Google Sheets", "warn")
+      return
+    }
+    try {
+      const res = await fetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}/export_sheets`, { method: "POST" })
+      if (res.ok) {
+        const j = await res.json()
+        addToast(`Export queued: ${j.export_id || 'queued'}`, "info")
+      } else {
+        let text = "Export failed"
+        try {
+          const j = await res.json()
+          text = j.detail || j.message || JSON.stringify(j)
+        } catch {
+          text = await res.text()
+        }
+        addToast(text, "warn")
+      }
+    } catch (e) {
+      addToast("Export failed: " + e.message, "error")
+    }
+  }
+
+  // poll history while any runs are running
+  React.useEffect(() => {
+    let timer = null
+    const hasRunning = historyList.some((h) => h.status === "running")
+    if (hasRunning) {
+      timer = setInterval(fetchHistory, 3000)
+    }
+    return () => {
+      if (timer) clearInterval(timer)
+    }
+  }, [historyList])
+
+  // fetch history on mount
+  React.useEffect(() => {
+    fetchHistory()
+  }, [])
 
   function renderTab() {
     if (activeTab === "overview") {
@@ -349,6 +504,10 @@ export default function App() {
             <div className="source-data-peek">
               <div className="source-data-peek-header">
                 <h3>Raw data grid</h3>
+                <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                  <label style={{fontSize:'0.82rem',color:'var(--muted)'}}>Show as table</label>
+                  <input type="checkbox" checked={showAsTable} onChange={(e)=>setShowAsTable(e.target.checked)} />
+                </div>
                 {sourceInspection ? (
                   <div className="source-data-peek-stats">
                     <span className="chip">Rows {sourceInspection.offset + 1}-{sourceInspection.offset + sourceInspection.returned_rows}</span>
@@ -360,26 +519,42 @@ export default function App() {
               {sourceInspection ? (
                 <>
                   <div className="table-wrap">
-                    <table className="source-table">
-                      <thead>
-                        <tr>
-                          <th>#</th>
-                          {sourceInspection.columns.map((col) => (
-                            <th key={col}>{col}</th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {sourceInspection.rows.map((row, rowIndex) => (
-                          <tr key={rowIndex}>
-                            <td>{sourceInspection.offset + rowIndex + 1}</td>
+                    {showAsTable ? (
+                      <table className="source-table">
+                        <thead>
+                          <tr>
+                            <th>#</th>
                             {sourceInspection.columns.map((col) => (
-                              <td key={`${rowIndex}-${col}`}>{String(row[col] ?? "")}</td>
+                              <th key={col}>{col}</th>
                             ))}
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                        </thead>
+                        <tbody>
+                          {sourceInspection.rows.map((row, rowIndex) => (
+                            <tr key={rowIndex}>
+                              <td>{sourceInspection.offset + rowIndex + 1}</td>
+                              {sourceInspection.columns.map((col) => (
+                                <td key={`${rowIndex}-${col}`}>{String(row[col] ?? "")}</td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    ) : (
+                      <table className="source-table">
+                        <thead>
+                          <tr><th>#</th><th>Raw extracted text</th></tr>
+                        </thead>
+                        <tbody>
+                          {(sourceInspection.raw_preview || sourceInspection.rows || []).map((r, i) => (
+                            <tr key={i}>
+                              <td>{sourceInspection.offset + i + 1}</td>
+                              <td>{r.text ?? JSON.stringify(r)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
                   </div>
 
                   <div className="button-row">
@@ -396,6 +571,28 @@ export default function App() {
                       Next 100 rows
                     </button>
                   </div>
+                  {/* Diagnostics panel */}
+                  {diagnostics && Object.keys(diagnostics).length > 0 && (
+                    <div className="diagnostics-panel">
+                      <h4>Data diagnostics</h4>
+                      <div className="diagnostics-list">
+                        {Object.entries(diagnostics).map(([col, info]) => (
+                          <div key={col} className="diag-item">
+                            <div className="diag-key">{col}</div>
+                            <div className="diag-value">
+                              <div>Missing: {info.missing_count ?? info.missing_count}</div>
+                              {info.missing_positions_sample && info.missing_positions_sample.length > 0 && (
+                                <div>Missing examples: {info.missing_positions_sample.slice(0,5).join(", ")}</div>
+                              )}
+                              <div>Unique values: {info.unique_count ?? info.unique_count}</div>
+                              {info.mixed_type ? <div style={{color:'#f59e0b'}}>Mixed types detected</div> : null}
+                              {info.constant ? <div style={{color:'#fb7185'}}>Constant/low-variance column</div> : null}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </>
               ) : (
                 <div className="empty-state">No data preview yet. Upload a file or click Profile data.</div>
@@ -437,10 +634,61 @@ export default function App() {
             subtitle="Refine transformation steps in-place, then preview or apply without leaving the Source tab."
           >
             <textarea value={recipeText} onChange={(e) => setRecipeText(e.target.value)} rows={14} className="editor" />
+            <div className="editor-meta">
+              <label>Recipe name</label>
+              <input placeholder="My recipe name" ref={recipeNameRef} />
+              <div className="recipe-meta-line">
+                <strong>Saved ID:</strong> {recipeId || "(not saved)"} &nbsp; <strong>Status:</strong> {recipeStatus || "(draft)"}
+              </div>
+            </div>
             <div className="button-row">
               <button className="primary" onClick={doPreview}>Preview</button>
               <button onClick={doApply}>Apply</button>
+              <button onClick={() => saveRecipe(recipeNameRef.current?.value || `recipe_${Date.now()}`)}>Save</button>
+              <button onClick={approveSavedRecipe} disabled={!recipeId}>Approve</button>
+              <label style={{display:'inline-flex',alignItems:'center',gap:8}}>
+                <span>Run as</span>
+                <select defaultValue="csv" ref={runFormatRef}>
+                  <option value="csv">CSV</option>
+                  <option value="xlsx">XLSX</option>
+                </select>
+              </label>
+              <button onClick={() => runSavedRecipe(runFormatRef.current?.value || 'csv')} disabled={!recipeId}>Run</button>
+              <button onClick={exportToSheets} disabled={!recipeId}>Export to Google Sheets</button>
             </div>
+          </Card>
+
+          <Card eyebrow="Run history" title="Runs and lineage" subtitle="View previous runs, outputs, and create rollbacks.">
+            <div className="button-row">
+              <button onClick={fetchHistory}>Refresh history</button>
+            </div>
+            {historyList.length ? (
+              <div className="history-list">
+                {historyList.map((r) => (
+                  <div key={r.id} className="history-item">
+                    <div style={{flex:'1 1 0'}}>
+                      <div className="history-top">
+                        <strong>{r.id}</strong>
+                        <small style={{marginLeft:8}}>{r.recipe_id} • {r.status}</small>
+                      </div>
+                      <div className="history-body">
+                        <div>Started: {r.started_at}</div>
+                        {r.finished_at && <div>Finished: {r.finished_at}</div>}
+                        {r.output_path && (
+                          <div>Output: <small>{r.output_path}</small> <a href={`${BACKEND}/download?path=${encodeURIComponent(r.output_path)}`} target="_blank" rel="noreferrer">Download</a></div>
+                        )}
+                        {r.warnings && <div style={{color:'#f59e0b'}}>Warnings: {JSON.stringify(r.warnings)}</div>}
+                      </div>
+                    </div>
+                    <div className="history-actions">
+                      <button onClick={() => rollbackRun(r.id)}>Rollback</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state">No runs yet. Run a saved recipe to populate history.</div>
+            )}
           </Card>
 
           <Card eyebrow="Recipe" title="Generated recipe" subtitle="The recipe produced from the analyst prompt or heuristic suggestions.">
@@ -554,6 +802,51 @@ export default function App() {
 
   return (
     <div className={`app-shell ${themeClass}`} data-theme={theme}>
+      {/* Toasts container */}
+      <div className="toasts-root" aria-live="polite">
+        {toasts.map((t) => (
+          <div key={t.id} className={`toast toast-${t.tone || 'info'}`}>
+            <div className="toast-left">
+              <span className="toast-icon" aria-hidden>
+                {t.tone === 'success' ? '✔' : t.tone === 'error' ? '✖' : t.tone === 'warn' ? '⚠' : 'ℹ'}
+              </span>
+            </div>
+            <div className="toast-body">{t.message}</div>
+            <button className="toast-close" aria-label="Dismiss" onClick={() => removeToast(t.id)}>✕</button>
+            <div className="toast-progress" style={{animationDuration: `${t.ttl || 4200}ms`}} />
+          </div>
+        ))}
+
+        <button className="toast-archive-toggle" onClick={() => setShowToastPanel((s) => !s)} aria-expanded={showToastPanel} title="Show notifications history">
+          {showToastPanel ? 'Hide notifications' : 'Notifications'}
+        </button>
+
+        {showToastPanel && (
+          <div className="toast-panel" role="dialog" aria-label="Notifications history">
+            <div className="toast-panel-header">
+              <strong>Notifications</strong>
+              <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                <button className="toast-archive-clear" onClick={() => setToastArchive([])}>Clear</button>
+                <button onClick={() => setShowToastPanel(false)}>Close</button>
+              </div>
+            </div>
+            <div className="toast-panel-list">
+              {toastArchive.length === 0 && <div className="empty-state" style={{padding:12}}>No notifications yet.</div>}
+              {toastArchive.map((a) => (
+                <div key={a.id} className="toast-archive-item">
+                  <div className="toast-left">
+                    <span className="toast-icon" aria-hidden>{a.tone === 'success' ? '✔' : a.tone === 'error' ? '✖' : a.tone === 'warn' ? '⚠' : 'ℹ'}</span>
+                  </div>
+                  <div className="toast-archive-body">
+                    <div className="toast-archive-msg">{a.message}</div>
+                    <div className="toast-archive-ts">{new Date(a.ts).toLocaleString()}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
       <div className="app-bg app-bg-a" />
       <div className="app-bg app-bg-b" />
       <div className="app-bg app-bg-c" />

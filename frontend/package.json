@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "scripts": {
-    "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
+    "dev": "vite --host 127.0.0.1 --port 1421",
     "build": "vite build",
     "preview": "vite preview --port 5173",
     "tauri:dev": "cd ..\\src-tauri && cargo tauri dev"
