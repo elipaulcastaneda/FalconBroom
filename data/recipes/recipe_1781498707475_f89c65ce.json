@@ -1,0 +1,24 @@
+{
+  "id": "recipe_1781498707475_f89c65ce",
+  "name": "recipe_1781498707475",
+  "created_at": "2026-06-15T04:45:07.484999Z",
+  "status": "approved",
+  "expected_columns": [
+    "{"
+  ],
+  "recipe": {
+    "sources": [
+      {
+        "path": "data\\uploads\\transactions_2025__1__9060fee6_1097_1a8c.json"
+      }
+    ],
+    "cleaning_steps": [],
+    "joins": [],
+    "outputs": [
+      {
+        "path": "output_from_text.csv"
+      }
+    ]
+  },
+  "approved_at": "2026-06-15T04:45:10.396680Z"
+}

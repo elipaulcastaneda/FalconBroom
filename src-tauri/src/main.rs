@@ -100,9 +100,10 @@ fn pick_file_and_profile() -> Result<Value, String> {
         None => return Err("No file selected".into()),
     };
 
-    // Call local backend /profile
+    // Call backend /profile. Prefer remote backend URL if provided via env var.
     let client = reqwest::blocking::Client::new();
-    let url = "http://127.0.0.1:3008/profile";
+    let base = std::env::var("FALCONBROOM_BACKEND_URL").unwrap_or_else(|_| "http://127.0.0.1:3008".to_string());
+    let url = format!("{}/profile", base.trim_end_matches('/'));
     let body = serde_json::json!({"path": path});
     let resp = client
         .post(url)
@@ -116,14 +117,19 @@ fn pick_file_and_profile() -> Result<Value, String> {
 }
 
 fn main() {
-    // Start backend process and keep handle in state
-    let backend_child = match spawn_backend() {
-        Ok(c) => Some(BackendChild::new(c)),
-        Err(e) => {
-            eprintln!("Warning: could not start backend: {}", e);
+        // Start backend process and keep handle in state.
+        // If `FALCONBROOM_BACKEND_URL` is set we assume a remote backend and skip spawning a local one.
+        let backend_child = if std::env::var("FALCONBROOM_BACKEND_URL").is_ok() {
             None
-        }
-    };
+        } else {
+            match spawn_backend() {
+                Ok(c) => Some(BackendChild::new(c)),
+                Err(e) => {
+                    eprintln!("Warning: could not start backend: {}", e);
+                    None
+                }
+            }
+        };
 
     let builder = tauri::Builder::default()
         .manage(backend_child)

@@ -1,0 +1,181 @@
+{
+  "id": "inspection_55b362de",
+  "created_at": "2026-06-10T06:41:24.953437Z",
+  "path": "C:\\Users\\Elijah\\FalconBroom\\data\\uploads\\portfolio-updated_b949cfcb_219_bd3c.csv",
+  "inspection": {
+    "path": "C:\\Users\\Elijah\\FalconBroom\\data\\uploads\\portfolio-updated_b949cfcb_219_bd3c.csv",
+    "row_count": 2,
+    "column_count": 11,
+    "columns": [
+      "id",
+      "title",
+      "seatCost",
+      "other",
+      "SeatsPurchased",
+      "SeatsActive",
+      "InactiveSeats",
+      "SeatUnitPrice",
+      "TotalMonthlyCostBefore",
+      "ActionSpecificSavings",
+      "TotalMonthlyCostAfter"
+    ],
+    "rows": [
+      {
+        "id": "action-1",
+        "title": "Test Action 1",
+        "seatCost": "20",
+        "other": "foo",
+        "SeatsPurchased": "",
+        "SeatsActive": "",
+        "InactiveSeats": "",
+        "SeatUnitPrice": "",
+        "TotalMonthlyCostBefore": "",
+        "ActionSpecificSavings": "",
+        "TotalMonthlyCostAfter": ""
+      },
+      {
+        "id": "action-2",
+        "title": "Test Action 2",
+        "seatCost": "15",
+        "other": "bar",
+        "SeatsPurchased": "",
+        "SeatsActive": "",
+        "InactiveSeats": "",
+        "SeatUnitPrice": "",
+        "TotalMonthlyCostBefore": "",
+        "ActionSpecificSavings": "",
+        "TotalMonthlyCostAfter": ""
+      }
+    ],
+    "offset": 0,
+    "limit": 100,
+    "returned_rows": 2,
+    "has_prev": false,
+    "has_next": false,
+    "diagnostics": {
+      "id": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 2,
+        "mixed_type": false,
+        "constant": false
+      },
+      "title": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 2,
+        "mixed_type": false,
+        "constant": false
+      },
+      "seatCost": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 2,
+        "mixed_type": false,
+        "constant": false
+      },
+      "other": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 2,
+        "mixed_type": false,
+        "constant": false
+      },
+      "SeatsPurchased": {
+        "missing_count": 2,
+        "missing_positions_sample": [
+          1,
+          2
+        ],
+        "missing_pct": 100.0,
+        "unique_count": 0,
+        "mixed_type": false,
+        "constant": true
+      },
+      "SeatsActive": {
+        "missing_count": 2,
+        "missing_positions_sample": [
+          1,
+          2
+        ],
+        "missing_pct": 100.0,
+        "unique_count": 0,
+        "mixed_type": false,
+        "constant": true
+      },
+      "InactiveSeats": {
+        "missing_count": 2,
+        "missing_positions_sample": [
+          1,
+          2
+        ],
+        "missing_pct": 100.0,
+        "unique_count": 0,
+        "mixed_type": false,
+        "constant": true
+      },
+      "SeatUnitPrice": {
+        "missing_count": 2,
+        "missing_positions_sample": [
+          1,
+          2
+        ],
+        "missing_pct": 100.0,
+        "unique_count": 0,
+        "mixed_type": false,
+        "constant": true
+      },
+      "TotalMonthlyCostBefore": {
+        "missing_count": 2,
+        "missing_positions_sample": [
+          1,
+          2
+        ],
+        "missing_pct": 100.0,
+        "unique_count": 0,
+        "mixed_type": false,
+        "constant": true
+      },
+      "ActionSpecificSavings": {
+        "missing_count": 2,
+        "missing_positions_sample": [
+          1,
+          2
+        ],
+        "missing_pct": 100.0,
+        "unique_count": 0,
+        "mixed_type": false,
+        "constant": true
+      },
+      "TotalMonthlyCostAfter": {
+        "missing_count": 2,
+        "missing_positions_sample": [
+          1,
+          2
+        ],
+        "missing_pct": 100.0,
+        "unique_count": 0,
+        "mixed_type": false,
+        "constant": true
+      }
+    },
+    "raw_preview": [
+      {
+        "row_index": 1,
+        "text": "id,title,seatCost,other,SeatsPurchased,SeatsActive,InactiveSeats,SeatUnitPrice,TotalMonthlyCostBefore,ActionSpecificSavings,TotalMonthlyCostAfter"
+      },
+      {
+        "row_index": 2,
+        "text": "action-1,Test Action 1,20,foo,,,,,,,"
+      },
+      {
+        "row_index": 3,
+        "text": "action-2,Test Action 2,15,bar,,,,,,,"
+      }
+    ]
+  }
+}

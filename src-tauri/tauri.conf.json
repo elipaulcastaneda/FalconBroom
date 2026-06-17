@@ -6,7 +6,7 @@
   "build": {
     "beforeDevCommand": "npm --prefix C:/Users/Elijah/FalconBroom/frontend run dev",
     "beforeBuildCommand": "npm --prefix C:/Users/Elijah/FalconBroom/frontend run build",
-    "devUrl": "http://127.0.0.1:1420",
+    "devUrl": "http://127.0.0.1:1421",
     "frontendDist": "../frontend/dist"
   },
   "app": {

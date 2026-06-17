@@ -1,8 +1,9 @@
 import React, {useMemo, useRef, useState} from "react"
 
-const BACKEND = "http://127.0.0.1:3008"
+const BACKEND = "http://127.0.0.1:3009"
 const NAV_ITEMS = [
   { section: "Start", id: "source", label: "Source", detail: "Profile and prompt to recipe", icon: "⟡" },
+  { section: "Start", id: "uploads", label: "Uploads", detail: "Saved uploads", icon: "⇪" },
   { section: "Build", id: "joins", label: "Joins", detail: "Match and merge hints", icon: "⧉" },
   { section: "Review", id: "preview", label: "Preview", detail: "Compare before and after", icon: "↔" },
 ]
@@ -37,7 +38,6 @@ function JsonBlock({ value, empty }) {
   if (value === null || value === undefined) {
     return <div className="empty-state">{empty}</div>
   }
-
   return <pre className="json-block json-block-soft">{JSON.stringify(value, null, 2)}</pre>
 }
 
@@ -60,12 +60,14 @@ function loadUploadHistory() {
 export default function App() {
   const uploadInputRef = useRef(null)
   const recipeNameRef = useRef(null)
+  const instructionRef = useRef(null)
   const runFormatRef = useRef(null)
   const INSPECT_PAGE_SIZE = 100
   const [path, setPath] = useState("")
   const [instruction, setInstruction] = useState("")
   const [leftPath, setLeftPath] = useState("")
   const [rightPath, setRightPath] = useState("")
+  const [uploadTarget, setUploadTarget] = useState(null) // 'left'|'right'|null
   const [profile, setProfile] = useState(null)
   const [suggest, setSuggest] = useState(null)
   const [cleaningSuggestions, setCleaningSuggestions] = useState(null)
@@ -80,6 +82,7 @@ export default function App() {
   const [applyRes, setApplyRes] = useState(null)
   const [recipeId, setRecipeId] = useState("")
   const [recipeStatus, setRecipeStatus] = useState("")
+  const [showApproveConfirm, setShowApproveConfirm] = useState(false)
   const [historyList, setHistoryList] = useState([])
   const [toasts, setToasts] = useState([])
   const [toastArchive, setToastArchive] = useState([])
@@ -109,6 +112,34 @@ export default function App() {
     toastTimeouts.current[id] = to
   }
   const [uploadHistory, setUploadHistory] = useState(() => loadUploadHistory())
+  const [uploadsList, setUploadsList] = useState([])
+  const [uploadsLoading, setUploadsLoading] = useState(false)
+  const [inspectionLoading, setInspectionLoading] = useState(false)
+  const [inspectingPath, setInspectingPath] = useState(null)
+  const [profileLoading, setProfileLoading] = useState(false)
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const [applyLoading, setApplyLoading] = useState(false)
+  const [recipeGenerating, setRecipeGenerating] = useState(false)
+  const [generatedPreview, setGeneratedPreview] = useState(null)
+  const [prevRecipeText, setPrevRecipeText] = useState(null)
+  const [rowsToShow, setRowsToShow] = useState(6)
+  const [selectedColumns, setSelectedColumns] = useState(null) // null = all
+  const [showColumnPicker, setShowColumnPicker] = useState(false)
+  const [selectedCells, setSelectedCells] = useState({})
+  const [tooltip, setTooltip] = useState(null)
+  const [showFullPreview, setShowFullPreview] = useState(false)
+  const [showRecipeJson, setShowRecipeJson] = useState(false)
+  const [showConfirmModal, setShowConfirmModal] = useState(false)
+  const [previewRows, setPreviewRows] = useState(6)
+  const [candidateColumns, setCandidateColumns] = useState([])
+  const [pendingGenerated, setPendingGenerated] = useState(null)
+  const [showCustomRevisions, setShowCustomRevisions] = useState(false)
+  const [showDuplicatesModal, setShowDuplicatesModal] = useState(false)
+  const [duplicateGroups, setDuplicateGroups] = useState([])
+  const [regressionModel, setRegressionModel] = useState('linear')
+  const [regressionFeatures, setRegressionFeatures] = useState('')
+  const [regressionGroupBy, setRegressionGroupBy] = useState('')
+  const [treatAsMissing, setTreatAsMissing] = useState('')
   const [theme, setTheme] = useState(() => window.localStorage.getItem("falconbroom-theme") || "dark")
   const [railCollapsed, setRailCollapsed] = useState(() => window.localStorage.getItem("falconbroom-rail-collapsed") === "true")
   const [activeTab, setActiveTab] = useState("source")
@@ -124,6 +155,8 @@ export default function App() {
       return 0
     }
   }, [recipeText])
+
+  const backgroundBusy = uploadsLoading || inspectionLoading || profileLoading || previewLoading || applyLoading
 
   const activeItem = NAV_ITEMS.find((item) => item.id === activeTab) || NAV_ITEMS[0]
 
@@ -146,26 +179,85 @@ export default function App() {
   }
 
   async function doInspectSource(nextPath, nextOffset = 0) {
-    const res = await fetch(`${BACKEND}/inspect`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: nextPath, offset: nextOffset, limit: INSPECT_PAGE_SIZE }),
+    try {
+      const res = await fetch(`${BACKEND}/inspect`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: nextPath, offset: nextOffset, limit: INSPECT_PAGE_SIZE }),
+      })
+      if (!res.ok) {
+        const text = await res.text()
+        console.error('Inspect failed', res.status, text)
+        addToast(`Inspect failed: ${res.status}`,'error',6000)
+        return
+      }
+      const j = await res.json()
+      const sanitized = sanitizeInspection(j.inspection)
+      setSourceInspection(sanitized)
+      setDiagnostics(sanitized?.diagnostics || null)
+      // build a lightweight profile from the reconstructed inspection so
+      // the UI (uploads tab) shows only data columns, not metadata/extraction cols
+      try {
+        const p = {}
+        const cols = sanitized?.columns || []
+        const diag = sanitized?.diagnostics || {}
+        cols.forEach((c) => {
+          try {
+            const info = diag[c] || {}
+            p[c] = { dtype: 'str', nulls: info.missing_count || 0, unique: info.unique_count || 0 }
+          } catch (e) {
+            p[c] = { dtype: 'str', nulls: 0, unique: 0 }
+          }
+        })
+        setProfile(p)
+      } catch (e) {
+        // ignore profile build errors
+      }
+      setInspectOffset(nextOffset)
+    // mark last refreshed on uploads list for UI
+    setUploadsList((list) => {
+      if (!list) return list
+      return list.map((it) => {
+        try {
+          if (_normalizePathMatch(it.path || '', nextPath || '')) {
+            return { ...it, last_refreshed: new Date().toISOString() }
+          }
+        } catch (e) {
+          // ignore
+        }
+        return it
+      })
     })
-    const j = await res.json()
-    setSourceInspection(j.inspection)
-    setDiagnostics(j.inspection?.diagnostics || null)
-    setInspectOffset(nextOffset)
+    } catch (err) {
+      console.error('Inspect request failed', err)
+      addToast('Inspect request failed: ' + (err.message || String(err)), 'error', 6000)
+    }
   }
 
   async function doProfileForPath(nextPath) {
-    const profileRes = await fetch(`${BACKEND}/profile`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: nextPath }),
-    })
-    const profilePayload = await profileRes.json()
-    setProfile(profilePayload.profile)
-    await doInspectSource(nextPath, 0)
+    setProfileLoading(true)
+    try {
+      const profileRes = await fetch(`${BACKEND}/profile`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: nextPath }),
+      })
+      if (!profileRes.ok) {
+        const text = await profileRes.text()
+        console.error('Profile failed', profileRes.status, text)
+        addToast(`Profile failed: ${profileRes.status}`,'error',6000)
+        setProfileLoading(false)
+        return
+      }
+      const profilePayload = await profileRes.json()
+      setProfile(profilePayload.profile)
+      await doInspectSource(nextPath, 0)
+    } catch (err) {
+      console.error('Profile request failed', err)
+      addToast('Profile request failed: ' + (err.message || String(err)), 'error', 6000)
+    } finally {
+      setProfileLoading(false)
+    }
   }
 
   async function doProfile() {
@@ -190,6 +282,13 @@ export default function App() {
 
     const payload = await res.json()
     setPath(payload.path)
+    // If upload was triggered from the Joins tab, set the appropriate path
+    try {
+      if (uploadTarget === 'left') setLeftPath(payload.path)
+      else if (uploadTarget === 'right') setRightPath(payload.path)
+    } catch (e) {}
+    // reset upload target after use
+    setUploadTarget(null)
 
     const historyItem = {
       name: payload.name || file.name,
@@ -199,8 +298,343 @@ export default function App() {
     }
     const deduped = [historyItem, ...uploadHistory.filter((item) => item.path !== historyItem.path)]
     persistUploadHistory(deduped)
+    // refresh server-side uploads list
+    fetchUploads()
+
+    // show custom revisions box after upload
+    setShowCustomRevisions(true)
 
     await doProfileForPath(payload.path)
+  }
+
+  async function fetchUploads() {
+    setUploadsLoading(true)
+    try {
+      const res = await fetch(`${BACKEND}/uploads`)
+      const j = await res.json()
+      setUploadsList(j.uploads || [])
+    } catch (e) {
+      // fallback to local history
+      setUploadsList(uploadHistory || [])
+    } finally {
+      setUploadsLoading(false)
+    }
+  }
+
+  React.useEffect(() => {
+    fetchUploads()
+  }, [])
+
+  // When the generated recipe or the rowsToShow selection changes, refresh the generated preview
+  React.useEffect(() => {
+    if (!recipeFromText) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const nParam = typeof rowsToShow === 'number' ? rowsToShow : Number(rowsToShow)
+        const previewQs = []
+        if (nParam != null) previewQs.push(`n=${encodeURIComponent(nParam)}`)
+        const previewUrl = `${BACKEND}/preview${previewQs.length ? `?${previewQs.join('&')}` : ''}`
+        const res = await fetch(previewUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(recipeFromText) })
+        if (!res.ok) {
+          console.warn('Generated preview refresh failed', await res.text())
+          return
+        }
+        const pj = await res.json()
+        if (!cancelled) setGeneratedPreview(sanitizePreview(pj.preview))
+      } catch (e) {
+        console.warn('Failed to refresh generated preview', e)
+      }
+    })()
+    return () => { cancelled = true }
+  }, [rowsToShow, recipeFromText])
+
+  React.useEffect(() => {
+    if (showCustomRevisions) {
+      // small delay to ensure modal is mounted
+      setTimeout(() => instructionRef.current?.focus(), 80)
+    }
+    function onKey(e){
+      if(!showCustomRevisions) return
+      if(e.key === 'Escape'){
+        setShowCustomRevisions(false)
+      }
+      if((e.ctrlKey || e.metaKey) && e.key === 'Enter'){
+        // accept generated recipe if present
+        if(generatedPreview) acceptGenerated()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return ()=> window.removeEventListener('keydown', onKey)
+  }, [showCustomRevisions])
+
+  // Remove metadata keys (starting with `_`) from preview rows before rendering
+  function _stripMeta(obj) {
+    if (!obj || typeof obj !== 'object') return obj
+    const out = {}
+    Object.entries(obj).forEach(([k, v]) => {
+      if (!k || typeof k !== 'string') return
+      // skip internal underscore keys
+      if (k.startsWith('_')) return
+      // skip known metadata keys
+      const metaKeys = ['container_name', 'sheet_name', 'slide_number', 'paragraph_index', 'table_index', 'column_index', 'cell_label', 'source_kind', 'source_name', 'source_path', 'unit_kind', 'row_index']
+      if (metaKeys.includes(k)) return
+      out[k] = v
+    })
+    return out
+  }
+
+  function sanitizePreview(p) {
+    if (!p) return p
+    const copy = { ...p }
+    try {
+      copy.before = (p.before || []).map((r) => _stripMeta(r))
+      copy.after = (p.after || []).map((r) => _stripMeta(r))
+    } catch (e) {
+      // if unexpected shape, return original
+      return p
+    }
+    return copy
+  }
+
+  function sanitizeInspection(ins) {
+    if (!ins) return ins
+    try {
+      const metaKeys = ['container_name', 'sheet_name', 'slide_number', 'paragraph_index', 'table_index', 'column_index', 'cell_label', 'source_kind', 'source_name', 'source_path', 'unit_kind', 'row_index']
+      // remove metadata columns from columns array
+      const cols = (ins.columns || []).filter((c) => !metaKeys.includes(c))
+      // strip metadata keys from each row
+      const rows = (ins.rows || []).map((r) => {
+        const out = {}
+        Object.entries(r || {}).forEach(([k, v]) => {
+          if (!k || typeof k !== 'string') return
+          if (k.startsWith('_')) return
+          if (metaKeys.includes(k)) return
+          out[k] = v
+        })
+        return out
+      })
+      // prune diagnostics entries for metadata columns
+      const diag = ins.diagnostics || {}
+      const newDiag = Object.entries(diag).reduce((acc, [k, v]) => {
+        if (!metaKeys.includes(k)) acc[k] = v
+        return acc
+      }, {})
+      return { ...ins, columns: cols, rows, diagnostics: newDiag }
+    } catch (e) {
+      return ins
+    }
+  }
+
+  // Remove cleaning steps that target metadata/internal columns
+  function sanitizeRecipe(r) {
+    if (!r) return r
+    try {
+      const metaKeys = ['container_name', 'sheet_name', 'slide_number', 'paragraph_index', 'table_index', 'column_index', 'cell_label', 'source_kind', 'source_name', 'source_path', 'unit_kind', 'row_index']
+      const copy = JSON.parse(JSON.stringify(r))
+      if (Array.isArray(copy.cleaning_steps)) {
+        copy.cleaning_steps = copy.cleaning_steps.filter((s) => {
+          try {
+            const col = s && s.column
+            if (!col || typeof col !== 'string') return true
+            if (metaKeys.includes(col)) return false
+            if (col.startsWith('_')) return false
+            return true
+          } catch (e) {
+            return true
+          }
+        })
+      }
+      return copy
+    } catch (e) {
+      return r
+    }
+  }
+
+  function _cellKey(rowIndex, col) { return `${rowIndex}|${col}` }
+  function toggleCellSelection(rowIndex, col) {
+    const k = _cellKey(rowIndex, col)
+    setSelectedCells((s) => {
+      const next = { ...(s || {}) }
+      if (next[k]) delete next[k]
+      else next[k] = true
+      return next
+    })
+  }
+
+  async function applySelectedChanges() {
+    const patches = []
+    if (!generatedPreview) {
+      addToast('No generated preview to apply selected changes from', 'warn')
+      return
+    }
+    const before = generatedPreview.before || []
+    const after = generatedPreview.after || []
+    Object.keys(selectedCells || {}).forEach((k) => {
+      const [r, col] = k.split('|')
+      const ri = Number(r)
+      const newVal = (after[ri] || {})[col]
+      patches.push({ row: ri, column: col, value: newVal })
+    })
+    if (patches.length === 0) {
+      addToast('No cells selected', 'warn')
+      return
+    }
+    try {
+      const res = await fetch(`${BACKEND}/apply-patch`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path, patches })
+      })
+      if (!res.ok) {
+        let txt = await res.text()
+        addToast('Apply selected failed: ' + txt, 'error')
+        return
+      }
+      const j = await res.json()
+      addToast(`Applied ${patches.length} selected changes`, 'success')
+      // if server returned a patched file, add it to uploads list and open it
+      if (j && (j.upload_path || j.patched_path)) {
+        const usePath = j.upload_path || j.patched_path
+        const parts = String(usePath).split(/\\|\//)
+        const name = parts[parts.length-1]
+        const newItem = { name, path: usePath, size: j.size || 0, modified_at: j.modified_at || new Date().toISOString() }
+        setUploadsList((u) => {
+          const existing = (u || []).filter(x => x.path !== newItem.path)
+          return [newItem, ...existing]
+        })
+        // open and inspect the patched file
+        try { await openUploadItem(newItem) } catch (err) { console.warn('Failed opening patched item', err) }
+      }
+      // clear selection and refresh preview/inspection
+      setSelectedCells({})
+      // try to refresh preview if possible
+      try { await doPreview() } catch {}
+    } catch (e) {
+      addToast('Apply selected failed: ' + (e.message || e), 'error')
+    }
+  }
+
+  // Removed automatic generation. Users must click "Generate JSON".
+
+  function _normalizePathMatch(a, b) {
+    if (!a || !b) return false
+    const na = a.replace(/\\/g, '/').toLowerCase()
+    const nb = b.replace(/\\/g, '/').toLowerCase()
+    return na === nb || na.endsWith(nb) || nb.endsWith(na) || na.includes(nb) || nb.includes(na)
+  }
+
+  async function openUploadItem(item) {
+    // item: {name, path, ...}
+    setPath(item.path)
+    // show custom revisions when opening an upload
+    setShowCustomRevisions(true)
+    // show full data preview for saved uploads
+    setShowFullPreview(true)
+    // hide raw recipe JSON by default (use instruction -> auto-generate)
+    setShowRecipeJson(false)
+    setInspectionLoading(true)
+    setInspectingPath(item.path)
+    // look for an existing inspection saved for this path
+    try {
+      const res = await fetch(`${BACKEND}/inspections`)
+      const j = await res.json()
+      const candidates = (j.inspections || []).filter((ins) => _normalizePathMatch(ins.path || '', item.path || ''))
+      if (candidates.length > 0) {
+        // pick the latest created
+        const latest = candidates.sort((a,b)=> (a.created_at < b.created_at ? 1 : -1))[0]
+        const got = await fetch(`${BACKEND}/inspections/${encodeURIComponent(latest.id)}`)
+        const payload = await got.json()
+        const inspection = payload.inspection || payload
+        const sanitized = sanitizeInspection(inspection)
+        setSourceInspection(sanitized)
+        setDiagnostics(sanitized?.diagnostics || null)
+        // build profile from inspection so uploads view matches source view
+        try {
+          const p = {}
+          const cols = sanitized?.columns || []
+          const diag = sanitized?.diagnostics || {}
+          cols.forEach((c) => {
+            try {
+              const info = diag[c] || {}
+              p[c] = { dtype: 'str', nulls: info.missing_count || 0, unique: info.unique_count || 0 }
+            } catch (e) {
+              p[c] = { dtype: 'str', nulls: 0, unique: 0 }
+            }
+          })
+          setProfile(p)
+        } catch (e) {
+          // ignore
+        }
+        setInspectOffset(sanitized?.offset || 0)
+        setInspectionLoading(false)
+        setInspectingPath(null)
+        return
+      }
+    } catch (e) {
+      // ignore and fall back to inspect
+    }
+
+    // no saved inspection found — call POST /inspect to generate one
+    try {
+      await doInspectSource(item.path, 0)
+      setInspectionLoading(false)
+      setInspectingPath(null)
+    } catch (e) {
+      addToast('Inspect failed: ' + (e.message || e), 'error')
+      setInspectionLoading(false)
+      setInspectingPath(null)
+    }
+  }
+
+  async function refreshInspection(item) {
+    setInspectionLoading(true)
+    setInspectingPath(item.path)
+    try {
+      await doInspectSource(item.path, 0)
+      addToast('Refreshed inspection for ' + item.name, 'success')
+    } catch (e) {
+      addToast('Refresh failed: ' + (e.message || e), 'error')
+    } finally {
+      setInspectionLoading(false)
+      setInspectingPath(null)
+    }
+  }
+
+  async function fetchDuplicates(){
+    try{
+      const res = await fetch(`${BACKEND}/uploads/duplicates`)
+      if(!res.ok){ addToast('Failed to check duplicates','error'); return }
+      const j = await res.json()
+      setDuplicateGroups(j.duplicates || [])
+      if(!(j.duplicates || []).length) addToast('No duplicates found','info')
+      else setShowDuplicatesModal(true)
+    }catch(e){ addToast('Duplicate check failed: '+(e.message||e),'error') }
+  }
+
+  async function deleteUploadFromModal(path){
+    try{
+      const res = await fetch(`${BACKEND}/uploads/delete`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({path}) })
+      if(!res.ok){ const txt = await res.text(); addToast('Delete failed: '+txt,'error'); return }
+      // remove from uploads list
+      setUploadsList((u)=> (u||[]).filter(x=> x.path !== path))
+      // remove from duplicate groups state
+      setDuplicateGroups((groups)=> groups.map(g=> ({...g, paths: g.paths.filter(p=> p !== path)})).filter(g=> g.paths && g.paths.length>1))
+      addToast('Deleted ' + path, 'success')
+    }catch(e){ addToast('Delete failed: '+(e.message||e),'error') }
+  }
+
+  async function deleteOthersInGroup(group, keepPath){
+    if(!group || !group.paths || group.paths.length < 2) return
+    const confirmMsg = `Delete ${group.paths.length - 1} files in this group and keep ${keepPath}? This is permanent.`
+    if(!window.confirm(confirmMsg)) return
+    for(const p of group.paths){
+      if(p === keepPath) continue
+      // await deletion sequentially
+      // eslint-disable-next-line no-await-in-loop
+      await deleteUploadFromModal(p)
+    }
+    // refresh duplicate groups
+    try{ await fetchDuplicates() } catch {}
   }
 
   async function onUploadInputChange(e) {
@@ -242,21 +676,119 @@ export default function App() {
     const res = await fetch(`${BACKEND}/cleaning-suggestions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
+      body: JSON.stringify({ path: path || (uploadsList[0] && uploadsList[0].path) }),
     })
     const j = await res.json()
     setCleaningSuggestions(j.suggestions)
   }
 
   async function doRecipeFromText() {
-    const res = await fetch(`${BACKEND}/recipe-from-text`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ instruction, source_path: path, output_path: "output_from_text.csv" }),
-    })
-    const j = await res.json()
-    setRecipeFromText(j)
-    setRecipeText(JSON.stringify(j.recipe, null, 2))
+    setRecipeGenerating(true)
+    setPrevRecipeText(recipeText)
+    try {
+      // parse sentinel input into an array of values (numbers when numeric)
+      const parseSentinels = (s) => {
+        if (!s) return null
+        return s.split(/\s*,\s*/).map((tok) => {
+          if (tok === '') return tok
+          const n = Number(tok)
+          if (!Number.isNaN(n) && String(n) === tok) return n
+          // also allow quoted strings, strip surrounding quotes
+          const m = tok.match(/^['"](.*)['"]$/)
+          if (m) return m[1]
+          return tok
+        })
+      }
+      const sentinelsArr = parseSentinels(treatAsMissing)
+
+      const res = await fetch(`${BACKEND}/recipe-from-text`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          instruction,
+          source_path: path || (uploadsList[0] && uploadsList[0].path),
+          output_path: "output_from_text.csv",
+          regression_model: regressionModel,
+          regression_features: regressionFeatures ? regressionFeatures.split(/\s*,\s*/) : null,
+          regression_group_by: regressionGroupBy || null,
+          treat_as_missing: sentinelsArr,
+        }),
+      })
+      const j = await res.json()
+      // embed parsed sentinels into impute steps for display if the user provided any
+      const recipeObj = sanitizeRecipe(j.recipe || j)
+      if (sentinelsArr && Array.isArray(sentinelsArr) && sentinelsArr.length > 0 && recipeObj && Array.isArray(recipeObj.cleaning_steps)) {
+        recipeObj.cleaning_steps = recipeObj.cleaning_steps.map((step) => {
+          try {
+            if (step && step.action === 'impute') {
+              const params = step.params ? { ...step.params } : {}
+              // set the treat_as_missing sentinel array from user input
+              params.treat_as_missing = sentinelsArr
+              return { ...step, params }
+            }
+          } catch (e) {
+            // swallow and return original step
+          }
+          return step
+        })
+      }
+      // store only the generated recipe for the Generated recipe panel
+      setRecipeFromText(recipeObj)
+      // if multiple candidate columns, ask for confirmation before applying
+        if (j.column_candidates && j.column_candidates.length > 1) {
+        setCandidateColumns(j.column_candidates.map((c) => c[0]))
+        setPendingGenerated(j)
+        setShowConfirmModal(true)
+      } else {
+        const safeRecipe = sanitizeRecipe(j.recipe)
+        const json = JSON.stringify(safeRecipe, null, 2)
+        setRecipeText(json)
+        // auto-show generated JSON so users see the recipe immediately
+        setShowRecipeJson(true)
+        setPendingGenerated(null)
+      }
+      // fetch generated preview sized to the current Generated preview Rows selector
+      try {
+        const nParam = typeof rowsToShow === 'number' ? rowsToShow : Number(rowsToShow)
+        const previewQs = []
+        if (nParam != null) previewQs.push(`n=${encodeURIComponent(nParam)}`)
+        if (j && j.id) previewQs.push(`recipe_id=${encodeURIComponent(j.id)}`)
+        const previewUrl = `${BACKEND}/preview${previewQs.length ? `?${previewQs.join('&')}` : ''}`
+        const previewRes = await fetch(previewUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(j.recipe),
+        })
+        const pj = await previewRes.json()
+        setGeneratedPreview(sanitizePreview(pj.preview))
+      } catch (pe) {
+        console.warn('Failed to fetch generated preview', pe)
+        setGeneratedPreview(null)
+      }
+    } finally {
+      setRecipeGenerating(false)
+    }
+  }
+
+  function confirmCandidate(col) {
+    if (!pendingGenerated) return
+    const j = pendingGenerated
+    // coerce recipe to use selected column where applicable
+    try {
+      const r = sanitizeRecipe(j.recipe)
+      if (r && r.cleaning_steps) {
+        r.cleaning_steps = r.cleaning_steps.map((s) => ({ ...s, column: s.column || col }))
+      }
+      const json = JSON.stringify(r, null, 2)
+      setRecipeText(json)
+      setShowRecipeJson(true)
+      addToast(`Using column '${col}' for generated recipe`, 'info')
+    } catch (e) {
+      addToast('Failed to accept generated recipe: ' + e.message, 'error')
+    }
+    setShowConfirmModal(false)
+    setPendingGenerated(null)
+    setCandidateColumns([])
   }
 
   async function doJoinSuggestions() {
@@ -270,16 +802,35 @@ export default function App() {
   }
 
   async function doPreview() {
+    setPreviewLoading(true)
     try {
-      const recipe = JSON.parse(recipeText)
-      const url = `${BACKEND}/preview${recipeId ? `?recipe_id=${encodeURIComponent(recipeId)}` : ""}`
+      let recipe = null
+      if (recipeText && recipeText.trim()) {
+        try {
+          recipe = JSON.parse(recipeText)
+        } catch (err) {
+          // fallback to in-memory generated recipe if available
+          if (recipeFromText) recipe = recipeFromText
+          else throw new Error('Recipe JSON is invalid or incomplete')
+        }
+      } else if (recipeFromText) {
+        recipe = recipeFromText
+      } else {
+        throw new Error('No recipe available to preview')
+      }
+      // include requested preview rows (n=0 means full dataset)
+      const nParam = typeof previewRows === 'number' ? previewRows : Number(previewRows)
+      const qs = []
+      if (nParam != null) qs.push(`n=${encodeURIComponent(nParam)}`)
+      if (recipeId) qs.push(`recipe_id=${encodeURIComponent(recipeId)}`)
+      const url = `${BACKEND}/preview${qs.length ? `?${qs.join('&')}` : ''}`
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(recipe),
       })
       const j = await res.json()
-      setPreview(j.preview)
+      setPreview(sanitizePreview(j.preview))
       if (j.schema_warnings) {
         // lightweight notification
         setApplyRes((prev) => ({ ...(prev || {}), schema_warnings: j.schema_warnings }))
@@ -287,12 +838,27 @@ export default function App() {
       }
     } catch (e) {
       addToast("Invalid recipe JSON: " + e.message, "error")
+    } finally {
+      setPreviewLoading(false)
     }
   }
 
   async function doApply() {
+    setApplyLoading(true)
     try {
-      const recipe = JSON.parse(recipeText)
+      let recipe = null
+      if (recipeText && recipeText.trim()) {
+        try {
+          recipe = JSON.parse(recipeText)
+        } catch (err) {
+          if (recipeFromText) recipe = recipeFromText
+          else throw new Error('Recipe JSON is invalid or incomplete')
+        }
+      } else if (recipeFromText) {
+        recipe = recipeFromText
+      } else {
+        throw new Error('No recipe available to apply')
+      }
       const res = await fetch(`${BACKEND}/apply`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -302,23 +868,63 @@ export default function App() {
       setApplyRes(j.result)
     } catch (e) {
       addToast("Invalid recipe JSON: " + e.message, "error")
+    } finally {
+      setApplyLoading(false)
     }
+  }
+
+  function acceptGenerated(){
+    // accept current recipeText (already set) and clear preview
+    setGeneratedPreview(null)
+    setPrevRecipeText(null)
+    setShowCustomRevisions(false)
+    addToast('Accepted generated recipe', 'success')
   }
 
   async function saveRecipe(name) {
     try {
-      const recipe = JSON.parse(recipeText)
+      // If recipeText is empty (e.g. user worked from generated preview),
+      // fall back to the in-memory `recipeFromText` object. Provide a
+      // clearer error if neither is present.
+      let recipe = null
+      if (recipeText && recipeText.trim()) {
+        try {
+          recipe = JSON.parse(recipeText)
+        } catch (err) {
+          throw new Error('Recipe JSON is invalid')
+        }
+      } else if (recipeFromText) {
+        recipe = recipeFromText
+      } else {
+        throw new Error('No recipe to save')
+      }
+
       const res = await fetch(`${BACKEND}/recipes`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name, recipe }),
       })
-      const j = await res.json()
+      let j = null
+      if (res.ok) {
+        try {
+          j = await res.json()
+        } catch (err) {
+          // backend returned empty body; construct a minimal response
+          j = { id: null }
+        }
+      } else {
+        const txt = await res.text()
+        throw new Error(txt || `Save failed: ${res.status}`)
+      }
       setRecipeId(j.id)
       // fetch saved record to get status
-      const saved = await fetch(`${BACKEND}/recipes/${encodeURIComponent(j.id)}`)
-      const sdata = await saved.json()
-      setRecipeStatus(sdata.status || "draft")
+      if (j.id) {
+        const saved = await fetch(`${BACKEND}/recipes/${encodeURIComponent(j.id)}`)
+        if (saved.ok) {
+          const sdata = await saved.json()
+          setRecipeStatus(sdata.status || "draft")
+        }
+      }
       addToast(`Saved recipe ${name}`, "success")
     } catch (e) {
       addToast("Failed to save recipe: " + e.message, "error")
@@ -326,23 +932,43 @@ export default function App() {
   }
 
   async function approveSavedRecipe() {
+    // open confirmation modal
     if (!recipeId) {
       addToast("No saved recipe to approve", "warn")
       return
     }
+    setShowApproveConfirm(true)
+  }
+
+  async function confirmApprove() {
+    if (!recipeId) {
+      addToast("No saved recipe to approve", "warn")
+      setShowApproveConfirm(false)
+      return
+    }
     try {
       const res = await fetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}/approve`, { method: "POST" })
+      if (!res.ok) {
+        const txt = await res.text()
+        throw new Error(txt || 'Approve failed')
+      }
       const j = await res.json()
       setRecipeStatus(j.status)
+      setShowApproveConfirm(false)
       addToast(`Recipe ${recipeId} approved`, "success")
     } catch (e) {
-      addToast("Failed to approve: " + e.message, "error")
+      setShowApproveConfirm(false)
+      addToast("Failed to approve: " + (e.message || e), "error")
     }
   }
 
   async function runSavedRecipe(format = "csv") {
     if (!recipeId) {
       addToast("Save recipe before running", "warn")
+      return
+    }
+    if (recipeStatus !== 'approved') {
+      addToast('Approve the recipe before running', 'warn')
       return
     }
     try {
@@ -353,6 +979,98 @@ export default function App() {
       addToast(`Run started: ${j.run.id}`, "info")
     } catch (e) {
       addToast("Failed to run recipe: " + e.message, "error")
+    }
+  }
+
+  // debug helper to surface client state and attempt run+download; useful when clicks produce no network traffic
+  async function debugRunDownload(format = 'csv') {
+    console.log('debugRunDownload invoked', { recipeId, format, recipeTextSnapshot: recipeText && recipeText.slice(0,200) })
+    addToast(`Debug: recipeId=${recipeId || '<none>'}`, 'info', 6000)
+    // if no recipeId, still show the current recipeText in console for inspection
+    if (!recipeId) {
+      console.warn('debugRunDownload: no recipeId; cannot run. Current recipeText (truncated):', recipeText && recipeText.slice(0,1000))
+      return
+    }
+    // delegate to the real runner which also logs progress
+    try {
+      await runAndDownloadSavedRecipe(format)
+    } catch (e) {
+      console.error('debugRunDownload: runAndDownloadSavedRecipe threw', e)
+      addToast('Debug run failed: ' + (e.message || e), 'error')
+    }
+  }
+
+  const [runDownloadLoading, setRunDownloadLoading] = useState(false)
+
+  async function runAndDownloadSavedRecipe(format = "csv") {
+    console.log('runAndDownloadSavedRecipe invoked', { recipeId, format })
+    if (!recipeId) {
+      addToast('Save recipe before running', 'warn')
+      console.warn('runAndDownloadSavedRecipe aborted: no recipeId')
+      return
+    }
+    if (recipeStatus !== 'approved') {
+      addToast('Approve the recipe before running', 'warn')
+      console.warn('runAndDownloadSavedRecipe aborted: not approved')
+      return
+    }
+    try {
+      setRunDownloadLoading(true)
+      addToast('Running recipe on server...', 'info')
+      const res = await fetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}/run?export_format=${encodeURIComponent(format)}`, { method: 'POST' })
+      if (!res.ok) {
+        let err = 'Run failed'
+        try { const j = await res.json(); err = j.detail || j.message || JSON.stringify(j) } catch { err = await res.text() }
+        addToast(err, 'error')
+        setRunDownloadLoading(false)
+        return
+      }
+      const j = await res.json()
+      console.log('run response', j)
+      const out = j.run && j.run.output_path
+      if (!out) {
+        addToast('Run completed but no output path found', 'warn')
+        console.warn('Run completed but response had no output_path', j)
+        setRunDownloadLoading(false)
+        return
+      }
+      // Fetch the generated file and trigger a blob download (more reliable than opening a new tab)
+      const downloadUrl = `${BACKEND}/download?path=${encodeURIComponent(out)}`
+      console.log('Download URL', downloadUrl)
+      try {
+        const fileRes = await fetch(downloadUrl)
+        if (!fileRes.ok) {
+          let err = 'Download failed'
+          try { const js = await fileRes.json(); err = js.detail || js.message || JSON.stringify(js) } catch { err = await fileRes.text() }
+          addToast(err, 'error')
+          setRunDownloadLoading(false)
+          return
+        }
+        const blob = await fileRes.blob()
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        // derive filename from output path
+        try {
+          const parts = String(out).split(/\\|\//)
+          a.download = parts[parts.length - 1] || `falconbroom_output_${Date.now()}`
+        } catch {
+          a.download = `falconbroom_output_${Date.now()}`
+        }
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+        URL.revokeObjectURL(url)
+        addToast('Download started', 'success')
+      } catch (e) {
+        addToast('Download failed: ' + (e.message || e), 'error')
+      } finally {
+        setRunDownloadLoading(false)
+      }
+    } catch (e) {
+      console.error(e)
+      addToast('Run & Download failed: ' + (e.message || e), 'error')
+      setRunDownloadLoading(false)
     }
   }
 
@@ -402,10 +1120,47 @@ export default function App() {
     }
   }
 
+  function downloadPreviewCsv() {
+    if (!generatedPreview || !generatedPreview.after) {
+      addToast('No preview available to download. Run Preview or generate a recipe.', 'warn')
+      return
+    }
+    try {
+      const rows = generatedPreview.after || []
+      if (rows.length === 0) {
+        addToast('Preview is empty; nothing to download.', 'warn')
+        return
+      }
+      const cols = selectedColumns && selectedColumns.length > 0 ? selectedColumns : Object.keys(rows[0])
+      const escapeCell = (v) => {
+        if (v === null || v === undefined) return ''
+        const s = String(v)
+        if (s.includes('"') || s.includes(',') || s.includes('\n')) return '"' + s.replace(/"/g, '""') + '"'
+        return s
+      }
+      const header = cols.join(',')
+      const csv = [header, ...rows.map(r => cols.map(c => escapeCell(r[c] ?? '')).join(','))].join('\n')
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `falconbroom_preview_${Date.now()}.csv`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+      addToast('Downloaded CSV', 'success')
+    } catch (e) {
+      console.error(e)
+      addToast('Failed to generate CSV: ' + (e.message || e), 'error')
+    }
+  }
+
   // poll history while any runs are running
   React.useEffect(() => {
     let timer = null
-    const hasRunning = historyList.some((h) => h.status === "running")
+    const list = historyList || []
+    const hasRunning = list.some((h) => h && h.status === "running")
     if (hasRunning) {
       timer = setInterval(fetchHistory, 3000)
     }
@@ -493,13 +1248,7 @@ export default function App() {
               style={{ display: "none" }}
             />
 
-            <label>Plain-English instruction</label>
-            <textarea
-              value={instruction}
-              onChange={(e) => setInstruction(e.target.value)}
-              rows={5}
-              placeholder="e.g. fill missing age values, lowercase email, and remove duplicate customers"
-            />
+            {/* Plain-English instruction moved to Custom Revisions - see that panel */}
 
             <div className="source-data-peek">
               <div className="source-data-peek-header">
@@ -608,55 +1357,9 @@ export default function App() {
             </div>
           </Card>
 
-          <Card eyebrow="Uploads" title="Saved uploads" subtitle="Uploaded files are persisted and reusable across app reloads.">
-            {uploadHistory.length ? (
-              <div className="upload-history">
-                {uploadHistory.map((item) => (
-                  <button
-                    key={item.path}
-                    className="upload-item"
-                    onClick={() => setPath(item.path)}
-                    title={item.path}
-                  >
-                    <span className="upload-item-name">{item.name}</span>
-                    <small>{item.path}</small>
-                  </button>
-                ))}
-              </div>
-            ) : (
-              <div className="empty-state">No uploads yet. Use Upload CSV to add one.</div>
-            )}
-          </Card>
+          {/* Uploads moved to its own tab */}
 
-          <Card
-            eyebrow="Custom revisions"
-            title="Recipe editor"
-            subtitle="Refine transformation steps in-place, then preview or apply without leaving the Source tab."
-          >
-            <textarea value={recipeText} onChange={(e) => setRecipeText(e.target.value)} rows={14} className="editor" />
-            <div className="editor-meta">
-              <label>Recipe name</label>
-              <input placeholder="My recipe name" ref={recipeNameRef} />
-              <div className="recipe-meta-line">
-                <strong>Saved ID:</strong> {recipeId || "(not saved)"} &nbsp; <strong>Status:</strong> {recipeStatus || "(draft)"}
-              </div>
-            </div>
-            <div className="button-row">
-              <button className="primary" onClick={doPreview}>Preview</button>
-              <button onClick={doApply}>Apply</button>
-              <button onClick={() => saveRecipe(recipeNameRef.current?.value || `recipe_${Date.now()}`)}>Save</button>
-              <button onClick={approveSavedRecipe} disabled={!recipeId}>Approve</button>
-              <label style={{display:'inline-flex',alignItems:'center',gap:8}}>
-                <span>Run as</span>
-                <select defaultValue="csv" ref={runFormatRef}>
-                  <option value="csv">CSV</option>
-                  <option value="xlsx">XLSX</option>
-                </select>
-              </label>
-              <button onClick={() => runSavedRecipe(runFormatRef.current?.value || 'csv')} disabled={!recipeId}>Run</button>
-              <button onClick={exportToSheets} disabled={!recipeId}>Export to Google Sheets</button>
-            </div>
-          </Card>
+          {/* Custom revisions modal rendered globally */}
 
           <Card eyebrow="Run history" title="Runs and lineage" subtitle="View previous runs, outputs, and create rollbacks.">
             <div className="button-row">
@@ -664,8 +1367,8 @@ export default function App() {
             </div>
             {historyList.length ? (
               <div className="history-list">
-                {historyList.map((r) => (
-                  <div key={r.id} className="history-item">
+                {historyList.map((r, idx) => (
+                  <div key={r && (r.id || r.run_id) ? (r.id || r.run_id) : `history-${idx}`} className="history-item">
                     <div style={{flex:'1 1 0'}}>
                       <div className="history-top">
                         <strong>{r.id}</strong>
@@ -709,11 +1412,17 @@ export default function App() {
             <div className="inline-grid">
               <div>
                 <label>Left CSV path</label>
-                <input value={leftPath} onChange={(e) => setLeftPath(e.target.value)} placeholder="Left CSV path" />
+                <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                  <input value={leftPath} onChange={(e) => setLeftPath(e.target.value)} placeholder="Left CSV path" style={{flex:1}} />
+                  <button onClick={() => { setUploadTarget('left'); uploadInputRef.current?.click() }} title="Upload left file">Upload</button>
+                </div>
               </div>
               <div>
                 <label>Right CSV path</label>
-                <input value={rightPath} onChange={(e) => setRightPath(e.target.value)} placeholder="Right CSV path" />
+                <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                  <input value={rightPath} onChange={(e) => setRightPath(e.target.value)} placeholder="Right CSV path" style={{flex:1}} />
+                  <button onClick={() => { setUploadTarget('right'); uploadInputRef.current?.click() }} title="Upload right file">Upload</button>
+                </div>
               </div>
             </div>
             <div className="button-row">
@@ -724,6 +1433,75 @@ export default function App() {
 
           <Card eyebrow="Recipe preview" title="Suggested step list" subtitle="What the current recipe suggestion engine produced.">
             <JsonBlock value={suggest} empty="No suggestion set yet." />
+          </Card>
+        </div>
+      )
+    }
+
+    if (activeTab === "uploads") {
+      return (
+        <div className="tab-stack tab-panel">
+          <Card eyebrow="Uploads" title="Saved uploads" subtitle="Uploaded files are persisted and reusable across app reloads.">
+            <div style={{display:'flex',gap:8,marginBottom:8}}>
+              <button onClick={fetchUploads}>Refresh uploads</button>
+              <button onClick={fetchDuplicates}>Find duplicates</button>
+            </div>
+            {uploadsLoading ? (
+              <div style={{padding:12,display:'flex',alignItems:'center',gap:8}}>
+                <div>⏳</div>
+                <div>Loading uploads…</div>
+              </div>
+            ) : uploadsList && uploadsList.length ? (
+              <div className="upload-history">
+                {uploadsList.map((item) => (
+                  <div key={item.path} className="upload-item-row">
+                    <div style={{flex:'1 1 0'}}>
+                      <div className="upload-item-name">{item.name}</div>
+                      <small style={{display:'block',color:'var(--muted)'}}>{item.path}</small>
+                      {(item.last_refreshed || item.inspected_at || item.uploadedAt || item.modified_at) && (
+                        <small style={{display:'block',color:'var(--muted)',marginTop:4}}>
+                          Last refreshed: {new Date(item.last_refreshed || item.inspected_at || item.uploadedAt || item.modified_at).toLocaleString()}
+                        </small>
+                      )}
+                    </div>
+                    <div style={{display:'flex',gap:8}}>
+                      <button
+                        onClick={() => openUploadItem(item)}
+                        disabled={uploadsLoading || (inspectionLoading && inspectingPath === item.path)}
+                      >
+                        {inspectionLoading && inspectingPath === item.path ? 'Opening…' : 'Open'}
+                      </button>
+                      <button
+                        onClick={() => { setPath(item.path); doProfileForPath(item.path) }}
+                        disabled={uploadsLoading}
+                      >
+                        Profile
+                      </button>
+                      <button
+                        onClick={() => refreshInspection(item)}
+                        disabled={uploadsLoading || (inspectionLoading && inspectingPath === item.path)}
+                      >
+                        {inspectionLoading && inspectingPath === item.path ? 'Refreshing…' : 'Refresh'}
+                      </button>
+                      <button
+                        onClick={async ()=>{
+                          try{
+                            const res = await fetch(`${BACKEND}/uploads/delete`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({path: item.path}) })
+                            if(!res.ok){ const txt = await res.text(); addToast('Delete failed: '+txt,'error'); return }
+                            setUploadsList((u)=> (u||[]).filter(x=> x.path !== item.path))
+                            addToast('Deleted ' + item.name, 'success')
+                          }catch(e){ addToast('Delete failed: '+(e.message||e),'error') }
+                        }}
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="empty-state">No uploads yet. Use Upload CSV to add one.</div>
+            )}
           </Card>
         </div>
       )
@@ -802,6 +1580,13 @@ export default function App() {
 
   return (
     <div className={`app-shell ${themeClass}`} data-theme={theme}>
+      <header className="app-header">
+        <div className="logo-wrap">
+          <img src="/logo.svg" alt="FalconBroom logo" className="app-logo" />
+          <h1 className="app-title">FalconBroom</h1>
+        </div>
+      </header>
+      {/* header styles moved to styles.css */}
       {/* Toasts container */}
       <div className="toasts-root" aria-live="polite">
         {toasts.map((t) => (
@@ -843,6 +1628,28 @@ export default function App() {
                   </div>
                 </div>
               ))}
+            </div>
+          </div>
+        )}
+        {showApproveConfirm && (
+          <div className="modal-overlay" onClick={() => setShowApproveConfirm(false)}>
+            <div className="modal-panel card" onClick={(e) => e.stopPropagation()} role="dialog" aria-label="Approve recipe">
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                <div>
+                  <h3>Confirm approve</h3>
+                  <div style={{color:'var(--muted)'}}>Approving this recipe marks it as ready to run. This is required before executing runs.</div>
+                </div>
+                <div>
+                  <button onClick={() => setShowApproveConfirm(false)}>Close</button>
+                </div>
+              </div>
+              <div style={{marginTop:12}}>
+                <p>Are you sure you want to approve recipe <strong>{recipeId || '(unsaved)'}</strong>?</p>
+                <div style={{display:'flex',gap:8,marginTop:12}}>
+                  <button className="primary" onClick={confirmApprove}>Approve</button>
+                  <button className="close" onClick={() => setShowApproveConfirm(false)}>Cancel</button>
+                </div>
+              </div>
             </div>
           </div>
         )}
@@ -922,10 +1729,399 @@ export default function App() {
           <div className="top-bar-status">
             <span className="chip">Left rail navigation</span>
             <span className="chip">Tab: {activeItem.label}</span>
+            {backgroundBusy && (
+              <span className="chip" title="Background tasks running">Loading…</span>
+            )}
           </div>
         </header>
 
         {renderTab()}
+
+        {showCustomRevisions && (
+          <div className="modal-overlay" onClick={() => setShowCustomRevisions(false)}>
+            <div className="modal-panel card" style={{position:'relative'}} onClick={(e) => e.stopPropagation()} role="dialog" aria-label="Custom revisions">
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:12}}>
+                <div>
+                  <h3>Custom revisions</h3>
+                  <div style={{color:'var(--muted)',fontSize:'0.9rem'}}>Refine transformation steps and instruction.</div>
+                </div>
+                <div>
+                  <span style={{display:'inline-flex',alignItems:'center',gap:8}}>
+                    {recipeGenerating ? <span className="chip">Generating…</span> : <span className="chip">Auto-generate</span>}
+                    <button onClick={() => setShowCustomRevisions(false)} aria-label="Close custom revisions">✕</button>
+                  </span>
+                </div>
+              </div>
+
+              <div style={{marginTop:12}}>
+                <label>Plain-English instruction</label>
+                {sourceInspection ? (
+                  <div style={{marginTop:8, marginBottom:8}}>
+                    <div style={{fontSize:'0.9rem',color:'var(--muted)',marginBottom:6}}>
+                      Raw data preview {showFullPreview ? '(full)' : '(first rows)'}
+                      <button style={{marginLeft:12}} onClick={() => setShowFullPreview((s)=>!s)}>{showFullPreview ? 'Collapse' : 'Show full'}</button>
+                    </div>
+                    <div className="table-wrap" style={{maxHeight: showFullPreview ? 560 : 180, overflow:'auto'}}>
+                      <table className="source-table">
+                        <thead>
+                          <tr>
+                            <th>#</th>
+                            {(showFullPreview ? sourceInspection.columns : sourceInspection.columns.slice(0,8)).map((col) => (<th key={col}>{col}</th>))}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(showFullPreview ? sourceInspection.rows : sourceInspection.rows.slice(0,5)).map((row, rowIndex) => (
+                            <tr key={rowIndex}>
+                              <td>{sourceInspection.offset + rowIndex + 1}</td>
+                              {(showFullPreview ? sourceInspection.columns : sourceInspection.columns.slice(0,8)).map((col) => (<td key={col}>{String(row[col] ?? '')}</td>))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    {/* Condensed diagnostics summary placed between raw preview and instruction */}
+                    {diagnostics && Object.keys(diagnostics).length > 0 && (
+                      <div className="diagnostics-panel" style={{marginTop:8}}>
+                        <h4>Data diagnostics summary</h4>
+                        <div className="column-meta-grid">
+                          {Object.entries(diagnostics)
+                            .filter(([col, info]) => (info.missing_count || info.mixed_type || info.constant))
+                            .slice(0, 12)
+                            .map(([col, info]) => (
+                              <div key={col} className="column-meta-item">
+                                <strong>{col}</strong>
+                                <small>Missing: {info.missing_count ?? '—'}</small>
+                                <small>Unique: {info.unique_count ?? '—'}</small>
+                                {info.mixed_type ? <small style={{color:'#f59e0b'}}>Mixed types</small> : null}
+                                {info.constant ? <small style={{color:'#fb7185'}}>Constant</small> : null}
+                              </div>
+                            ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ) : null}
+                <textarea
+                  ref={instructionRef}
+                  value={instruction}
+                  onChange={(e) => setInstruction(e.target.value)}
+                  rows={3}
+                  placeholder="e.g. fill missing age values, lowercase email, and remove duplicate customers"
+                />
+                <div style={{marginTop:8, display:'flex', gap:8, alignItems:'center', flexWrap:'wrap'}}>
+                  <small style={{color:'var(--muted)'}}>Regression options:</small>
+                  <label style={{fontSize:'0.85rem'}}>Model
+                    <select value={regressionModel} onChange={(e)=>setRegressionModel(e.target.value)} style={{marginLeft:6}}>
+                      <option value="linear">Linear</option>
+                      <option value="ridge">Ridge</option>
+                    </select>
+                  </label>
+                  <label style={{fontSize:'0.85rem'}}>Features
+                    <input value={regressionFeatures} onChange={(e)=>setRegressionFeatures(e.target.value)} placeholder="HEIGHT, WEIGHT" style={{marginLeft:6}} />
+                  </label>
+                  <label style={{fontSize:'0.85rem'}}>Group by
+                    <input value={regressionGroupBy} onChange={(e)=>setRegressionGroupBy(e.target.value)} placeholder="city" style={{marginLeft:6}} />
+                  </label>
+                  <label style={{fontSize:'0.85rem'}}>Treat as missing
+                    <input value={treatAsMissing} onChange={(e)=>setTreatAsMissing(e.target.value)} placeholder="e.g. 0, NA, ''" style={{marginLeft:6}} />
+                  </label>
+                  <button onClick={() => setInstruction("Predict AGE from HEIGHT and WEIGHT using regression")}>Regression example</button>
+                  <button onClick={() => setInstruction("Impute AGE from BIRTH_YEAR using mean")}>Mean impute example</button>
+                </div>
+                <div style={{marginTop:8}}>
+                  <button className="primary" onClick={() => doRecipeFromText()} disabled={recipeGenerating || !instruction || instruction.trim().length===0}>
+                    {recipeGenerating ? 'Generating…' : 'Generate JSON'}
+                  </button>
+                </div>
+              </div>
+
+              <div style={{marginTop:12}}>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                  <label>Recipe JSON</label>
+                  <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                    <small style={{color:'var(--muted)'}}>Optional — generated from instruction</small>
+                    <button onClick={() => setShowRecipeJson((s)=>!s)}>{showRecipeJson ? 'Hide JSON' : 'Show JSON'}</button>
+                  </div>
+                </div>
+                {showRecipeJson ? (
+                  <textarea value={recipeText} onChange={(e) => setRecipeText(e.target.value)} rows={10} className="editor" />
+                ) : (
+                  <div className="empty-state">Recipe JSON hidden. Click "Generate JSON" below the instruction to create a recipe JSON. Click "Show JSON" to edit manually.</div>
+                )}
+                {showConfirmModal ? (
+                  <div className="modal">
+                    <div className="modal-content">
+                      <h3>Confirm column</h3>
+                      <p>Multiple columns match your instruction. Choose the correct column:</p>
+                      <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+                        {candidateColumns.map((c) => (
+                          <button key={c} onClick={() => confirmCandidate(c)}>{c}</button>
+                        ))}
+                      </div>
+                      <div style={{marginTop:12}}>
+                        <button className="close" onClick={() => setShowConfirmModal(false)}>Cancel</button>
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+
+              {generatedPreview && (
+                <div style={{marginTop:12}}>
+                  <h4>Generated preview (sample)</h4>
+                  {generatedPreview.warnings && generatedPreview.warnings.length > 0 && (
+                    <div style={{marginBottom:8}}>
+                      {generatedPreview.warnings.map((w, i) => (
+                        <div key={i} style={{color:'#f59e0b', fontSize:'0.95rem'}}>
+                          {w.message || (w.step === 'impute' ? `Imputed ${w.column}: ${w.rows_changed || 0} rows changed` : JSON.stringify(w))}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{display:'flex',gap:12,alignItems:'center',marginBottom:8}}>
+                    <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                      <label style={{fontSize:'0.9rem',color:'var(--muted)'}}>Rows</label>
+                      <select value={rowsToShow} onChange={(e)=>setRowsToShow(Number(e.target.value))}>
+                        <option value={6}>6</option>
+                        <option value={12}>12</option>
+                        <option value={20}>20</option>
+                        <option value={0}>All</option>
+                      </select>
+                    </div>
+                    <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                      <label style={{fontSize:'0.9rem',color:'var(--muted)'}}>Columns</label>
+                      <button onClick={()=>setShowColumnPicker((s)=>!s)}>{showColumnPicker ? 'Hide' : 'Select'}</button>
+                      <button onClick={()=>setSelectedColumns(null)}>All</button>
+                    </div>
+                  </div>
+
+                  {showColumnPicker && (
+                    <div style={{display:'flex',flexWrap:'wrap',gap:6,marginBottom:8}}>
+                      {((generatedPreview.before[0] ? Object.keys(generatedPreview.before[0]) : [])).map((col)=> (
+                        <label key={col} style={{display:'inline-flex',alignItems:'center',gap:6}}>
+                          <input type="checkbox" checked={selectedColumns ? selectedColumns.includes(col) : true} onChange={(e)=>{
+                            if(!selectedColumns){ setSelectedColumns(((generatedPreview.before[0]?Object.keys(generatedPreview.before[0]):[]).filter(c=>c!==col))) }
+                            else{
+                              if(e.target.checked) setSelectedColumns(selectedColumns.filter(c=>c!==col))
+                              else setSelectedColumns([...selectedColumns, col])
+                            }
+                          }} />
+                          <small style={{color:'var(--muted)'}}>{col}</small>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:12,marginBottom:8}}>
+                    <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                      <div style={{display:'inline-flex',alignItems:'center',gap:8}}>
+                        <div style={{width:12,height:12,background:'linear-gradient(90deg, rgba(245,158,11,0.12), rgba(245,158,11,0.06))',borderBottom:'2px solid rgba(245,158,11,0.18)'}} />
+                        <small style={{color:'var(--muted)'}}>Changed</small>
+                      </div>
+                      <div style={{display:'inline-flex',alignItems:'center',gap:8}}>
+                        <div style={{width:12,height:12,background:'#f59e0b',opacity:0.18,border:'1px solid rgba(245,158,11,0.22)'}} />
+                        <small style={{color:'var(--muted)'}}>Selected</small>
+                      </div>
+                    </div>
+                    <div style={{display:'flex',gap:8}}>
+                      <button onClick={() => setSelectedCells(((generatedPreview.before||[]).reduce((acc,_,i)=>{
+                        ((generatedPreview.before[i] ? Object.keys(generatedPreview.before[i]) : [])).forEach((col)=>{
+                          const isChanged = String((generatedPreview.before[i]||{})[col] ?? '') !== String(((generatedPreview.after[i]||{})[col] ?? ''))
+                          if(isChanged) acc[`${i}|${col}`] = true
+                        })
+                        return acc
+                      },{})))}>Select all changes</button>
+                      <button onClick={() => setSelectedCells({})}>Clear selection</button>
+                      <button onClick={applySelectedChanges} className="primary">Apply Selected</button>
+                    </div>
+                  </div>
+
+                  <div className="preview-grid" style={{gridTemplateColumns:'1fr 1fr', gap:12}}>
+                    <div>
+                      <h5>Before</h5>
+                      <div className="table-wrap" style={{maxHeight:320, overflow:'auto'}}>
+                        <table className="source-table">
+                          <thead>
+                            <tr>
+                              <th>#</th>
+                              {(generatedPreview.before[0] ? ((selectedColumns?selectedColumns:Object.keys(generatedPreview.before[0])).slice(0,8)) : []).map((col) => (
+                                <th key={col}>{col}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(generatedPreview.before || []).slice(0, rowsToShow || undefined).map((row, i) => (
+                              <tr key={i}>
+                                <td>{i+1}</td>
+                                {(generatedPreview.before[0] ? ((selectedColumns?selectedColumns:Object.keys(generatedPreview.before[0])).slice(0,8)) : []).map((col) => {
+                                  const beforeVal = String((generatedPreview.before[i]||{})[col] ?? '')
+                                  const afterVal = String(((generatedPreview.after[i]||{})[col] ?? ''))
+                                  const isChanged = beforeVal !== afterVal
+                                  const isSelected = !!selectedCells[_cellKey(i,col)]
+                                  const cls = isChanged ? (isSelected ? 'cell-changed cell-selected' : 'cell-changed') : ''
+                                  return (
+                                    <td key={col} className={cls}
+                                      onClick={() => { if(isChanged) toggleCellSelection(i,col) }}
+                                      onMouseEnter={(e)=>{ if(isChanged) setTooltip({x:e.clientX,y:e.clientY, before:beforeVal, after:afterVal}) }}
+                                      onMouseLeave={()=>setTooltip(null)}
+                                    >{String(row[col] ?? '')}</td>
+                                  )
+                                })}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                    <div>
+                      <h5>After</h5>
+                      <div className="table-wrap" style={{maxHeight:320, overflow:'auto'}}>
+                        <table className="source-table">
+                          <thead>
+                            <tr>
+                              <th>#</th>
+                              {(generatedPreview.after[0] ? ((selectedColumns?selectedColumns:Object.keys(generatedPreview.after[0])).slice(0,8)) : []).map((col) => (
+                                <th key={col}>{col}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(generatedPreview.after || []).slice(0, rowsToShow || undefined).map((row, i) => (
+                              <tr key={i}>
+                                <td>{i+1}</td>
+                                {(generatedPreview.after[0] ? ((selectedColumns?selectedColumns:Object.keys(generatedPreview.after[0])).slice(0,8)) : []).map((col) => {
+                                  const beforeVal = String((generatedPreview.before[i]||{})[col] ?? '')
+                                  const afterVal = String((generatedPreview.after[i]||{})[col] ?? '')
+                                  const isChanged = beforeVal !== afterVal
+                                  const isSelected = !!selectedCells[_cellKey(i,col)]
+                                  const cls = isChanged ? (isSelected ? 'cell-changed cell-selected' : 'cell-changed') : ''
+                                  return (
+                                    <td key={col} className={cls}
+                                      onClick={() => { if(isChanged) toggleCellSelection(i,col) }}
+                                      onMouseEnter={(e)=>{ if(isChanged) setTooltip({x:e.clientX,y:e.clientY, before:beforeVal, after:afterVal}) }}
+                                      onMouseLeave={()=>setTooltip(null)}
+                                    >{String(row[col] ?? '')}</td>
+                                  )
+                                })}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Schema diff */}
+                  <div style={{marginTop:10}}>
+                    <h5>Schema changes</h5>
+                    <div className="schema-diff">
+                      {(() => {
+                        const beforeCols = generatedPreview.before[0] ? Object.keys(generatedPreview.before[0]) : []
+                        const afterCols = generatedPreview.after[0] ? Object.keys(generatedPreview.after[0]) : []
+                        const added = afterCols.filter(c=>!beforeCols.includes(c))
+                        const removed = beforeCols.filter(c=>!afterCols.includes(c))
+                        return (
+                          <div>
+                            {added.length>0 && <div style={{color:'#10b981'}}>Added: {added.join(', ')}</div>}
+                            {removed.length>0 && <div style={{color:'#ef4444'}}>Removed: {removed.join(', ')}</div>}
+                            {added.length===0 && removed.length===0 && <div style={{color:'var(--muted)'}}>No schema changes detected</div>}
+                          </div>
+                        )
+                      })()}
+                    </div>
+                  </div>
+
+                  <div style={{marginTop:8,display:'flex',gap:8}}>
+                    <button className="primary" onClick={() => { acceptGenerated(); }}>Accept generated</button>
+                    <button onClick={() => { setRecipeText(prevRecipeText || ''); setGeneratedPreview(null); setSelectedCells({}); addToast('Rejected generated recipe', 'info') }}>Reject</button>
+                  </div>
+                </div>
+              )}
+
+              {/* Tooltip popup */}
+              {tooltip && (
+                <div className="tooltip-popup" style={{left: tooltip.x + 8, top: tooltip.y + 8}}>
+                  <div><strong>Before</strong>: <span style={{fontFamily:'monospace'}}>{tooltip.before}</span></div>
+                  <div><strong>After</strong>: <span style={{fontFamily:'monospace'}}>{tooltip.after}</span></div>
+                </div>
+              )}
+
+              <div style={{marginTop:10}} className="button-row">
+                <label style={{display:'inline-flex',alignItems:'center',gap:8}}>
+                  <span style={{fontSize:'0.85rem',color:'var(--muted)'}}>Preview rows</span>
+                  <select value={previewRows} onChange={(e) => setPreviewRows(Number(e.target.value))}>
+                    <option value={6}>6</option>
+                    <option value={20}>20</option>
+                    <option value={0}>All</option>
+                  </select>
+                </label>
+                <button className="primary" onClick={() => saveRecipe(recipeNameRef.current?.value || `recipe_${Date.now()}`)}>Save</button>
+                <button onClick={doPreview} disabled={previewLoading}>Preview</button>
+                <button onClick={doApply} disabled={applyLoading}>Apply</button>
+                <button
+                  onClick={approveSavedRecipe}
+                  disabled={!(applyRes && (applyRes.written || applyRes.written === 0)) || !recipeId}
+                  style={{ background: '#0ea5a4', color: '#fff', border: 'none', padding: '6px 10px', borderRadius: 4 }}
+                >
+                  Approve
+                </button>
+                <label style={{display:'inline-flex',alignItems:'center',gap:8}}>
+                  <span>Run as</span>
+                  <select defaultValue="csv" ref={runFormatRef}>
+                    <option value="csv">CSV</option>
+                    <option value="xlsx">XLSX</option>
+                  </select>
+                </label>
+                <button onClick={() => runSavedRecipe(runFormatRef.current?.value || 'csv')} disabled={!recipeId || recipeStatus !== 'approved'}>Run</button>
+                <button onClick={() => runAndDownloadSavedRecipe(runFormatRef.current?.value || 'csv')} disabled={!recipeId || recipeStatus !== 'approved'}>{runDownloadLoading ? 'Running…' : 'Run & Download'}</button>
+                <button title="Debug: show logs and attempt run+download" onClick={() => debugRunDownload(runFormatRef.current?.value || 'csv')}>Debug Run & Download</button>
+                <button onClick={exportToSheets} disabled={!recipeId}>Export to Google Sheets</button>
+                <button onClick={() => downloadPreviewCsv()} disabled={!generatedPreview}>Download CSV</button>
+              </div>
+            </div>
+          </div>
+        )}
+        {showDuplicatesModal && (
+          <div className="modal-overlay" onClick={() => setShowDuplicatesModal(false)}>
+            <div className="modal-panel card" onClick={(e) => e.stopPropagation()} role="dialog" aria-label="Duplicate uploads">
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                <div>
+                  <h3>Duplicate files</h3>
+                  <div style={{color:'var(--muted)'}}>Review duplicate groups and delete unwanted copies.</div>
+                </div>
+                <div>
+                  <button onClick={() => setShowDuplicatesModal(false)}>Close</button>
+                </div>
+              </div>
+              <div style={{marginTop:12}}>
+                {duplicateGroups.length === 0 && <div className="empty-state">No duplicates found.</div>}
+                {duplicateGroups.map((g, gi) => (
+                  <div key={g.hash || gi} style={{borderTop:'1px solid rgba(255,255,255,0.03)', paddingTop:10, marginTop:10}}>
+                    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                      <div><strong>Group</strong> <small style={{color:'var(--muted)'}}>size: {g.size}</small></div>
+                      <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                        <small style={{color:'var(--muted)'}}>{g.hash}</small>
+                        <button onClick={()=>{ if(window.confirm('Keep first file and delete others in this group?')) deleteOthersInGroup(g, g.paths[0]) }}>Keep first / Delete others</button>
+                      </div>
+                    </div>
+                    <div style={{marginTop:8,display:'flex',flexDirection:'column',gap:8}}>
+                      {g.paths.map((p) => (
+                        <div key={p} style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:8}}>
+                          <div style={{flex:'1 1 0'}}><small style={{color:'var(--muted)'}}>{p}</small></div>
+                          <div style={{display:'flex',gap:8}}>
+                            <button onClick={()=>{ navigator.clipboard?.writeText(p); addToast('Copied path to clipboard','info') }}>Copy</button>
+                            <button onClick={()=>{ deleteUploadFromModal(p) }}>Delete</button>
+                            <button onClick={()=>{ if(window.confirm('Keep this file and delete other duplicates in group?')) deleteOthersInGroup(g, p) }}>Keep</button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   )

@@ -1,0 +1,19 @@
+{
+  "id": "run_d894e3b3",
+  "recipe_id": "recipe_1781558918296_62b57941",
+  "started_at": "2026-06-15T21:28:41.370761Z",
+  "status": "completed",
+  "export_format": "csv",
+  "finished_at": "2026-06-15T21:28:41.405672Z",
+  "output_path": "output_from_text.csv",
+  "diagnostics": [
+    {
+      "step": "impute",
+      "column": "observation_date",
+      "method": "from_column",
+      "rows_changed": 0,
+      "sample_positions": [],
+      "source": "date"
+    }
+  ]
+}

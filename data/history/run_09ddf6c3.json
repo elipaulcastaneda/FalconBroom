@@ -1,0 +1,9 @@
+{
+  "id": "run_09ddf6c3",
+  "recipe_id": "recipe_1781499661236_27b55a34",
+  "started_at": "2026-06-15T05:01:04.342634Z",
+  "status": "completed",
+  "export_format": "csv",
+  "finished_at": "2026-06-15T05:01:04.365939Z",
+  "output_path": "output_from_text.csv"
+}

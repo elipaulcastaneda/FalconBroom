@@ -9,7 +9,10 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from .connectors import resolve_source
-from .engine import Cleaner
+from .engine import Cleaner, _read_table
+import csv
+import shutil
+import hashlib
 from .ingest import convert_uploaded_file
 from .ingest import _google_drive_access_token
 from .recipe_schema import Recipe
@@ -22,6 +25,7 @@ from .workflow_rules import (
     suggest_columns_to_clean,
     suggest_join_rules,
 )
+import traceback
 
 app = FastAPI(title="FalconBroom Prototype API")
 
@@ -61,6 +65,10 @@ class TextRecipeSpec(BaseModel):
     instruction: str
     source_path: str
     output_path: str = "output.csv"
+    regression_model: Optional[str] = None
+    regression_features: Optional[list] = None
+    regression_group_by: Optional[str] = None
+    treat_as_missing: Optional[list] = None
 
 
 class JoinSuggestionSpec(BaseModel):
@@ -70,6 +78,11 @@ class JoinSuggestionSpec(BaseModel):
 
 class SourceResolveSpec(BaseModel):
     path: str
+
+
+class PatchSpec(BaseModel):
+    path: str
+    patches: list
 
 
 @app.get("/health")
@@ -154,14 +167,81 @@ def suggest(spec: SourceSpec):
 @app.post("/recipe-from-text")
 def recipe_from_text(spec: TextRecipeSpec):
     try:
-        profile = cleaner.profile(spec.source_path)
-        recipe = recipe_from_plain_english(spec.instruction, profile, spec.source_path, spec.output_path)
+        # Build a profile from the materialized source. If the ingestion
+        # produced long-form rows (unit_kind/text), prefer a reconstructed
+        # table profile so the parser sees the wide table columns rather than
+        # the low-level extraction columns like `text`/`notes`.
+        try:
+            inspection = cleaner.inspect_source(spec.source_path, offset=0, limit=200)
+            cols = inspection.get("columns") or []
+            rows = inspection.get("rows") or []
+            if cols and isinstance(cols, list) and len(cols) > 0 and not (set(cols) <= set(cleaner.META_KEYS) or set(cols) == {"text", "style_json", "notes"}):
+                # build a lightweight profile from the reconstructed rows
+                profile = {}
+                for c in cols:
+                    vals = [r.get(c) for r in rows if isinstance(r, dict)]
+                    total = len(vals)
+                    missing = sum(1 for v in vals if v is None or (isinstance(v, str) and v.strip() == ""))
+                    unique = len(set([v for v in vals if v is not None and v != ""]))
+                    dtype = "str"
+                    profile[c] = {"dtype": dtype, "nulls": missing, "unique": unique}
+            else:
+                profile = cleaner.profile(spec.source_path)
+        except Exception:
+            profile = cleaner.profile(spec.source_path)
+        # pass optional regression parameters to the parser only when features are provided
+        reg_opts = None
+        if spec.regression_features and isinstance(spec.regression_features, list) and len(spec.regression_features) > 0:
+            reg_opts = {
+                "model": spec.regression_model or None,
+                "features": spec.regression_features,
+                "group_by": spec.regression_group_by or None,
+            }
+        recipe = recipe_from_plain_english(spec.instruction, profile, spec.source_path, spec.output_path, regression_options=reg_opts)
         explanations = explain_recipe(recipe, profile)
+        # ensure parser output does not include metadata-targeting steps
+        try:
+            recipe_dict = recipe.model_dump() if hasattr(recipe, "model_dump") else recipe.dict()
+            def _is_meta_column(col):
+                try:
+                    if not col or not isinstance(col, str):
+                        return False
+                    if col in cleaner.META_KEYS:
+                        return True
+                    if col.startswith("_"):
+                        return True
+                    return False
+                except Exception:
+                    return False
+
+            # Filter out any cleaning steps that target metadata or columns not present
+            # in the source profile. Use the profile we built above (which may be
+            # reconstructed from the long-form inspection) so generated steps that
+            # reference reconstructed columns are preserved rather than being
+            # dropped by comparing against the low-level extraction profile.
+            src_profile = profile
+            valid_columns = set(src_profile.keys())
+
+            def _is_valid_step(s):
+                if not s or not isinstance(s, dict):
+                    return False
+                col = s.get("column")
+                if _is_meta_column(col):
+                    return False
+                # allow steps without a column (e.g., joins) to pass
+                if not col:
+                    return True
+                return col in valid_columns
+
+            recipe_dict["cleaning_steps"] = [s for s in recipe_dict.get("cleaning_steps", []) if _is_valid_step(s)]
+        except Exception:
+            recipe_dict = recipe.model_dump() if hasattr(recipe, "model_dump") else recipe.dict()
+
         return {
             "instruction": spec.instruction,
             "action": infer_action(spec.instruction),
             "column_candidates": infer_columns_from_text(spec.instruction, profile),
-            "recipe": recipe.model_dump() if hasattr(recipe, "model_dump") else recipe.dict(),
+            "recipe": recipe_dict,
             "explanations": [
                 {
                     "step": exp.step.model_dump() if hasattr(exp.step, "model_dump") else exp.step.dict(),
@@ -223,7 +303,29 @@ def get_recipe(rid: str):
     p = RECIPES_DIR / f"{rid}.json"
     if not p.exists():
         raise HTTPException(status_code=404, detail="Recipe not found")
-    return json.loads(p.read_text(encoding="utf-8"))
+    data = json.loads(p.read_text(encoding="utf-8"))
+    # sanitize loaded recipe: remove any cleaning steps that target metadata columns
+    try:
+        recipe = data.get("recipe") or {}
+        steps = recipe.get("cleaning_steps") or []
+        def _is_meta_column(col):
+            try:
+                if not col or not isinstance(col, str):
+                    return False
+                if col in cleaner.META_KEYS:
+                    return True
+                if col.startswith("_"):
+                    return True
+                return False
+            except Exception:
+                return False
+
+        filtered = [s for s in steps if not (s and _is_meta_column(s.get("column")))]
+        recipe["cleaning_steps"] = filtered
+        data["recipe"] = recipe
+    except Exception:
+        pass
+    return data
 
 
 @app.post("/recipes/{rid}/approve")
@@ -245,7 +347,12 @@ def run_recipe(rid: str, export_format: str = "csv"):
         raise HTTPException(status_code=404, detail="Recipe not found")
     data = json.loads(p.read_text(encoding="utf-8"))
     recipe = data.get("recipe")
-    # record run
+    # ensure recipe is approved before allowing a run
+    status = data.get("status")
+    if status != "approved":
+        raise HTTPException(status_code=403, detail="Recipe must be approved before running")
+
+    # record run (only after approval)
     run_id = f"run_{uuid4().hex[:8]}"
     run_record = {
         "id": run_id,
@@ -270,8 +377,39 @@ def run_recipe(rid: str, export_format: str = "csv"):
                 except Exception:
                     recipe_obj = recipe
         result = cleaner.apply_recipe_from_spec(recipe_obj)
+        result = cleaner.apply_recipe_from_spec(recipe_obj)
         out_path = result.get("written") if isinstance(result, dict) else None
-        if not out_path:
+        diagnostics = result.get("diagnostics") if isinstance(result, dict) else None
+        # Ensure output is copied into the canonical outputs directory so the
+        # download endpoint (which restricts to outputs) can retrieve it.
+        if out_path:
+            try:
+                out_p = Path(out_path)
+                if not out_p.exists():
+                    # if runner returned a relative path that wasn't created,
+                    # fallback to a canonical filename in outputs
+                    out_path = str(OUTPUTS_DIR / f"{rid}_{run_id}.csv")
+                else:
+                    resolved_out = out_p.resolve()
+                    outputs_root = OUTPUTS_DIR.resolve()
+                    if not str(resolved_out).startswith(str(outputs_root)):
+                        # copy into outputs dir to ensure restricted download can access
+                        dest = OUTPUTS_DIR / f"{rid}_{run_id}_{out_p.name}"
+                        try:
+                            shutil.copyfile(str(resolved_out), str(dest))
+                            out_path = str(dest)
+                        except Exception:
+                            # if copy fails, fall back to writing into outputs via _write_csv
+                            try:
+                                # attempt to read and rewrite using engine helpers
+                                df_for_copy = _read_table(src)
+                                _write_csv(df_for_copy, str(OUTPUTS_DIR / f"{rid}_{run_id}.csv"))
+                                out_path = str(OUTPUTS_DIR / f"{rid}_{run_id}.csv")
+                            except Exception:
+                                out_path = str(OUTPUTS_DIR / f"{rid}_{run_id}.csv")
+            except Exception:
+                out_path = str(OUTPUTS_DIR / f"{rid}_{run_id}.csv")
+        else:
             out_path = str(OUTPUTS_DIR / f"{rid}_{run_id}.csv")
         # if export requested as xlsx, attempt conversion
         exported = out_path
@@ -297,6 +435,8 @@ def run_recipe(rid: str, export_format: str = "csv"):
         run_record["status"] = "completed"
         run_record["finished_at"] = datetime.utcnow().isoformat() + "Z"
         run_record["output_path"] = exported
+        if diagnostics:
+            run_record["diagnostics"] = diagnostics
         history_path.write_text(json.dumps(run_record, indent=2, ensure_ascii=False), encoding="utf-8")
         return {"run": run_record}
     except Exception as e:
@@ -336,6 +476,42 @@ def list_history():
         except Exception:
             continue
     return {"history": sorted(out, key=lambda r: r.get("started_at", ""), reverse=True)}
+
+
+@app.get("/inspections")
+def list_inspections():
+    out = []
+    for p in INSPECTIONS_DIR.glob("*.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            out.append({"id": data.get("id"), "path": data.get("path"), "created_at": data.get("created_at"), "file": str(p)})
+        except Exception:
+            continue
+    return {"inspections": sorted(out, key=lambda r: r.get("created_at", ""), reverse=True)}
+
+
+@app.get("/inspections/{insp_id}")
+def get_inspection(insp_id: str):
+    p = INSPECTIONS_DIR / f"{insp_id}.json"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="Inspection not found")
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/uploads")
+def list_uploads():
+    out = []
+    for p in UPLOAD_DIR.iterdir():
+        try:
+            if p.is_file():
+                st = p.stat()
+                out.append({"name": p.name, "path": str(p), "size": st.st_size, "modified_at": datetime.utcfromtimestamp(st.st_mtime).isoformat() + "Z"})
+        except Exception:
+            continue
+    return {"uploads": sorted(out, key=lambda r: r.get("modified_at", ""), reverse=True)}
 
 
 @app.post("/history/{run_id}/rollback")
@@ -421,8 +597,17 @@ def cleaning_suggestions(spec: SourceSpec):
 @app.post("/join-suggestions")
 def join_suggestions(spec: JoinSuggestionSpec):
     try:
-        left_profile = cleaner.profile(spec.left_path)
-        right_profile = cleaner.profile(spec.right_path)
+        # Resolve provided paths first so we can give a clear 404 when files
+        # are missing instead of bubbling up a FileNotFoundError as a 500.
+        left_res = resolve_source(spec.left_path)
+        right_res = resolve_source(spec.right_path)
+        if not left_res.exists:
+            raise HTTPException(status_code=404, detail=f"Left source not found: {spec.left_path}")
+        if not right_res.exists:
+            raise HTTPException(status_code=404, detail=f"Right source not found: {spec.right_path}")
+
+        left_profile = cleaner.profile(left_res.materialized_path or left_res.path)
+        right_profile = cleaner.profile(right_res.materialized_path or right_res.path)
         joins = suggest_join_rules(left_profile, right_profile, left_name=spec.left_path, right_name=spec.right_path)
         return {
             "joins": [join.model_dump() if hasattr(join, "model_dump") else join.dict() for join in joins]
@@ -434,16 +619,164 @@ def join_suggestions(spec: JoinSuggestionSpec):
 @app.post("/apply")
 def apply_recipe(recipe: Recipe):
     try:
+        # Debug: log incoming recipe payload (truncated) to help diagnose 500s
+        try:
+            raw = recipe.json() if hasattr(recipe, 'json') else str(recipe)
+            print(f"INCOMING /apply payload: {raw[:2000]}")
+        except Exception:
+            print("INCOMING /apply payload: <unserializable recipe>")
+        # validate source exists before attempting to run heavy transforms
+        src = recipe.sources[0]["path"] if recipe.sources else None
+        if not src:
+            raise HTTPException(status_code=400, detail="Recipe missing source path")
+        if not Path(src).exists():
+            raise HTTPException(status_code=400, detail=f"Source path not found: {src}")
         out = cleaner.apply_recipe_from_spec(recipe)
         return {"result": out}
+    except Exception as e:
+        traceback.print_exc()
+        # Friendly message for common runtime error when polars isn't installed
+        if isinstance(e, RuntimeError) and "Polars not installed" in str(e):
+            raise HTTPException(status_code=500, detail=str(e))
+        if isinstance(e, HTTPException):
+            raise
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/apply-patch")
+def apply_patch(spec: PatchSpec):
+    try:
+        # read source table as list of dicts
+        df = _read_table(spec.path)
+        rows = df.to_dicts()
+        # apply patches: each patch is {row: int, column: str, value: any}
+        applied = 0
+        for p in spec.patches:
+            try:
+                r = int(p.get("row", -1))
+                col = p.get("column")
+                val = p.get("value")
+            except Exception:
+                continue
+            if r < 0 or r >= len(rows):
+                continue
+            # ensure column exists; if not, create it
+            if col not in rows[r]:
+                # add column with empty values for previous rows
+                for rr in rows:
+                    rr.setdefault(col, "")
+            rows[r][col] = val
+            applied += 1
+
+        out_name = f"patched_{Path(spec.path).stem}_{uuid4().hex[:8]}.csv"
+        out_path = OUTPUTS_DIR / out_name
+        # determine column order (preserve original df.columns, but include any new columns appended)
+        cols = list(df.columns)
+        for r in rows:
+            for c in r.keys():
+                if c not in cols:
+                    cols.append(c)
+
+        with open(out_path, "w", encoding="utf-8", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(cols)
+            for row in rows:
+                writer.writerow([row.get(c, "") for c in cols])
+
+        # also copy into uploads for visibility/reuse
+        upload_name = out_name
+        upload_path = UPLOAD_DIR / upload_name
+        shutil.copyfile(out_path, upload_path)
+
+        # gather metadata
+        stat = upload_path.stat()
+        size = stat.st_size
+        modified_at = datetime.utcfromtimestamp(stat.st_mtime).isoformat() + "Z"
+
+        return {"patched_path": str(out_path.resolve()), "upload_path": str(upload_path.resolve()), "applied": applied, "size": size, "modified_at": modified_at}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/uploads/delete")
+def delete_upload(payload: dict):
+    try:
+        path = payload.get("path")
+        if not path:
+            raise HTTPException(status_code=400, detail="Missing path")
+        p = Path(path)
+        resolved = p.resolve()
+        if not str(resolved).startswith(str(UPLOAD_DIR.resolve())):
+            raise HTTPException(status_code=403, detail="Delete restricted to uploads directory")
+        if not resolved.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        resolved.unlink()
+        return {"deleted": str(resolved)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/uploads/duplicates")
+def find_upload_duplicates():
+    try:
+        groups = {}
+        for p in UPLOAD_DIR.iterdir():
+            if not p.is_file():
+                continue
+            try:
+                sz = p.stat().st_size
+            except Exception:
+                sz = None
+            groups.setdefault(sz, []).append(p)
+
+        dup_groups = []
+        for sz, files in groups.items():
+            if len(files) < 2:
+                continue
+            # compute quick sha256 for same-size files to confirm duplicates
+            hashes = {}
+            for f in files:
+                try:
+                    h = hashlib.sha256()
+                    with open(f, "rb") as fh:
+                        while True:
+                            chunk = fh.read(8192)
+                            if not chunk:
+                                break
+                            h.update(chunk)
+                    digest = h.hexdigest()
+                    hashes.setdefault(digest, []).append(str(f.resolve()))
+                except Exception:
+                    continue
+            for digest, paths in hashes.items():
+                if len(paths) > 1:
+                    dup_groups.append({"hash": digest, "paths": paths, "size": sz})
+
+        return {"duplicates": dup_groups}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/preview")
-def preview_recipe(recipe: Recipe, recipe_id: Optional[str] = None):
+def preview_recipe(recipe: Recipe, recipe_id: Optional[str] = None, n: Optional[int] = None):
     try:
-        out = cleaner.preview_recipe(recipe)
+        # Debug: log incoming recipe payload (truncated) and recipe_id
+        try:
+            raw = recipe.json() if hasattr(recipe, 'json') else str(recipe)
+            print(f"INCOMING /preview payload (recipe_id={recipe_id}): {raw[:2000]}")
+        except Exception:
+            print(f"INCOMING /preview payload (recipe_id={recipe_id}): <unserializable recipe>")
+        # validate source path early to provide clearer errors to the UI
+        src = recipe.sources[0]["path"] if recipe.sources else None
+        if not src:
+            raise HTTPException(status_code=400, detail="Recipe missing source path")
+        if not Path(src).exists():
+            raise HTTPException(status_code=400, detail=f"Source path not found: {src}")
+        out = cleaner.preview_recipe(recipe, n=(n if n is not None else 5))
         # schema drift: compare expected columns from saved recipe (if provided)
         schema_warnings = []
         if recipe_id:
@@ -467,4 +800,9 @@ def preview_recipe(recipe: Recipe, recipe_id: Optional[str] = None):
                     pass
         return {"preview": out, "schema_warnings": schema_warnings}
     except Exception as e:
+        traceback.print_exc()
+        if isinstance(e, RuntimeError) and "Polars not installed" in str(e):
+            raise HTTPException(status_code=500, detail=str(e))
+        if isinstance(e, HTTPException):
+            raise
         raise HTTPException(status_code=500, detail=str(e))

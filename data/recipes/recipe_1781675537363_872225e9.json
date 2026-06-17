@@ -1,0 +1,36 @@
+{
+  "id": "recipe_1781675537363_872225e9",
+  "name": "recipe_1781675537363",
+  "created_at": "2026-06-17T05:52:17.435897Z",
+  "status": "approved",
+  "expected_columns": [
+    "text",
+    "style_json",
+    "notes",
+    "observation_date"
+  ],
+  "recipe": {
+    "sources": [
+      {
+        "path": "data\\uploads\\patched_patched_patched_dataocean__1__d12f085b_51591_d00_6ac20a98_c775b3ee_5b586b6e.csv"
+      }
+    ],
+    "cleaning_steps": [
+      {
+        "action": "impute",
+        "column": "observation_date",
+        "params": {
+          "strategy": "from_column",
+          "source": "date"
+        }
+      }
+    ],
+    "joins": [],
+    "outputs": [
+      {
+        "path": "output_from_text.csv"
+      }
+    ]
+  },
+  "approved_at": "2026-06-17T06:01:47.657485Z"
+}

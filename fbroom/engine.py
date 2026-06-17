@@ -1,6 +1,8 @@
 import json
 import csv
 import io
+import re
+import difflib
 
 from .connectors import resolve_source
 
@@ -8,6 +10,764 @@ try:
     import polars as pl
 except Exception:
     pl = None
+
+from datetime import datetime
+try:
+    from dateutil import parser as _dateutil_parser  # type: ignore
+except Exception:
+    _dateutil_parser = None
+
+
+def _is_date_str(val: str) -> bool:
+    """Best-effort date detection: use dateutil if available, else try common formats and iso regex."""
+    if val is None:
+        return False
+    s = str(val).strip()
+    if s == "":
+        return False
+    # quick ISO-like regex
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s) or re.match(r"^\d{2}/\d{2}/\d{4}$", s) or re.match(r"^\d{1,2} [A-Za-z]{3,9} \d{4}$", s):
+        return True
+    if _dateutil_parser:
+        try:
+            _dateutil_parser.parse(s, dayfirst=False)
+            return True
+        except Exception:
+            try:
+                _dateutil_parser.parse(s, dayfirst=True)
+                return True
+            except Exception:
+                return False
+    # fallback: try several common strptime formats
+    fmts = ["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%b %d, %Y", "%d %b %Y", "%B %d, %Y", "%d %B %Y"]
+    for f in fmts:
+        try:
+            datetime.strptime(s, f)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _is_polars_df(df):
+    try:
+        return pl is not None and isinstance(df, pl.DataFrame)
+    except Exception:
+        return False
+
+
+def _df_head_records(df, n=None):
+    """Return up to `n` records from dataframe as list of dicts.
+    If `n` is None or n <= 0, return all records.
+    """
+    # treat None or non-positive as request for all rows
+    try:
+        if n is None or (isinstance(n, int) and n <= 0):
+            if _is_polars_df(df):
+                return df.to_dicts()
+            try:
+                return df.to_dict("records")
+            except Exception:
+                return []
+        # otherwise return head(n)
+        if _is_polars_df(df):
+            return df.head(n).to_dicts()
+        try:
+            return df.head(n).to_dict("records")
+        except Exception:
+            return []
+    except Exception:
+        return []
+
+
+def _fill_null_column(df, col, value, strategy=None):
+    # strategy is used for forward-fill in polars
+    if _is_polars_df(df):
+        try:
+            if strategy == "forward":
+                return df.with_columns(df[col].fill_null(strategy="forward").alias(col))
+            return df.with_columns(df[col].fill_null(value).alias(col))
+        except Exception:
+            try:
+                if strategy == "forward":
+                    return df.with_column(df[col].fill_null(strategy="forward").alias(col))
+                return df.with_column(df[col].fill_null(value).alias(col))
+            except Exception:
+                return df
+    else:
+        import pandas as _pd
+        df2 = df.copy()
+        if strategy == "forward":
+            df2[col] = df2[col].fillna(method="ffill")
+        else:
+            df2[col] = df2[col].fillna(value)
+        return df2
+
+
+def _string_transform_column(df, col, case="lower"):
+    if _is_polars_df(df):
+        try:
+            if case == "upper":
+                return df.with_columns(df[col].str.to_uppercase().alias(col))
+            if case == "trim":
+                return df.with_columns(df[col].str.strip_chars().alias(col))
+            return df.with_columns(df[col].str.to_lowercase().alias(col))
+        except Exception:
+            try:
+                if case == "upper":
+                    return df.with_column(df[col].str.to_uppercase().alias(col))
+                if case == "trim":
+                    return df.with_column(df[col].str.strip_chars().alias(col))
+                return df.with_column(df[col].str.to_lowercase().alias(col))
+            except Exception:
+                return df
+    else:
+        df2 = df.copy()
+        if case == "upper":
+            df2[col] = df2[col].astype(str).str.upper()
+        elif case == "trim":
+            df2[col] = df2[col].astype(str).str.strip()
+        else:
+            df2[col] = df2[col].astype(str).str.lower()
+        return df2
+
+
+def _unique_df(df, subset=None):
+    if _is_polars_df(df):
+        return df.unique(subset=subset, keep="first")
+    else:
+        try:
+            return df.drop_duplicates(subset=subset, keep="first")
+        except Exception:
+            return df
+
+
+def _drop_column(df, col):
+    if _is_polars_df(df):
+        try:
+            return df.drop(col)
+        except Exception:
+            return df
+    else:
+        try:
+            return df.drop(columns=[col])
+        except Exception:
+            return df
+
+
+def _rename_column(df, old, new):
+    if _is_polars_df(df):
+        try:
+            return df.rename({old: new})
+        except Exception:
+            return df
+    else:
+        try:
+            return df.rename(columns={old: new})
+        except Exception:
+            return df
+
+
+def _write_csv(df, out_path):
+    if _is_polars_df(df):
+        return df.write_csv(out_path)
+    else:
+        try:
+            return df.to_csv(out_path, index=False)
+        except Exception:
+            return None
+
+
+def _replace_values(df, col, old, new):
+    # perform literal replacements (avoid regex metacharacters for literal match)
+    old_raw = str(old)
+    literal_old = re.escape(old_raw)
+    if _is_polars_df(df):
+        try:
+            # prefer expression API with literal=True when available; pass raw old string
+            try:
+                return df.with_columns(pl.col(col).str.replace(old_raw, str(new), literal=True).alias(col))
+            except Exception:
+                # fallback to Series API using raw old (may treat as regex)
+                return df.with_columns(df[col].str.replace(old_raw, str(new)).alias(col))
+        except Exception:
+            try:
+                return df.with_column(pl.col(col).str.replace(literal_old, str(new)).alias(col))
+            except Exception:
+                return df
+    else:
+        df2 = df.copy()
+        try:
+            df2[col] = df2[col].astype(str).str.replace(old, new, regex=False)
+        except Exception:
+            try:
+                # fallback: escape regex in pandas replace
+                df2[col] = df2[col].astype(str).str.replace(literal_old, str(new), regex=True)
+            except Exception:
+                pass
+        return df2
+
+
+def _map_values(df, col, mapping: dict):
+    if _is_polars_df(df):
+        try:
+            # prefer building a polars expression chain for deterministic mapping
+            # fallback: perform literal replacements for each mapping key
+            df2 = df
+            for k, v in mapping.items():
+                df2 = _replace_values(df2, col, k, v)
+            return df2
+        except Exception:
+            try:
+                # fallback: convert to pandas if available
+                pd = df.to_pandas()
+                pd[col] = pd[col].astype(str).map(mapping).fillna(pd[col])
+                return pl.from_pandas(pd)
+            except Exception:
+                try:
+                    return df.with_columns(pl.col(col).apply(lambda v: mapping.get(str(v), v)).alias(col))
+                except Exception:
+                    return df
+    else:
+        import pandas as _pd
+        df2 = df.copy()
+        try:
+            df2[col] = df2[col].map(mapping).fillna(df2[col])
+        except Exception:
+            try:
+                df2[col] = df2[col].astype(str).map(mapping).fillna(df2[col])
+            except Exception:
+                pass
+        return df2
+
+
+def _regex_replace(df, col, pattern, repl):
+    if _is_polars_df(df):
+        try:
+            return df.with_columns(pl.col(col).str.replace_all(pattern, repl).alias(col))
+        except Exception:
+            try:
+                return df.with_columns(df[col].str.replace(pattern, repl).alias(col))
+            except Exception:
+                # fallback to python apply
+                return df.with_columns(pl.col(col).apply(lambda v: re.sub(pattern, repl, str(v) if v is not None else "")).alias(col))
+    else:
+        import pandas as _pd
+        df2 = df.copy()
+        try:
+            df2[col] = df2[col].astype(str).str.replace(pattern, repl, regex=True)
+        except Exception:
+            try:
+                df2[col] = df2[col].astype(str).apply(lambda v: re.sub(pattern, repl, str(v)))
+            except Exception:
+                pass
+        return df2
+
+
+def _remove_by_type(df, col, params=None):
+    """Remove (replace) values in `col` that match a data type criterion.
+    params: {target_type: 'string'|'numeric', replacement: any}
+    Returns (df_new, info) similar to _impute_missing diagnostics.
+    """
+    params = params or {}
+    target_type = params.get("target_type", "string")
+    replacement = params.get("replacement", "")
+    exceptions = params.get("exceptions") or []
+
+    if col not in (df.columns if _is_polars_df(df) else list(df.columns)):
+        return df, None
+
+    try:
+        if _is_polars_df(df):
+            # numeric detection: full-string numeric match
+            try:
+                # Normalize common currency symbols and thousands separators,
+                # allow parentheses for negative values, then cast to float.
+                cleaned = pl.col(col).str.replace_all(r"^\s*\(|\)\s*$", "")
+                cleaned = cleaned.str.replace_all(r"[\$\£\€\¥\₹]", "")
+                cleaned = cleaned.str.replace_all(r"[,\s]", "")
+                # attempt to cast cleaned values to float; non-numeric become null
+                num_mask = cleaned.cast(pl.Float64).is_not_null()
+            except Exception:
+                try:
+                    # fallback: best-effort cast on original column
+                    num_mask = pl.col(col).cast(pl.Float64).is_not_null()
+                except Exception:
+                    num_mask = pl.lit(False)
+
+            if target_type == "numeric":
+                mask = num_mask
+            else:
+                mask = (~num_mask) & (~pl.col(col).is_null()) & (pl.col(col) != "")
+
+            # If exceptions include date, build a date-detection expression and exclude those rows from mask
+            try:
+                if 'date' in exceptions:
+                    # build polars expression to detect iso-like patterns and fallback to parsing attempt
+                    date_expr = pl.col(col).is_not_null() & pl.col(col).str.strip() != ""
+                    # basic ISO pattern
+                    iso_mask = pl.col(col).str.contains(r"^\d{4}-\d{2}-\d{2}$")
+                    mdm = None
+                    try:
+                        mdm = pl.col(col).str.contains(r"^\d{1,2}/\d{1,2}/\d{4}$")
+                    except Exception:
+                        mdm = None
+                    if mdm is not None:
+                        date_mask = iso_mask | mdm
+                    else:
+                        date_mask = iso_mask
+                    # exclude date-like strings from mask if present
+                    mask = mask & (~date_mask)
+            except Exception:
+                pass
+
+            # If expression-based detection found nothing or is unsupported in this polars build,
+            # fall back to a Python-list based heuristic that is more permissive.
+            try:
+                # evaluate mask to python list if num_mask is an expression
+                if isinstance(mask, pl.Expr):
+                    try:
+                        evaluated = df.select(mask.alias("__mask_eval__")).to_series("__mask_eval__").to_list()
+                    except Exception:
+                        # try alternative access
+                        try:
+                            evaluated = mask.to_frame().to_series().to_list()
+                        except Exception:
+                            evaluated = None
+                else:
+                    evaluated = None
+            except Exception:
+                evaluated = None
+
+            if not evaluated:
+                # Python-level heuristic
+                try:
+                    vals = None
+                    try:
+                        vals = df.select(pl.col(col)).to_series().to_list()
+                    except Exception:
+                        try:
+                            vals = df[col].to_list()
+                        except Exception:
+                            vals = []
+
+                    import re as _re
+                    num_re = _re.compile(r'^[-+]?\d+(?:\.\d+)?$')
+                    def is_num_val(x):
+                        if x is None:
+                            return False
+                        s = str(x).strip()
+                        if s == '':
+                            return False
+                        # parentheses as negative
+                        if s.startswith('(') and s.endswith(')'):
+                            s = s[1:-1]
+                        # remove currency symbols
+                        s = _re.sub(r'[\$\£\€\¥\₹]', '', s)
+                        # remove commas/spaces used as thousands separators
+                        s = s.replace(',', '').replace(' ', '')
+                        return bool(num_re.match(s))
+
+                    def is_date_val(x):
+                        try:
+                            return _is_date_str(x)
+                        except Exception:
+                            return False
+
+                    mask_list = [is_num_val(v) for v in vals]
+                    # construct new column values; respect exceptions (e.g., keep dates)
+                    new_vals = []
+                    for v, m in zip(vals, mask_list):
+                        if 'date' in exceptions and is_date_val(v):
+                            new_vals.append(v)
+                        else:
+                            if (m and target_type == 'numeric') or (not m and target_type != 'numeric'):
+                                new_vals.append(replacement)
+                            else:
+                                new_vals.append(v)
+                    # create polars Series and assign
+                    try:
+                        df_new = df.with_columns(pl.Series(col, new_vals).alias(col))
+                    except Exception:
+                        # fallback: build a new DataFrame from dicts
+                        dicts = df.to_dicts()
+                        for i, d in enumerate(dicts):
+                            d[col] = new_vals[i]
+                        df_new = pl.from_dicts(dicts)
+
+                    affected = []
+                    for i, (v, m) in enumerate(zip(vals, mask_list)):
+                        if 'date' in exceptions and is_date_val(v):
+                            continue
+                        if (m and target_type == 'numeric') or (not m and target_type != 'numeric'):
+                            affected.append(i)
+                    info = {"step": "remove_by_type", "column": col, "method": "remove_by_type", "target_type": target_type, "rows_changed": len(affected), "sample_positions": [i + 1 for i in (sorted(affected)[:20])]} 
+                    return df_new, info
+                except Exception:
+                    pass
+
+            try:
+                df_with_idx = df.with_row_index("__row_idx__")
+                affected = df_with_idx.filter(mask).select("__row_idx__").to_series().to_list()
+            except Exception:
+                affected = []
+
+            try:
+                df_new = df.with_columns(pl.when(mask).then(pl.lit(replacement)).otherwise(pl.col(col)).alias(col))
+            except Exception:
+                # try alternative column assignment
+                try:
+                    df_new = df.with_column(pl.when(mask).then(pl.lit(replacement)).otherwise(pl.col(col)).alias(col))
+                except Exception:
+                    return df, None
+
+            info = {"step": "remove_by_type", "column": col, "method": "remove_by_type", "target_type": target_type, "rows_changed": len(affected), "sample_positions": [i + 1 for i in (sorted(affected)[:20])]} 
+            return df_new, info
+        else:
+            import pandas as _pd
+            df2 = df.copy()
+            try:
+                ser = df2[col].astype(str)
+            except Exception:
+                ser = df2[col].map(lambda x: "" if x is None else str(x))
+
+            import re as _re
+            # Clean strings: remove surrounding parentheses, currency symbols, and thousands separators
+            clean = ser.str.strip()
+            # remove surrounding parentheses that denote negatives
+            try:
+                has_paren = clean.str.startswith('(') & clean.str.endswith(')')
+                clean = clean.str.replace(r'^\(|\)$', '', regex=True)
+            except Exception:
+                pass
+            try:
+                clean = clean.str.replace(r'[\$\£\€\¥\₹]', '', regex=True)
+                clean = clean.str.replace(r'[,\s]', '', regex=True)
+            except Exception:
+                # best-effort non-regex replacements
+                clean = clean.str.replace('$', '').str.replace('£', '').str.replace('€', '').str.replace('¥', '').str.replace('₹', '')
+                clean = clean.str.replace(',', '').str.replace(' ', '')
+
+            mask = clean.str.match(r'^[-+]?\d+(?:\.\d+)?$') if target_type == 'numeric' else (~clean.str.match(r'^[-+]?\d+(?:\.\d+)?$')) & (clean.str.strip() != '')
+
+            affected_idx = mask[mask].index.tolist()
+            df2.loc[mask, col] = replacement
+            info = {"step": "remove_by_type", "column": col, "method": "remove_by_type", "target_type": target_type, "rows_changed": len(affected_idx), "sample_positions": [i + 1 for i in (sorted(affected_idx)[:20])]} 
+            return df2, info
+    except Exception:
+        return df, None
+
+
+def _swap_by_types(df, moves, replacement=""):
+    """Perform bidirectional swaps/moves between columns based on type matches.
+    `moves` is a list of dicts: {source, target, type, exceptions: []}
+    Returns (df_new, info)
+    """
+    if not moves:
+        return df, None
+
+    # collect involved columns
+    cols = []
+    for m in moves:
+        cols.append(m.get('source'))
+        cols.append(m.get('target'))
+    cols = [c for c in dict.fromkeys(cols) if c in (df.columns if _is_polars_df(df) else list(df.columns))]
+    if not cols:
+        return df, None
+
+    # helper detectors
+    import re as _re
+    def is_num_val(x):
+        if x is None or x == "":
+            return False
+        s = str(x).strip()
+        if s == "":
+            return False
+        if s.startswith('(') and s.endswith(')'):
+            s = s[1:-1]
+        s = _re.sub(r'[\$\£\€\¥\₹]', '', s)
+        s = s.replace(',', '').replace(' ', '')
+        return bool(_re.match(r'^[-+]?\d+(?:\.\d+)?$', s))
+
+    def is_date_val(x):
+        try:
+            return _is_date_str(x)
+        except Exception:
+            return False
+
+    def is_string_val(x):
+        if x is None or x == "":
+            return False
+        if is_date_val(x):
+            return False
+        if is_num_val(x):
+            return False
+        return True
+
+    # materialize columns into lists for row-wise operations
+    try:
+        if _is_polars_df(df):
+            data = {c: df.select(pl.col(c)).to_series().to_list() for c in cols}
+        else:
+            data = {c: df[c].tolist() for c in cols}
+    except Exception:
+        # fallback: try pandas
+        try:
+            pd = df.to_pandas() if _is_polars_df(df) else df
+            data = {c: pd[c].tolist() for c in cols}
+        except Exception:
+            return df, None
+
+    n = len(next(iter(data.values()))) if data else 0
+    rows_changed = 0
+    # prepare new values copy
+    new_data = {c: list(data[c]) for c in cols}
+
+    for i in range(n):
+        # determine per-move applicability
+        applied_swap = False
+        # first, detect reciprocal pairs and swap if both match
+        for a in moves:
+            for b in moves:
+                if a is b:
+                    continue
+                if a.get('source') == b.get('target') and a.get('target') == b.get('source'):
+                    src_col = a.get('source')
+                    tgt_col = a.get('target')
+                    va = data.get(src_col)[i]
+                    vb = data.get(tgt_col)[i]
+                    # check matches
+                    def matches(mov, val):
+                        typ = mov.get('type')
+                        exc = mov.get('exceptions') or []
+                        if typ == 'numeric':
+                            if 'date' in exc and is_date_val(val):
+                                return False
+                            return is_num_val(val)
+                        elif typ == 'string':
+                            if 'date' in exc and is_date_val(val):
+                                return False
+                            return is_string_val(val)
+                        elif typ == 'date':
+                            return is_date_val(val)
+                        return False
+
+                    if matches(a, va) and matches(b, vb):
+                        # swap them
+                        new_data[src_col][i] = vb
+                        new_data[tgt_col][i] = va
+                        rows_changed += 1
+                        applied_swap = True
+                        break
+            if applied_swap:
+                break
+        if applied_swap:
+            continue
+
+        # otherwise apply single-direction moves in order
+        for mov in moves:
+            src = mov.get('source')
+            tgt = mov.get('target')
+            if src not in data or tgt not in data:
+                continue
+            val = data[src][i]
+            # determine match for mov
+            typ = mov.get('type')
+            exc = mov.get('exceptions') or []
+            ok = False
+            if typ == 'numeric':
+                if 'date' in exc and is_date_val(val):
+                    ok = False
+                else:
+                    ok = is_num_val(val)
+            elif typ == 'string':
+                if 'date' in exc and is_date_val(val):
+                    ok = False
+                else:
+                    ok = is_string_val(val)
+            elif typ == 'date':
+                ok = is_date_val(val)
+
+            if ok:
+                # move value to target and set source to replacement
+                new_data[tgt][i] = val
+                new_data[src][i] = replacement
+                rows_changed += 1
+
+    # build output DataFrame: start from original df and replace columns
+    try:
+        if _is_polars_df(df):
+            df_new = df
+            for c in cols:
+                df_new = df_new.with_columns(pl.Series(c, new_data[c]).alias(c))
+        else:
+            import pandas as _pd
+            pd = df if isinstance(df, _pd.DataFrame) else df.to_pandas()
+            for c in cols:
+                pd[c] = new_data[c]
+            try:
+                df_new = pl.from_pandas(pd)
+            except Exception:
+                df_new = pd
+    except Exception:
+        return df, None
+
+    info = {"step": "swap_by_types", "moves": moves, "rows_changed": rows_changed}
+    return df_new, info
+
+
+def _bucketize(df, col, buckets):
+    # buckets: list of {min, max, label}
+    def label_for_value(v):
+        try:
+            # try to extract numeric portion (handle values like '3+')
+            s = str(v)
+            m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
+            if not m:
+                return v
+            fv = float(m.group(0))
+        except Exception:
+            return v
+        for b in buckets:
+            lo = b.get("min")
+            hi = b.get("max")
+            if lo is None and hi is not None:
+                if fv < hi:
+                    return b.get("label")
+            elif lo is not None and hi is None:
+                if fv > lo:
+                    return b.get("label")
+            elif lo is not None and hi is not None:
+                if fv >= lo and fv <= hi:
+                    return b.get("label")
+        return v
+
+    if _is_polars_df(df):
+        try:
+            # coerce numeric portion by stripping non-numeric chars then cast
+            try:
+                num = pl.col(col).str.replace_all(r"[^0-9\.\-]+", "").cast(pl.Float64)
+            except Exception:
+                num = pl.col(col)
+            expr = pl.col(col)
+            for b in buckets:
+                lo = b.get('min')
+                hi = b.get('max')
+                label = b.get('label')
+                cond = None
+                if lo is None and hi is not None:
+                    cond = num < hi
+                elif lo is not None and hi is None:
+                    cond = num > lo
+                elif lo is not None and hi is not None:
+                    cond = (num >= lo) & (num <= hi)
+                if cond is not None:
+                    expr = pl.when(cond).then(pl.lit(label)).otherwise(expr)
+            return df.with_columns(expr.alias(col))
+        except Exception:
+            try:
+                pd = df.to_pandas()
+                pd[col] = pd[col].apply(label_for_value)
+                return pl.from_pandas(pd)
+            except Exception:
+                return df
+    else:
+        df2 = df.copy()
+        try:
+            df2[col] = df2[col].apply(label_for_value)
+        except Exception:
+            try:
+                df2[col] = df2[col].astype(float).apply(label_for_value)
+            except Exception:
+                pass
+        return df2
+
+
+def _conditional_transform(df, col, value, condition):
+    # condition: {column, op, value}
+    cond_col = condition.get('column')
+    op = condition.get('op')
+    cond_val = condition.get('value')
+    if cond_col not in (df.columns if _is_polars_df(df) else list(df.columns)):
+        return df
+    if _is_polars_df(df):
+        try:
+            expr = None
+            if op == '>':
+                expr = pl.when(pl.col(cond_col) > cond_val).then(value).otherwise(pl.col(col))
+            elif op == '<':
+                expr = pl.when(pl.col(cond_col) < cond_val).then(value).otherwise(pl.col(col))
+            elif op == '>=':
+                expr = pl.when(pl.col(cond_col) >= cond_val).then(value).otherwise(pl.col(col))
+            elif op == '<=':
+                expr = pl.when(pl.col(cond_col) <= cond_val).then(value).otherwise(pl.col(col))
+            elif op == '==':
+                expr = pl.when(pl.col(cond_col) == cond_val).then(value).otherwise(pl.col(col))
+            if expr is not None:
+                return df.with_columns(expr.alias(col))
+        except Exception:
+            pass
+    else:
+        try:
+            import pandas as _pd
+            df2 = df.copy()
+            ops = {
+                '>': lambda a, b: a > b,
+                '<': lambda a, b: a < b,
+                '>=': lambda a, b: a >= b,
+                '<=': lambda a, b: a <= b,
+                '==': lambda a, b: a == b,
+            }
+            opfunc = ops.get(op)
+            if opfunc is None:
+                return df
+            mask = opfunc(df2[cond_col].astype(float), cond_val)
+            df2.loc[mask, col] = value
+            return df2
+        except Exception:
+            return df
+
+
+def _percentile_bucketize(df, col, buckets):
+    # buckets: list of {pmin, pmax, label} where pmin/pmax are percentiles 0-100
+    if col not in (df.columns if _is_polars_df(df) else list(df.columns)):
+        return df
+    try:
+        if _is_polars_df(df):
+            ser = df.select(pl.col(col)).to_series()
+            nums = ser.cast(pl.Float64)
+            quantiles = {p: nums.quantile(p / 100.0) for b in buckets for p in (b.get('pmin', 0), b.get('pmax', 100))}
+            # build expression
+            num_expr = pl.col(col).cast(pl.Float64)
+            expr = pl.col(col)
+            for b in buckets:
+                pmin = b.get('pmin', 0)
+                pmax = b.get('pmax', 100)
+                lo = quantiles.get(pmin)
+                hi = quantiles.get(pmax)
+                cond = (num_expr >= lo) & (num_expr <= hi) if lo is not None and hi is not None else None
+                if cond is not None:
+                    expr = pl.when(cond).then(b.get('label')).otherwise(expr)
+            return df.with_columns(expr.alias(col))
+        else:
+            import pandas as _pd
+            pdser = df[col].astype(float)
+            quant = {}
+            for b in buckets:
+                for p in (b.get('pmin', 0), b.get('pmax', 100)):
+                    quant[p] = pdser.quantile(p / 100.0)
+            df2 = df.copy()
+            def label_val(v):
+                for b in buckets:
+                    lo = quant.get(b.get('pmin', 0))
+                    hi = quant.get(b.get('pmax', 100))
+                    if lo is not None and hi is not None and lo <= float(v) <= hi:
+                        return b.get('label')
+                return v
+            df2[col] = df2[col].apply(label_val)
+            return df2
+    except Exception:
+        return df
 
 
 def _read_table(path: str):
@@ -35,12 +795,574 @@ def _read_table(path: str):
     return pl.read_csv(materialized_path, has_header=False, new_columns=["value"], **read_kwargs)
 
 
+def _impute_missing(df, col, params=None):
+    params = params or {}
+    strategy = params.get("strategy")
+    source = params.get("source")
+    sources = params.get("sources") or params.get("source_columns")
+    group_by = params.get("group_by")
+    sentinels = params.get("treat_as_missing") or []
+
+    if col not in (df.columns if _is_polars_df(df) else list(df.columns)):
+        return df
+
+    try:
+        if _is_polars_df(df):
+            # do not operate on metadata/internal columns
+            if col.startswith("_"):
+                return df, None
+            # compute missing positions before
+            try:
+                df_with_idx = df.with_row_index("__row_idx__")
+                mask = (pl.col(col).is_null()) | (pl.col(col) == "")
+                # include configured sentinels (both numeric and string forms)
+                for s in sentinels:
+                    try:
+                        mask = mask | (pl.col(col) == s)
+                    except Exception:
+                        pass
+                # default heuristic: do not treat 0 as missing unless sentinel present
+                before_missing = df_with_idx.filter(mask).select("__row_idx__").to_series().to_list()
+            except Exception:
+                before_missing = []
+            # from another column
+            if strategy == "from_column" and source and source in df.columns:
+                try:
+                    # treat empty strings and configured sentinels as missing when copying from another column
+                    try:
+                        missing_expr = (pl.col(col).is_null()) | (pl.col(col) == "")
+                        for s in sentinels:
+                            try:
+                                missing_expr = missing_expr | (pl.col(col) == s)
+                            except Exception:
+                                pass
+                        df_new = df.with_columns(pl.when(missing_expr).then(pl.col(source)).otherwise(pl.col(col)).alias(col))
+                    except Exception:
+                        # fallback to simple fill_null if the above fails
+                        df_new = df.with_columns(pl.col(col).fill_null(pl.col(source)).alias(col))
+                    # compute after
+                    try:
+                        df2_with_idx = df_new.with_row_index("__row_idx__")
+                        mask2 = (pl.col(col).is_null()) | (pl.col(col) == "")
+                        for s in sentinels:
+                            try:
+                                mask2 = mask2 | (pl.col(col) == s)
+                            except Exception:
+                                pass
+                        after_missing = df2_with_idx.filter(mask2).select("__row_idx__").to_series().to_list()
+                    except Exception:
+                        after_missing = []
+                    filled = len(set(before_missing) - set(after_missing))
+                    sample = sorted(list(set(before_missing) - set(after_missing)))[:20]
+                    info = {"step": "impute", "column": col, "method": "from_column", "rows_changed": filled, "sample_positions": [i + 1 for i in sample], "source": source}
+                    return df_new, info
+                except Exception:
+                    return df, None
+
+            # forward/backward fill
+            if strategy in ("ffill", "forward_fill"):
+                try:
+                    df_new = df.with_columns(df[col].fill_null(strategy="forward").alias(col))
+                    # compute diagnostics
+                    try:
+                        df2_with_idx = df_new.with_row_index("__row_idx__")
+                        after_missing = df2_with_idx.filter((pl.col(col).is_null()) | (pl.col(col) == "") | (pl.col(col) == 0)).select("__row_idx__").to_series().to_list()
+                    except Exception:
+                        after_missing = []
+                    filled = len(set(before_missing) - set(after_missing))
+                    info = {"step": "impute", "column": col, "method": "ffill", "rows_changed": filled}
+                    return df_new, info
+                except Exception:
+                    return df, None
+
+            if strategy in ("bfill", "backfill"):
+                try:
+                    df_new = df.with_columns(df[col].fill_null(strategy="backward").alias(col))
+                    try:
+                        df2_with_idx = df_new.with_row_index("__row_idx__")
+                        after_missing = df2_with_idx.filter((pl.col(col).is_null()) | (pl.col(col) == "") | (pl.col(col) == 0)).select("__row_idx__").to_series().to_list()
+                    except Exception:
+                        after_missing = []
+                    filled = len(set(before_missing) - set(after_missing))
+                    info = {"step": "impute", "column": col, "method": "bfill", "rows_changed": filled}
+                    return df_new, info
+                except Exception:
+                    return df, None
+
+            # constant fill
+            if strategy == "constant":
+                value = params.get("value")
+                try:
+                    df_new = df.with_columns(pl.col(col).fill_null(value).alias(col))
+                    try:
+                        df2_with_idx = df_new.with_row_index("__row_idx__")
+                        after_missing = df2_with_idx.filter((pl.col(col).is_null()) | (pl.col(col) == "") | (pl.col(col) == 0)).select("__row_idx__").to_series().to_list()
+                    except Exception:
+                        after_missing = []
+                    filled = len(set(before_missing) - set(after_missing))
+                    info = {"step": "impute", "column": col, "method": "constant", "rows_changed": filled, "value": value}
+                    return df_new, info
+                except Exception:
+                    return df, None
+
+                # fill missing strings with empty string
+                if strategy == "empty_string":
+                    try:
+                        # replace nulls, empty strings, and sentinels with empty string
+                        try:
+                            missing_expr = (pl.col(col).is_null()) | (pl.col(col) == "")
+                            for s in sentinels:
+                                try:
+                                    missing_expr = missing_expr | (pl.col(col) == s)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            missing_expr = (pl.col(col).is_null()) | (pl.col(col) == "")
+
+                        df_new = df.with_columns(pl.when(missing_expr).then(pl.lit("")).otherwise(pl.col(col)).alias(col))
+
+                        # compute rows changed by comparing old vs new values
+                        try:
+                            old_rows = df.with_row_count("__row_idx__").select(["__row_idx__", col]).to_dicts()
+                            new_rows = df_new.with_row_count("__row_idx__").select(["__row_idx__", col]).to_dicts()
+                            diffs = [r["__row_idx__"] for r, n in zip(old_rows, new_rows) if (r.get(col) != n.get(col))]
+                            filled = len(diffs)
+                            sample = sorted(diffs)[:20]
+                        except Exception:
+                            filled = 0
+                            sample = []
+
+                        info = {"step": "impute", "column": col, "method": "empty_string", "rows_changed": filled, "sample_positions": [i + 1 for i in sample]}
+                        return df_new, info
+                    except Exception:
+                        return df, None
+
+            # mode (most frequent)
+            if strategy in ("mode", "most_common"):
+                try:
+                    try:
+                        mode_val = df.select(pl.col(source if source in df.columns else col).mode()).to_series()[0]
+                    except Exception:
+                        # fallback to pandas
+                        pd = df.to_pandas()
+                        mode_val = pd[source if source in pd.columns else col].mode().iloc[0]
+                    df_new = df.with_columns(pl.col(col).fill_null(mode_val).alias(col))
+                    try:
+                        df2_with_idx = df_new.with_row_index("__row_idx__")
+                        after_missing = df2_with_idx.filter((pl.col(col).is_null()) | (pl.col(col) == "") | (pl.col(col) == 0)).select("__row_idx__").to_series().to_list()
+                    except Exception:
+                        after_missing = []
+                    filled = len(set(before_missing) - set(after_missing))
+                    info = {"step": "impute", "column": col, "method": "mode", "rows_changed": filled, "mode_value": mode_val}
+                    return df_new, info
+                except Exception:
+                    return df, None
+
+            # mean/median/group mean
+            if strategy in ("mean", "average", "median"):
+                try:
+                    # support median vs mean
+                    if strategy == 'median':
+                        agg = 'median'
+                    else:
+                        agg = 'mean'
+                    if source and source in df.columns:
+                        if group_by and group_by in df.columns:
+                            if agg == 'mean':
+                                df_new = df.with_columns(pl.col(col).fill_null(pl.col(source).mean().over(group_by)).alias(col))
+                            else:
+                                df_new = df.with_columns(pl.col(col).fill_null(pl.col(source).median().over(group_by)).alias(col))
+                        else:
+                            if agg == 'mean':
+                                m = df.select(pl.col(source).mean()).to_series()[0]
+                            else:
+                                m = df.select(pl.col(source).median()).to_series()[0]
+                            df_new = df.with_columns(pl.col(col).fill_null(m).alias(col))
+                    else:
+                        # fall back to target column mean/median
+                        if strategy == 'median':
+                            m = df.select(pl.col(col).median()).to_series()[0]
+                        else:
+                            m = df.select(pl.col(col).mean()).to_series()[0]
+                        df_new = df.with_columns(pl.col(col).fill_null(m).alias(col))
+                    # compute after missing and report
+                    try:
+                        df2_with_idx = df_new.with_row_index("__row_idx__")
+                        after_missing = df2_with_idx.filter((pl.col(col).is_null()) | (pl.col(col) == "")).select("__row_idx__").to_series().to_list()
+                    except Exception:
+                        after_missing = []
+                    filled = len(set(before_missing) - set(after_missing))
+                    sample = sorted(list(set(before_missing) - set(after_missing)))[:20]
+                    info = {"step": "impute", "column": col, "method": "mean", "rows_changed": filled, "sample_positions": [i + 1 for i in sample], "source": source, "group_by": group_by}
+                    return df_new, info
+                except Exception:
+                    return df, None
+
+            # row-wise mean across multiple source columns
+            if strategy == "row_mean" and sources:
+                try:
+                    exprs = [pl.col(s).cast(pl.Float64) for s in sources if s in df.columns]
+                    if not exprs:
+                        return df, None
+                    sum_expr = exprs[0]
+                    for e in exprs[1:]:
+                        sum_expr = sum_expr + e
+                    mean_expr = (sum_expr / len(exprs)).alias("__row_mean__")
+                    df2 = df.with_columns(mean_expr)
+                    df_new = df2.with_columns(pl.col(col).fill_null(pl.col("__row_mean__")).alias(col)).drop("__row_mean__")
+                    try:
+                        df_old_idx = df.with_row_count("__row_idx__")
+                        before_missing = df_old_idx.filter((pl.col(col).is_null()) | (pl.col(col) == "")).select("__row_idx__").to_series().to_list()
+                        df_new_idx = df_new.with_row_count("__row_idx__")
+                        after_missing = df_new_idx.filter((pl.col(col).is_null()) | (pl.col(col) == "")).select("__row_idx__").to_series().to_list()
+                        filled = len(set(before_missing) - set(after_missing))
+                        sample = sorted(list(set(before_missing) - set(after_missing)))[:20]
+                    except Exception:
+                        filled = 0
+                        sample = []
+                    info = {"step": "impute", "column": col, "method": "row_mean", "rows_changed": filled, "sample_positions": [i + 1 for i in sample], "source": sources}
+                    return df_new, info
+                except Exception:
+                    return df, None
+
+            # regression imputation: convert to pandas and reuse pandas path for robustness
+            if strategy == 'regression' and sources:
+                try:
+                    # convert to pandas and delegate to pandas regression handling above
+                    import pandas as _pd
+                    pd_df = _pd.DataFrame(df.to_dicts())
+                    import numpy as _np
+                    valid_srcs = [s for s in sources if s in pd_df.columns]
+                    if not valid_srcs:
+                        return df, None
+                    train = pd_df.dropna(subset=valid_srcs + [col])
+                    if train.shape[0] == 0:
+                        return df, None
+                    X_train = train[valid_srcs].astype(float).to_numpy()
+                    y_train = train[col].astype(float).to_numpy()
+                    X_train_aug = _np.hstack([_np.ones((X_train.shape[0],1)), X_train])
+                    coef, *_ = _np.linalg.lstsq(X_train_aug, y_train, rcond=None)
+                    missing_idx = pd_df[pd_df[col].isnull()].index.tolist()
+                    if not missing_idx:
+                        return df, None
+                    X_missing = pd_df.loc[missing_idx, valid_srcs].astype(float).to_numpy()
+                    X_missing_aug = _np.hstack([_np.ones((X_missing.shape[0],1)), X_missing])
+                    preds = X_missing_aug.dot(coef)
+                    for idx, p in zip(missing_idx, preds):
+                        pd_df.at[idx, col] = float(p)
+                    df_new = pl.from_pandas(pd_df)
+                    info = {"step": "impute", "column": col, "method": "regression", "rows_changed": len(preds), "model": "ols", "sources": valid_srcs}
+                    return df_new, info
+                except Exception:
+                    return df, None
+
+            return df, None
+        else:
+            import pandas as _pd
+            df2 = df.copy()
+            # do not operate on metadata/internal columns
+            if str(col).startswith("_"):
+                return df2, None
+            # compute before missing
+            try:
+                mask = df2[col].isnull() | (df2[col].astype(str).str.strip() == "")
+                try:
+                    if sentinels:
+                        mask = mask | df2[col].isin(sentinels)
+                except Exception:
+                    # if isin fails due to types, try string comparison
+                    try:
+                        mask = mask | df2[col].astype(str).isin([str(s) for s in sentinels])
+                    except Exception:
+                        pass
+                before_missing = df2[mask].index.tolist()
+            except Exception:
+                before_missing = []
+
+            if strategy == "from_column" and source and source in df2.columns:
+                # treat empty strings and configured sentinels as missing when copying from another column
+                try:
+                    mask2 = df2[col].isnull() | (df2[col].astype(str).str.strip() == "")
+                    try:
+                        if sentinels:
+                            mask2 = mask2 | df2[col].isin(sentinels)
+                    except Exception:
+                        try:
+                            mask2 = mask2 | df2[col].astype(str).isin([str(s) for s in sentinels])
+                        except Exception:
+                            pass
+                    df2.loc[mask2, col] = df2.loc[mask2, source]
+                except Exception:
+                    df2[col] = df2[col].fillna(df2[source])
+
+                try:
+                    mask2 = df2[col].isnull() | (df2[col].astype(str).str.strip() == "")
+                    try:
+                        if sentinels:
+                            mask2 = mask2 | df2[col].isin(sentinels)
+                    except Exception:
+                        try:
+                            mask2 = mask2 | df2[col].astype(str).isin([str(s) for s in sentinels])
+                        except Exception:
+                            pass
+                    after_missing = df2[mask2].index.tolist()
+                    filled = len(set(before_missing) - set(after_missing))
+                    sample = sorted(list(set(before_missing) - set(after_missing)))[:20]
+                except Exception:
+                    filled = 0
+                    sample = []
+                info = {"step": "impute", "column": col, "method": "from_column", "rows_changed": filled, "sample_positions": [i + 1 for i in sample], "source": source}
+                return df2, info
+            # forward/backward fill
+            if strategy in ("ffill", "forward_fill"):
+                try:
+                    df2[col] = df2[col].fillna(method='ffill')
+                    try:
+                        mask2 = df2[col].isnull() | (df2[col].astype(str).str.strip() == "")
+                        try:
+                            if sentinels:
+                                mask2 = mask2 | df2[col].isin(sentinels)
+                        except Exception:
+                            try:
+                                mask2 = mask2 | df2[col].astype(str).isin([str(s) for s in sentinels])
+                            except Exception:
+                                pass
+                        after_missing = df2[mask2].index.tolist()
+                        filled = len(set(before_missing) - set(after_missing))
+                        sample = sorted(list(set(before_missing) - set(after_missing)))[:20]
+                    except Exception:
+                        filled = 0
+                        sample = []
+                except Exception:
+                    filled = 0
+                    sample = []
+                info = {"step": "impute", "column": col, "method": "ffill", "rows_changed": filled}
+                return df2, info
+            if strategy in ("bfill", "backfill"):
+                try:
+                    df2[col] = df2[col].fillna(method='bfill')
+                    try:
+                        mask2 = df2[col].isnull() | (df2[col].astype(str).str.strip() == "")
+                        try:
+                            if sentinels:
+                                mask2 = mask2 | df2[col].isin(sentinels)
+                        except Exception:
+                            try:
+                                mask2 = mask2 | df2[col].astype(str).isin([str(s) for s in sentinels])
+                            except Exception:
+                                pass
+                        after_missing = df2[mask2].index.tolist()
+                        filled = len(set(before_missing) - set(after_missing))
+                        sample = sorted(list(set(before_missing) - set(after_missing)))[:20]
+                    except Exception:
+                        filled = 0
+                        sample = []
+                except Exception:
+                    filled = 0
+                    sample = []
+                info = {"step": "impute", "column": col, "method": "bfill", "rows_changed": filled}
+                return df2, info
+            # constant fill
+            if strategy == "constant":
+                value = params.get("value")
+                try:
+                    df2[col] = df2[col].fillna(value)
+                    try:
+                        mask2 = df2[col].isnull() | (df2[col].astype(str).str.strip() == "")
+                        try:
+                            if sentinels:
+                                mask2 = mask2 | df2[col].isin(sentinels)
+                        except Exception:
+                            try:
+                                mask2 = mask2 | df2[col].astype(str).isin([str(s) for s in sentinels])
+                            except Exception:
+                                pass
+                        after_missing = df2[mask2].index.tolist()
+                        filled = len(set(before_missing) - set(after_missing))
+                        sample = sorted(list(set(before_missing) - set(after_missing)))[:20]
+                    except Exception:
+                        filled = 0
+                        sample = []
+                except Exception:
+                    filled = 0
+                    sample = []
+                info = {"step": "impute", "column": col, "method": "constant", "rows_changed": filled, "value": value}
+                return df2, info
+            # mode
+            # fill missing strings with empty string (pandas path)
+            if strategy == "empty_string":
+                try:
+                    # detect nulls/empty/sentinels
+                    try:
+                        mask_null = df2[col].isnull()
+                        mask_empty = df2[col].astype(str).str.strip() == ""
+                        mask = mask_null | mask_empty
+                        try:
+                            if sentinels:
+                                mask = mask | df2[col].isin(sentinels)
+                        except Exception:
+                            try:
+                                mask = mask | df2[col].astype(str).isin([str(s) for s in sentinels])
+                            except Exception:
+                                pass
+                    except Exception:
+                        mask = df2[col].isnull()
+
+                    df_old = df2.copy()
+                    df2.loc[mask, col] = ""
+
+                    try:
+                        # compare old vs new to count changed rows
+                        changed = (df_old[col].fillna(object()) != df2[col].fillna(object()))
+                        diffs_idx = df_old[changed].index.tolist()
+                        filled = len(diffs_idx)
+                        sample = sorted(diffs_idx)[:20]
+                    except Exception:
+                        filled = 0
+                        sample = []
+
+                    info = {"step": "impute", "column": col, "method": "empty_string", "rows_changed": filled, "sample_positions": [i + 1 for i in sample]}
+                    return df2, info
+                except Exception:
+                    return df2, None
+
+            if strategy in ("mode", "most_common"):
+                try:
+                    mode_series = df2[source if source in df2.columns else col].mode()
+                    if len(mode_series) > 0:
+                        mode_val = mode_series.iloc[0]
+                    else:
+                        mode_val = None
+                    if mode_val is not None:
+                        df2[col] = df2[col].fillna(mode_val)
+                    try:
+                        mask2 = df2[col].isnull() | (df2[col].astype(str).str.strip() == "")
+                        try:
+                            if sentinels:
+                                mask2 = mask2 | df2[col].isin(sentinels)
+                        except Exception:
+                            try:
+                                mask2 = mask2 | df2[col].astype(str).isin([str(s) for s in sentinels])
+                            except Exception:
+                                pass
+                        after_missing = df2[mask2].index.tolist()
+                        filled = len(set(before_missing) - set(after_missing))
+                        sample = sorted(list(set(before_missing) - set(after_missing)))[:20]
+                    except Exception:
+                        filled = 0
+                        sample = []
+                except Exception:
+                    filled = 0
+                    sample = []
+                info = {"step": "impute", "column": col, "method": "mode", "rows_changed": filled, "mode_value": mode_val if 'mode_val' in locals() else None}
+                return df2, info
+
+            if strategy in ("mean", "average", "median"):
+                if source and source in df2.columns:
+                    # support median vs mean
+                    if strategy == 'median':
+                        agg = 'median'
+                    else:
+                        agg = 'mean'
+                    if group_by and group_by in df2.columns:
+                        if agg == 'mean':
+                            grp = df2.groupby(group_by)[source].transform("mean")
+                        else:
+                            grp = df2.groupby(group_by)[source].transform("median")
+                        df2[col] = df2[col].fillna(grp)
+                        try:
+                            after_missing = df2[df2[col].isnull() | (df2[col].astype(str).str.strip() == "")].index.tolist()
+                            filled = len(set(before_missing) - set(after_missing))
+                            sample = sorted(list(set(before_missing) - set(after_missing)))[:20]
+                        except Exception:
+                            filled = 0
+                            sample = []
+                        info = {"step": "impute", "column": col, "method": agg, "rows_changed": filled, "sample_positions": [i + 1 for i in sample], "source": source, "group_by": group_by}
+                        return df2, info
+                    else:
+                        if agg == 'mean':
+                            m = df2[source].astype(float).mean()
+                        else:
+                            m = df2[source].astype(float).median()
+                        df2[col] = df2[col].fillna(m)
+                        try:
+                            after_missing = df2[df2[col].isnull() | (df2[col].astype(str).str.strip() == "")].index.tolist()
+                            filled = len(set(before_missing) - set(after_missing))
+                            sample = sorted(list(set(before_missing) - set(after_missing)))[:20]
+                        except Exception:
+                            filled = 0
+                            sample = []
+                        info = {"step": "impute", "column": col, "method": agg, "rows_changed": filled, "sample_positions": [i + 1 for i in sample], "source": source}
+                        return df2, info
+                else:
+                    m = df2[col].astype(float).mean()
+                    df2[col] = df2[col].fillna(m)
+                    try:
+                        after_missing = df2[df2[col].isnull() | (df2[col].astype(str).str.strip() == "")].index.tolist()
+                        filled = len(set(before_missing) - set(after_missing))
+                        sample = sorted(list(set(before_missing) - set(after_missing)))[:20]
+                    except Exception:
+                        filled = 0
+                        sample = []
+                    info = {"step": "impute", "column": col, "method": "mean", "rows_changed": filled, "sample_positions": [i + 1 for i in sample]}
+                    return df2, info
+            if strategy == "row_mean" and sources:
+                valid = [s for s in sources if s in df2.columns]
+                if not valid:
+                    return df2
+                rowmean = df2[valid].astype(float).mean(axis=1)
+                df2[col] = df2[col].fillna(rowmean)
+                try:
+                    after_missing = df2[df2[col].isnull() | (df2[col].astype(str).str.strip() == "")].index.tolist()
+                    filled = len(set(before_missing) - set(after_missing))
+                    sample = sorted(list(set(before_missing) - set(after_missing)))[:20]
+                except Exception:
+                    filled = 0
+                    sample = []
+                info = {"step": "impute", "column": col, "method": "row_mean", "rows_changed": filled, "sample_positions": [i + 1 for i in sample], "source": valid}
+                return df2, info
+            # regression imputation for pandas
+            if strategy == 'regression' and sources:
+                try:
+                    import numpy as _np
+                    valid_srcs = [s for s in sources if s in df2.columns]
+                    if not valid_srcs:
+                        return df2, None
+                    train = df2.dropna(subset=valid_srcs + [col])
+                    if train.shape[0] == 0:
+                        return df2, None
+                    X_train = train[valid_srcs].astype(float).to_numpy()
+                    y_train = train[col].astype(float).to_numpy()
+                    X_train_aug = _np.hstack([_np.ones((X_train.shape[0],1)), X_train])
+                    coef, *_ = _np.linalg.lstsq(X_train_aug, y_train, rcond=None)
+                    missing_idx = df2[df2[col].isnull()].index.tolist()
+                    if not missing_idx:
+                        return df2, None
+                    X_missing = df2.loc[missing_idx, valid_srcs].astype(float).to_numpy()
+                    X_missing_aug = _np.hstack([_np.ones((X_missing.shape[0],1)), X_missing])
+                    preds = X_missing_aug.dot(coef)
+                    for idx, p in zip(missing_idx, preds):
+                        df2.at[idx, col] = float(p)
+                    info = {"step": "impute", "column": col, "method": "regression", "rows_changed": len(preds), "model": "ols", "sources": valid_srcs}
+                    return df2, info
+                except Exception:
+                    return df2, None
+            return df2, None
+    except Exception:
+        return df, None
+
+
 class Cleaner:
+    # Columns considered metadata and not part of the user's data table
+    META_KEYS = {"container_name", "sheet_name", "slide_number", "paragraph_index", "table_index", "column_index", "cell_label", "source_kind", "source_name", "source_path", "unit_kind", "row_index"}
     def profile(self, path: str):
         """Produce a minimal profile for a CSV path using Polars if available."""
         df = _read_table(path)
         profile = {}
         for col in df.columns:
+            # ignore metadata columns
+            if col in self.META_KEYS or (isinstance(col, str) and col.startswith("_")):
+                continue
             s = df[col]
             dtype = str(s.dtype)
             nulls = int(s.null_count())
@@ -59,11 +1381,21 @@ class Cleaner:
         df = _read_table(path)
 
         def _is_number(x: str) -> bool:
-            try:
-                float(str(x).replace(',', ''))
-                return True
-            except Exception:
-                return False
+                try:
+                    s = str(x).strip()
+                    if s == "":
+                        return False
+                    # handle parentheses as negative numbers
+                    if s.startswith('(') and s.endswith(')'):
+                        s = '-' + s[1:-1]
+                    # remove common currency symbols
+                    s = re.sub(r'[\$\£\€\¥\₹]', '', s)
+                    # remove thousands separators (commas and spaces)
+                    s = s.replace(',', '').replace(' ', '')
+                    float(s)
+                    return True
+                except Exception:
+                    return False
 
         def compute_diagnostics_from_rows(rows_list: list[dict], cols: list[str]):
             total = len(rows_list)
@@ -140,14 +1472,17 @@ class Cleaner:
                         safe_offset = max(0, int(offset))
                         safe_limit = max(1, min(int(limit), 500))
                         slice_rows = rows_out[safe_offset : safe_offset + safe_limit]
-                        diagnostics = compute_diagnostics_from_rows(rows_out, cols)
+                        # filter out metadata columns from output
+                        out_cols = [c for c in cols if c not in self.META_KEYS and not (isinstance(c, str) and c.startswith("_"))]
+                        slice_rows = [ {k:v for k,v in r.items() if k in out_cols} for r in slice_rows ]
+                        diagnostics = compute_diagnostics_from_rows(rows_out, out_cols)
                         # include a small raw preview of original extracted text lines
                         raw_preview = lines[safe_offset : safe_offset + safe_limit]
                         return {
                             "path": path,
                             "row_count": total_rows,
-                            "column_count": len(cols),
-                            "columns": cols,
+                            "column_count": len(out_cols),
+                            "columns": out_cols,
                             "rows": slice_rows,
                             "offset": safe_offset,
                             "limit": safe_limit,
@@ -157,7 +1492,117 @@ class Cleaner:
                             "diagnostics": diagnostics,
                             "raw_preview": raw_preview,
                         }
+                    # If cell-level extraction exists (from .xlsx, .docx tables, .pptx tables), assemble a 2D grid
+                    try:
+                        if pl is not None and "unit_kind" in df.columns and any(k in ("cell", "table_cell") for k in df.select(pl.col("unit_kind")).to_series().to_list()):
+                            # prefer sheet-level if present; choose the first sheet by occurrence
+                            try:
+                                cells_df = df.filter(pl.col("unit_kind").is_in(["cell", "table_cell"]))
+                            except Exception:
+                                cells_df = df.filter((pl.col("unit_kind") == "cell") | (pl.col("unit_kind") == "table_cell"))
+
+                            cells = cells_df.select([c for c in ["sheet_name", "row_index", "column_index", "cell_label", "text"] if c in cells_df.columns]).to_dicts()
+                            if cells:
+                                # group by sheet_name and pick the first non-empty sheet
+                                sheets = {}
+                                for c in cells:
+                                    sheet = c.get("sheet_name") or "sheet1"
+                                    sheets.setdefault(sheet, []).append(c)
+                                first_sheet = list(sheets.keys())[0]
+                                sheet_cells = sheets[first_sheet]
+
+                                # coerce indices to ints and find extents
+                                max_row = 0
+                                max_col = 0
+                                cell_map = {}
+                                for cc in sheet_cells:
+                                    try:
+                                        r = int(cc.get("row_index") or 0)
+                                        col = int(cc.get("column_index") or 0)
+                                    except Exception:
+                                        continue
+                                    if r < 1 or col < 1:
+                                        continue
+                                    max_row = max(max_row, r)
+                                    max_col = max(max_col, col)
+                                    cell_map[(r, col)] = cc.get("text")
+
+                                # build rows matrix (1-based rows). We'll detect header from first row.
+                                matrix = []
+                                for r in range(1, max_row + 1):
+                                    row_vals = [cell_map.get((r, c), None) for c in range(1, max_col + 1)]
+                                    matrix.append(row_vals)
+
+                                # header detection: if first row has at least one non-numeric and not all empty, treat as header
+                                def _is_number_val(x):
+                                    try:
+                                        if x is None or x == "":
+                                            return False
+                                        s = str(x).strip()
+                                        if s == "":
+                                            return False
+                                        if s.startswith('(') and s.endswith(')'):
+                                            s = '-' + s[1:-1]
+                                        s = re.sub(r'[\$\£\€\¥\₹]', '', s)
+                                        s = s.replace(',', '').replace(' ', '')
+                                        float(s)
+                                        return True
+                                    except Exception:
+                                        return False
+
+                                header = None
+                                if matrix and any(v not in (None, "") for v in matrix[0]):
+                                    first_row = matrix[0]
+                                    non_numeric = sum(1 for v in first_row if not _is_number_val(v))
+                                    if non_numeric >= 1:
+                                        header = [h if h not in (None, "") else f"col_{i+1}" for i, h in enumerate(first_row)]
+
+                                cols = []
+                                rows_out = []
+                                start_row = 1
+                                if header:
+                                    cols = header
+                                    start_row = 2
+                                else:
+                                    cols = [f"col_{i+1}" for i in range(max_col)]
+
+                                for ridx in range(start_row - 1, len(matrix)):
+                                    row = matrix[ridx]
+                                    rowdict = {}
+                                    for j, v in enumerate(row):
+                                        colname = cols[j] if j < len(cols) else f"col_{j+1}"
+                                        rowdict[colname] = v
+                                    rows_out.append(rowdict)
+
+                                if rows_out:
+                                    total_rows = len(rows_out)
+                                    safe_offset = max(0, int(offset))
+                                    safe_limit = max(1, min(int(limit), 500))
+                                    slice_rows = rows_out[safe_offset : safe_offset + safe_limit]
+                                    # filter out metadata columns from output
+                                    out_cols = [c for c in cols if c not in self.META_KEYS and not (isinstance(c, str) and c.startswith("_"))]
+                                    slice_rows = [ {k:v for k,v in r.items() if k in out_cols} for r in slice_rows ]
+                                    diagnostics = compute_diagnostics_from_rows(rows_out, out_cols)
+                                    raw_preview = [ {"r": r, "cells": matrix[r] } for r in range(safe_offset, min(safe_offset + safe_limit, len(matrix))) ]
+                                    return {
+                                        "path": path,
+                                        "row_count": total_rows,
+                                        "column_count": len(out_cols),
+                                        "columns": out_cols,
+                                        "rows": slice_rows,
+                                        "offset": safe_offset,
+                                        "limit": safe_limit,
+                                        "returned_rows": len(slice_rows),
+                                        "has_prev": safe_offset > 0,
+                                        "has_next": (safe_offset + safe_limit) < total_rows,
+                                        "diagnostics": diagnostics,
+                                        "raw_preview": raw_preview,
+                                        "sheet_name": first_sheet,
+                                    }
+                    except Exception:
+                        pass
         except Exception:
+            # best-effort reconstruction failed; fall back to dataframe inspection
             pass
 
         # Default: use polars dataframe columns and compute lightweight diagnostics
@@ -167,10 +1612,14 @@ class Cleaner:
         total_rows = int(df.height)
         end = safe_offset + len(rows)
 
+        # filter out metadata columns from rows and diagnostics
+        out_cols = [c for c in list(df.columns) if c not in self.META_KEYS and not (isinstance(c, str) and c.startswith("_"))]
+        rows = [ {k:v for k,v in r.items() if k in out_cols} for r in rows ]
+
         diagnostics = {}
         try:
             df_small = df.with_row_count("_row_index")
-            for col in df.columns:
+            for col in out_cols:
                 try:
                     # find up to 20 missing positions
                     nulls = df_small.filter((pl.col(col).is_null()) | (pl.col(col) == "")).select("_row_index").to_series().to_list()
@@ -199,8 +1648,8 @@ class Cleaner:
         return {
             "path": path,
             "row_count": total_rows,
-            "column_count": int(len(df.columns)),
-            "columns": list(df.columns),
+            "column_count": int(len(out_cols)),
+            "columns": out_cols,
             "rows": rows,
             "offset": safe_offset,
             "limit": safe_limit,
@@ -209,6 +1658,160 @@ class Cleaner:
             "has_next": end < total_rows,
             "diagnostics": diagnostics,
         }
+
+    def _reconstruct_table_from_df(self, df, offset: int = 0, limit: int = None):
+        """Attempt to reconstruct a wide table from long-form ingestion DataFrame.
+        Returns a list of row dicts (filtered of meta columns). If limit is None or <=0, return all rows.
+        """
+        try:
+            if pl is None or not {"unit_kind", "text"}.issubset(set(df.columns if hasattr(df, 'columns') else [])):
+                # Not long-form; fall back to head records
+                return _df_head_records(df, limit if limit is not None else None)
+
+            # gather line-level rows
+            try:
+                lines = df.filter(pl.col("unit_kind") == "line").sort("row_index").select(["row_index", "text"]).to_dicts()
+            except Exception:
+                try:
+                    lines = df.filter(pl.col("unit_kind") == "line").select(["row_index", "text"]).to_dicts()
+                except Exception:
+                    lines = []
+
+            if lines:
+                # detect delimiter from sample
+                sample = "\n".join(str(r.get("text", "")) for r in lines[:8])
+                counts = {",": sample.count(","), "\t": sample.count("\t"), ";": sample.count(";"), "|": sample.count("|")}
+                delim = max(counts.items(), key=lambda kv: kv[1])[0]
+                parsed_rows = []
+                for r in lines:
+                    text = r.get("text") or ""
+                    try:
+                        reader = csv.reader(io.StringIO(text), delimiter=delim)
+                        parsed = next(reader)
+                    except Exception:
+                        parsed = text.split(delim) if delim else [text]
+                    parsed_rows.append([c for c in parsed])
+
+                # detect header from first row
+                header = None
+                if parsed_rows:
+                    first_vals = parsed_rows[0]
+                    non_numeric = sum(1 for v in first_vals if not (v is None or v == "" or (isinstance(v, str) and v.replace(',', '').replace('.', '').isdigit())))
+                    if non_numeric >= 1:
+                        header = [h or f"col_{i+1}" for i, h in enumerate(first_vals)]
+
+                cols = []
+                rows_out = []
+                start_row = 1
+                if header:
+                    cols = header
+                    start_row = 2
+                else:
+                    cols = [f"col_{i+1}" for i in range(max(len(r) for r in parsed_rows))]
+
+                for i, vals in enumerate(parsed_rows):
+                    if header and i == 0:
+                        continue
+                    rowdict = {}
+                    for j, v in enumerate(vals):
+                        colname = header[j] if header and j < len(header) else f"col_{j+1}"
+                        rowdict[colname] = v
+                        if colname not in cols:
+                            cols.append(colname)
+                    rows_out.append(rowdict)
+
+                if rows_out:
+                    # handle limit/offset
+                    safe_offset = max(0, int(offset or 0))
+                    if limit is None or (isinstance(limit, int) and limit <= 0):
+                        slice_rows = rows_out[safe_offset:]
+                    else:
+                        safe_limit = max(1, min(int(limit), 10000))
+                        slice_rows = rows_out[safe_offset : safe_offset + safe_limit]
+
+                    out_cols = [c for c in cols if c not in self.META_KEYS and not (isinstance(c, str) and c.startswith("_"))]
+                    slice_rows = [{k: v for k, v in r.items() if k in out_cols} for r in slice_rows]
+                    return slice_rows
+
+            # cell-level table assembly
+            try:
+                if pl is not None and "unit_kind" in df.columns and any(k in ("cell", "table_cell") for k in df.select(pl.col("unit_kind")).to_series().to_list()):
+                    try:
+                        cells_df = df.filter(pl.col("unit_kind").is_in(["cell", "table_cell"]))
+                    except Exception:
+                        cells_df = df.filter((pl.col("unit_kind") == "cell") | (pl.col("unit_kind") == "table_cell"))
+
+                    cells = cells_df.select([c for c in ["sheet_name", "row_index", "column_index", "cell_label", "text"] if c in cells_df.columns]).to_dicts()
+                    if cells:
+                        sheets = {}
+                        for c in cells:
+                            sheet = c.get("sheet_name") or "sheet1"
+                            sheets.setdefault(sheet, []).append(c)
+                        first_sheet = list(sheets.keys())[0]
+                        sheet_cells = sheets[first_sheet]
+
+                        max_row = 0
+                        max_col = 0
+                        cell_map = {}
+                        for cc in sheet_cells:
+                            try:
+                                r = int(cc.get("row_index") or 0)
+                                col = int(cc.get("column_index") or 0)
+                            except Exception:
+                                continue
+                            if r < 1 or col < 1:
+                                continue
+                            max_row = max(max_row, r)
+                            max_col = max(max_col, col)
+                            cell_map[(r, col)] = cc.get("text")
+
+                        matrix = []
+                        for r in range(1, max_row + 1):
+                            row_vals = [cell_map.get((r, c), None) for c in range(1, max_col + 1)]
+                            matrix.append(row_vals)
+
+                        def _is_number_val(x):
+                            try:
+                                if x is None or x == "":
+                                    return False
+                                float(str(x).replace(',', ''))
+                                return True
+                            except Exception:
+                                return False
+
+                        header = None
+                        if matrix and any(v not in (None, "") for v in matrix[0]):
+                            first_row = matrix[0]
+                            non_numeric = sum(1 for v in first_row if not _is_number_val(v))
+                            if non_numeric >= 1:
+                                header = [h if h not in (None, "") else f"col_{i+1}" for i, h in enumerate(first_row)]
+
+                        cols = header if header else [f"col_{i+1}" for i in range(max_col)]
+                        rows_out = []
+                        start_row = 2 if header else 1
+                        for ridx in range(start_row - 1, len(matrix)):
+                            row = matrix[ridx]
+                            rowdict = {}
+                            for j, v in enumerate(row):
+                                colname = cols[j] if j < len(cols) else f"col_{j+1}"
+                                rowdict[colname] = v
+                            rows_out.append(rowdict)
+
+                        if rows_out:
+                            if limit is None or (isinstance(limit, int) and limit <= 0):
+                                slice_rows = rows_out
+                            else:
+                                safe_limit = max(1, min(int(limit), 10000))
+                                slice_rows = rows_out[0:safe_limit]
+                            out_cols = [c for c in cols if c not in self.META_KEYS and not (isinstance(c, str) and c.startswith("_"))]
+                            slice_rows = [{k: v for k, v in r.items() if k in out_cols} for r in slice_rows]
+                            return slice_rows
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # fallback: return head records
+        return _df_head_records(df, limit if limit is not None else None)
 
     def suggest_fixes(self, profile: dict):
         suggestions = []
@@ -232,83 +1835,385 @@ class Cleaner:
             raise ValueError("Recipe must contain at least one source")
         src = recipe.sources[0]["path"]
         df = _read_table(src)
-        for step in recipe.cleaning_steps:
-            if step.action == "drop_column" and step.column:
-                df = df.drop(step.column)
-            elif step.action == "impute" and step.column:
-                strat = step.params.get("strategy") or step.params.get("strategy", None) or getattr(step, "strategy", None)
-                if strat == "median":
+        # If source is long-form extraction, reconstruct a wide table first
+        try:
+            if pl is not None and {"unit_kind", "text"}.issubset(set(df.columns if hasattr(df, 'columns') else [])):
+                rows = self._reconstruct_table_from_df(df, offset=0, limit=None)
+                if rows:
                     try:
-                        med = df[step.column].median()
-                        df = df.with_column(df[step.column].fill_null(med).alias(step.column))
+                        df = pl.from_dicts(rows)
                     except Exception:
-                        df = df.with_column(df[step.column].fill_null(0).alias(step.column))
-                elif strat == "empty_string":
-                    df = df.with_column(df[step.column].fill_null("").alias(step.column))
-                elif strat == "forward_fill":
-                    df = df.with_column(df[step.column].fill_null(strategy="forward").alias(step.column))
-            elif step.action == "normalize" and step.column:
+                        try:
+                            import pandas as _pd
+                            df = _pd.DataFrame(rows)
+                        except Exception:
+                            # fall back to original polars df if conversion fails
+                            df = _read_table(src)
+        except Exception:
+            pass
+        diagnostics = []
+        for step in recipe.cleaning_steps:
+            # Skip steps that reference missing columns to avoid runtime errors
+            col = getattr(step, "column", None)
+            # Never apply transformations to metadata columns
+            if col and col in self.META_KEYS:
+                continue
+            if col and col not in df.columns:
+                # skip silently in runner; caller may validate schema separately
+                continue
+
+            if step.action == "drop_column" and col:
+                df = _drop_column(df, col)
+            elif step.action == "impute" and col:
+                params = step.params or {}
+                res = _impute_missing(df, col, params)
+                if isinstance(res, tuple):
+                    df = res[0]
+                    info = res[1]
+                    if info:
+                        diagnostics.append(info)
+                else:
+                    df = res
+            elif step.action == "normalize" and col:
                 try:
                     case = (step.params or {}).get("case", "lower")
-                    if case == "upper":
-                        df = df.with_column(df[step.column].str.to_uppercase().alias(step.column))
-                    elif case == "trim":
-                        df = df.with_column(df[step.column].str.strip_chars().alias(step.column))
-                    else:
-                        df = df.with_column(df[step.column].str.to_lowercase().alias(step.column))
+                    df = _string_transform_column(df, col, case=case)
                 except Exception:
                     pass
             elif step.action == "deduplicate":
-                subset = [step.column] if step.column else None
-                df = df.unique(subset=subset, keep="first")
-            elif step.action == "rename" and step.column:
+                subset = [col] if col else None
+                df = _unique_df(df, subset=subset)
+            elif step.action == "map" and col:
+                mapping = (step.params or {}).get("mapping") or {}
+                if mapping:
+                    df = _map_values(df, col, mapping)
+            elif step.action == "regex_replace" and col:
+                pat = (step.params or {}).get("pattern")
+                repl = (step.params or {}).get("replace")
+                if pat is not None:
+                    df = _regex_replace(df, col, pat, repl or "")
+            elif step.action == "bucketize" and col:
+                buckets = (step.params or {}).get("buckets", [])
+                if buckets:
+                    df = _bucketize(df, col, buckets)
+            elif step.action == "replace" and col:
+                old = (step.params or {}).get("old")
+                new = (step.params or {}).get("new")
+                if old is not None:
+                    df = _replace_values(df, col, old, new)
+            elif step.action == "remove_by_type" and col:
+                params = step.params or {}
+                res = _remove_by_type(df, col, params)
+                if isinstance(res, tuple):
+                    df = res[0]
+                    info = res[1]
+                    if info:
+                        diagnostics.append(info)
+                else:
+                    df = res
+            elif step.action == "move_by_type" or step.action == "swap_by_types":
+                params = step.params or {}
+                if step.action == "move_by_type":
+                    moves = [params]
+                else:
+                    moves = params.get("moves") or []
+                res = _swap_by_types(df, moves, replacement=params.get("replacement", ""))
+                if isinstance(res, tuple):
+                    df = res[0]
+                    info = res[1]
+                    if info:
+                        diagnostics.append(info)
+                else:
+                    df = res
+            elif step.action == "rename" and col:
                 new_name = (step.params or {}).get("new_name")
                 if new_name:
-                    df = df.rename({step.column: new_name})
-        out_path = recipe.outputs[0]["path"] if recipe.outputs else "output.csv"
-        df.write_csv(out_path)
-        return {"written": out_path}
+                    df = _rename_column(df, col, new_name)
+            elif step.action == "conditional" and col:
+                params = step.params or {}
+                val = params.get("value")
+                cond = params.get("condition")
+                if cond is not None:
+                    df = _conditional_transform(df, col, val, cond)
+            elif step.action == "join":
+                params = step.params or {}
+                left_path = params.get("left")
+                right_path = params.get("right")
+                keys = params.get("keys") or []
+                fuzzy = params.get("fuzzy", False)
+                # only support single-key joins for fuzzy matching
+                if right_path and keys:
+                    try:
+                        right_df = _read_table(right_path)
+                        join_key = keys[0]
+                        if not fuzzy:
+                            # standard left join
+                            if _is_polars_df(df) and _is_polars_df(right_df):
+                                df = df.join(right_df, on=join_key, how="left")
+                            else:
+                                # pandas fallback
+                                import pandas as _pd
+                                left_pd = df.to_pandas() if _is_polars_df(df) else df
+                                right_pd = right_df.to_pandas() if _is_polars_df(right_df) else right_df
+                                df = left_pd.merge(right_pd, left_on=join_key, right_on=join_key, how="left")
+                        else:
+                            # fuzzy join: match closest right key for each left key value
+                            # build list of candidate keys from right
+                            if _is_polars_df(right_df):
+                                try:
+                                    right_keys = [str(x) for x in right_df.select(pl.col(join_key)).to_series().to_list()]
+                                except Exception:
+                                    # fallback: try direct column access on polars DataFrame
+                                    try:
+                                        right_keys = [str(x) for x in right_df[join_key].to_list()] if join_key in right_df.columns else []
+                                    except Exception:
+                                        right_keys = []
+                            else:
+                                right_keys = [str(x) for x in right_df[join_key].astype(str).unique().tolist()]
 
-    def preview_recipe(self, recipe, n=5):
-        """Run recipe transforms in-memory and return first `n` rows before and after as dicts."""
+                            mapping = {}
+                            # threshold for difflib matching
+                            cutoff = float(params.get("threshold", 0.8))
+                            for rk in right_keys:
+                                mapping[rk] = rk
+
+                            def find_best(v):
+                                if v is None:
+                                    return None
+                                s = str(v)
+                                matches = difflib.get_close_matches(s, right_keys, n=1, cutoff=cutoff)
+                                return matches[0] if matches else None
+
+                            if _is_polars_df(df):
+                                try:
+                                    # create helper mapped column
+                                    mapped = df.select(pl.col(join_key)).to_series().to_list()
+                                    mapped_vals = [find_best(x) for x in mapped]
+                                    df = df.with_columns(pl.Series("__fuzzy_key__", mapped_vals))
+                                    # rename right side columns to avoid collisions
+                                    right_pref = right_df.rename({c: f"right__{c}" for c in right_df.columns})
+                                    df = df.join(right_pref, left_on="__fuzzy_key__", right_on=f"right__{join_key}", how="left")
+                                    # drop helper key
+                                    try:
+                                        df = df.drop("__fuzzy_key__")
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    pass
+                            else:
+                                import pandas as _pd
+                                left_pd = df.to_pandas() if _is_polars_df(df) else df.copy()
+                                right_pd = right_df.to_pandas() if _is_polars_df(right_df) else right_df.copy()
+                                left_pd["__fuzzy_key__"] = left_pd[join_key].apply(find_best)
+                                right_pd = right_pd.rename(columns={join_key: "__right_key__"})
+                                df = left_pd.merge(right_pd, left_on="__fuzzy_key__", right_on="__right_key__", how="left")
+                    except Exception:
+                        pass
+        out_path = recipe.outputs[0]["path"] if recipe.outputs else "output.csv"
+        _write_csv(df, out_path)
+        return {"written": out_path, "diagnostics": diagnostics}
+
+    def preview_recipe(self, recipe, n=None):
+        """Run recipe transforms in-memory and return first `n` rows before and after as dicts.
+
+        If `n` is None or <= 0, the full dataset is returned (use with care for large files).
+        """
         if not recipe.sources:
             raise ValueError("Recipe must contain at least one source")
         src = recipe.sources[0]["path"]
         df = _read_table(src)
-        before = df.head(n).to_dicts()
-        df_after = df
-        for step in recipe.cleaning_steps:
-            if step.action == "drop_column" and step.column:
-                df_after = df_after.drop(step.column)
-            elif step.action == "impute" and step.column:
-                strat = step.params.get("strategy") or step.params.get("strategy", None) or getattr(step, "strategy", None)
-                if strat == "median":
+        wide_df = None
+        try:
+            if pl is not None and {"unit_kind", "text"}.issubset(set(df.columns if hasattr(df, 'columns') else [])):
+                rows_all = self._reconstruct_table_from_df(df, offset=0, limit=None)
+                if rows_all:
                     try:
-                        med = df_after[step.column].median()
-                        df_after = df_after.with_column(df_after[step.column].fill_null(med).alias(step.column))
+                        wide_df = pl.from_dicts(rows_all)
                     except Exception:
-                        df_after = df_after.with_column(df_after[step.column].fill_null(0).alias(step.column))
-                elif strat == "empty_string":
-                    df_after = df_after.with_column(df_after[step.column].fill_null("").alias(step.column))
-                elif strat == "forward_fill":
-                    df_after = df_after.with_column(df_after[step.column].fill_null(strategy="forward").alias(step.column))
-            elif step.action == "normalize" and step.column:
+                        import pandas as _pd
+                        wide_df = _pd.DataFrame(rows_all)
+        except Exception:
+            wide_df = None
+
+        # choose df to present/operate on: prefer reconstructed wide table when available
+        df_for_ops = wide_df if wide_df is not None else df
+        before = _df_head_records(df_for_ops, n)
+        # strip metadata keys from preview rows
+        def _strip_meta_rows(rows):
+            try:
+                return [ {k:v for k,v in (r or {}).items() if k not in self.META_KEYS and not (isinstance(k, str) and k.startswith('_'))} for r in (rows or []) ]
+            except Exception:
+                return rows
+        before = _strip_meta_rows(before)
+        df_after = df_for_ops
+        warnings = []
+        for step in recipe.cleaning_steps:
+            col = getattr(step, "column", None)
+            if col and col not in (df_after.columns if _is_polars_df(df_after) else list(df_after.columns)):
+                warnings.append({"step": step.action, "column": col, "reason": "column_missing"})
+                continue
+
+            if step.action == "drop_column" and col:
+                df_after = _drop_column(df_after, col)
+            elif step.action == "impute" and col:
+                params = step.params or {}
+                res = _impute_missing(df_after, col, params)
+                info = None
+                if isinstance(res, tuple):
+                    df_after = res[0]
+                    info = res[1]
+                else:
+                    df_after = res
+                if info:
+                    # add human-readable warning for preview
+                    try:
+                        method = info.get('method') or info.get('strategy') or ''
+                        rows_changed = int(info.get('rows_changed') or 0)
+                        colname = info.get('column')
+                        source = info.get('source')
+                        group_by = info.get('group_by')
+                        msg = f"Imputed {colname}: {rows_changed} rows filled"
+                        details = []
+                        if method:
+                            details.append(method)
+                        if source:
+                            details.append('from ' + (source if isinstance(source, str) else json.dumps(source)))
+                        if group_by:
+                            details.append('grouped by ' + group_by)
+                        if details:
+                            msg = msg + ' (' + ', '.join(details) + ')'
+                        warnings.append({"step": "impute", "column": colname, "message": msg, "rows_changed": rows_changed, "sample_positions": info.get('sample_positions', [])})
+                    except Exception:
+                        warnings.append({"step": "impute", "column": col, "message": "Imputation applied", "rows_changed": 0})
+            elif step.action == "normalize" and col:
                 try:
                     case = (step.params or {}).get("case", "lower")
-                    if case == "upper":
-                        df_after = df_after.with_column(df_after[step.column].str.to_uppercase().alias(step.column))
-                    elif case == "trim":
-                        df_after = df_after.with_column(df_after[step.column].str.strip_chars().alias(step.column))
-                    else:
-                        df_after = df_after.with_column(df_after[step.column].str.to_lowercase().alias(step.column))
+                    df_after = _string_transform_column(df_after, col, case=case)
                 except Exception:
                     pass
             elif step.action == "deduplicate":
-                subset = [step.column] if step.column else None
-                df_after = df_after.unique(subset=subset, keep="first")
-            elif step.action == "rename" and step.column:
+                subset = [col] if col else None
+                df_after = _unique_df(df_after, subset=subset)
+            elif step.action == "map" and col:
+                mapping = (step.params or {}).get("mapping") or {}
+                if mapping:
+                    df_after = _map_values(df_after, col, mapping)
+            elif step.action == "regex_replace" and col:
+                pat = (step.params or {}).get("pattern")
+                repl = (step.params or {}).get("replace")
+                if pat is not None:
+                    df_after = _regex_replace(df_after, col, pat, repl or "")
+            elif step.action == "bucketize" and col:
+                buckets = (step.params or {}).get("buckets", [])
+                if buckets:
+                    df_after = _bucketize(df_after, col, buckets)
+            elif step.action == "replace" and col:
+                old = (step.params or {}).get("old")
+                new = (step.params or {}).get("new")
+                if old is not None:
+                    df_after = _replace_values(df_after, col, old, new)
+            elif step.action == "remove_by_type" and col:
+                params = step.params or {}
+                res = _remove_by_type(df_after, col, params)
+                info = None
+                if isinstance(res, tuple):
+                    df_after = res[0]
+                    info = res[1]
+                else:
+                    df_after = res
+                if info:
+                    # add human-readable warning for preview
+                    try:
+                        rows_changed = int(info.get('rows_changed') or 0)
+                        colname = info.get('column')
+                        ttype = info.get('target_type')
+                        msg = f"Removed {ttype} entries from {colname}: {rows_changed} rows changed"
+                        warnings.append({"step": "remove_by_type", "column": colname, "message": msg, "rows_changed": rows_changed, "sample_positions": info.get('sample_positions', [])})
+                    except Exception:
+                        warnings.append({"step": "remove_by_type", "column": col, "message": "Removed values by type", "rows_changed": 0})
+            elif step.action == "rename" and col:
                 new_name = (step.params or {}).get("new_name")
                 if new_name:
-                    df_after = df_after.rename({step.column: new_name})
-        after = df_after.head(n).to_dicts()
-        return {"before": before, "after": after}
+                    df_after = _rename_column(df_after, col, new_name)
+            elif step.action == "move_by_type" or step.action == "swap_by_types":
+                params = step.params or {}
+                if step.action == "move_by_type":
+                    moves = [params]
+                else:
+                    moves = params.get("moves") or []
+                res = _swap_by_types(df_after, moves, replacement=params.get("replacement", ""))
+                info = None
+                if isinstance(res, tuple):
+                    df_after = res[0]
+                    info = res[1]
+                else:
+                    df_after = res
+                if info:
+                    warnings.append({"step": step.action, "message": f"Moved/swapped values: {info.get('rows_changed', 0)} rows changed", "details": info})
+            elif step.action == "conditional" and col:
+                params = step.params or {}
+                val = params.get("value")
+                cond = params.get("condition")
+                if cond is not None:
+                    df_after = _conditional_transform(df_after, col, val, cond)
+            elif step.action == "join":
+                params = step.params or {}
+                left_path = params.get("left")
+                right_path = params.get("right")
+                keys = params.get("keys") or []
+                fuzzy = params.get("fuzzy", False)
+                if right_path and keys:
+                    try:
+                        right_df = _read_table(right_path)
+                        join_key = keys[0]
+                        if not fuzzy:
+                            if _is_polars_df(df_after) and _is_polars_df(right_df):
+                                df_after = df_after.join(right_df, on=join_key, how="left")
+                            else:
+                                import pandas as _pd
+                                left_pd = df_after.to_pandas() if _is_polars_df(df_after) else df_after
+                                right_pd = right_df.to_pandas() if _is_polars_df(right_df) else right_df
+                                df_after = left_pd.merge(right_pd, left_on=join_key, right_on=join_key, how="left")
+                        else:
+                            if _is_polars_df(right_df):
+                                try:
+                                    right_keys = [str(x) for x in right_df.select(pl.col(join_key)).to_series().to_list()]
+                                except Exception:
+                                    right_keys = [str(x) for x in right_df[join_key].to_list()] if join_key in right_df.columns else []
+                            else:
+                                right_keys = [str(x) for x in right_df[join_key].astype(str).unique().tolist()]
+
+                            cutoff = float(params.get("threshold", 0.8))
+
+                            def find_best(v):
+                                if v is None:
+                                    return None
+                                s = str(v)
+                                matches = difflib.get_close_matches(s, right_keys, n=1, cutoff=cutoff)
+                                return matches[0] if matches else None
+
+                            if _is_polars_df(df_after):
+                                try:
+                                    mapped = df_after.select(pl.col(join_key)).to_series().to_list()
+                                    mapped_vals = [find_best(x) for x in mapped]
+                                    df_after = df_after.with_columns(pl.Series("__fuzzy_key__", mapped_vals))
+                                    right_pref = right_df.rename({c: f"right__{c}" for c in right_df.columns})
+                                    df_after = df_after.join(right_pref, left_on="__fuzzy_key__", right_on=f"right__{join_key}", how="left")
+                                    try:
+                                        df_after = df_after.drop("__fuzzy_key__")
+                                    except Exception:
+                                        pass
+                                except Exception:
+                                    pass
+                            else:
+                                import pandas as _pd
+                                left_pd = df_after.to_pandas() if _is_polars_df(df_after) else df_after.copy()
+                                right_pd = right_df.to_pandas() if _is_polars_df(right_df) else right_df.copy()
+                                left_pd["__fuzzy_key__"] = left_pd[join_key].apply(find_best)
+                                right_pd = right_pd.rename(columns={join_key: "__right_key__"})
+                                df_after = left_pd.merge(right_pd, left_on="__fuzzy_key__", right_on="__right_key__", how="left")
+                    except Exception:
+                        pass
+        after = _df_head_records(df_after, n)
+        after = _strip_meta_rows(after)
+        return {"before": before, "after": after, "warnings": warnings}

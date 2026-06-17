@@ -1,0 +1,9 @@
+{
+  "id": "run_c24d73ae",
+  "recipe_id": "recipe_1781137674169_ae460201",
+  "started_at": "2026-06-11T00:27:55.567422Z",
+  "status": "failed",
+  "export_format": "csv",
+  "error": "'DataFrame' object has no attribute 'with_column'",
+  "finished_at": "2026-06-11T00:27:55.613971Z"
+}

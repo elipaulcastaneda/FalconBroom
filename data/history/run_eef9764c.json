@@ -1,0 +1,40 @@
+{
+  "id": "run_eef9764c",
+  "recipe_id": "recipe_1781675537363_872225e9",
+  "started_at": "2026-06-17T05:58:01.610933Z",
+  "status": "completed",
+  "export_format": "csv",
+  "finished_at": "2026-06-17T05:58:01.743005Z",
+  "output_path": "output_from_text.csv",
+  "diagnostics": [
+    {
+      "step": "impute",
+      "column": "observation_date",
+      "method": "from_column",
+      "rows_changed": 157,
+      "sample_positions": [
+        1,
+        2,
+        3,
+        8,
+        11,
+        13,
+        17,
+        20,
+        25,
+        28,
+        29,
+        34,
+        37,
+        40,
+        43,
+        46,
+        49,
+        54,
+        57,
+        60
+      ],
+      "source": "date"
+    }
+  ]
+}

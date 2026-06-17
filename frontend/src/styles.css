@@ -167,10 +167,29 @@ p {
   position: relative;
   min-height: 100vh;
   display: grid;
+  grid-template-rows: auto 1fr;
   grid-template-columns: 280px minmax(0, 1fr);
   gap: 1rem;
   padding: 1rem;
   overflow: hidden;
+}
+
+.app-header {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  padding: 10px 16px;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+  z-index: 30;
+}
+
+.logo-wrap{display:flex;align-items:center;gap:10px}
+.app-logo{width:36px;height:36px}
+.app-title{font-size:1rem;margin:0;color:var(--muted)}
+
+/* Ensure the rail and main occupy the second grid row under the header */
+.side-rail, .main-pane {
+  grid-row: 2;
 }
 
 .app-bg {
@@ -608,6 +627,32 @@ p {
   max-height: 24rem;
 }
 
+.cell-changed {
+  background: linear-gradient(90deg, rgba(245,158,11,0.12), rgba(245,158,11,0.06));
+  border-bottom: 2px solid rgba(245,158,11,0.18);
+}
+
+.schema-diff { padding: 0.6rem; border-radius: 8px; border: 1px dashed rgba(148,163,184,0.08); background: rgba(148,163,184,0.03); color: var(--muted); }
+
+.cell-selected {
+  box-shadow: inset 0 0 0 2px rgba(245,158,11,0.32);
+  background: linear-gradient(90deg, rgba(245,158,11,0.18), rgba(245,158,11,0.08));
+}
+
+.tooltip-popup {
+  position: absolute;
+  z-index: 60;
+  background: var(--surface, #0b1220);
+  color: var(--text, #e6eef8);
+  border: 1px solid rgba(255,255,255,0.06);
+  padding: 8px 10px;
+  border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(2,6,23,0.6);
+  font-size: 0.85rem;
+  pointer-events: none;
+  min-width: 160px;
+}
+
 .empty-state {
   border: 1px dashed rgba(148, 163, 184, 0.3);
   border-radius: 18px;
@@ -797,6 +842,39 @@ p {
   display: grid;
   gap: 0.6rem;
   z-index: 9999;
+}
+
+/* Modal for custom revisions */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(2,6,23,0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9998;
+  animation: fadeIn 160ms ease;
+}
+
+.modal-panel {
+  width: min(1100px, 92%);
+  max-height: 86vh;
+  overflow: auto;
+  padding: 1.25rem;
+  border-radius: 14px;
+  box-shadow: 0 30px 80px rgba(2,8,23,0.6);
+  transform: translateY(8px);
+  animation: slideUp 200ms cubic-bezier(.2,.9,.2,1) both;
+}
+
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(12px) scale(0.995); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 .toast-archive-toggle {
