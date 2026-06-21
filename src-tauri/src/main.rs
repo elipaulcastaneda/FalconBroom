@@ -102,14 +102,39 @@ fn pick_file_and_profile() -> Result<Value, String> {
 
     // Call backend /profile. Prefer remote backend URL if provided via env var.
     let client = reqwest::blocking::Client::new();
-    let base = std::env::var("FALCONBROOM_BACKEND_URL").unwrap_or_else(|_| "http://127.0.0.1:3008".to_string());
+    let env_base = std::env::var("FALCONBROOM_BACKEND_URL");
+    let base = env_base.clone().unwrap_or_else(|_| "http://127.0.0.1:3008".to_string());
     let url = format!("{}/profile", base.trim_end_matches('/'));
-    let body = serde_json::json!({"path": path});
-    let resp = client
-        .post(url)
-        .json(&body)
-        .send()
-        .map_err(|e| format!("Failed to call backend: {}", e))?;
+
+    let resp = if env_base.is_ok() {
+        // Remote backend: upload the file contents as multipart/form-data
+        let p = std::path::PathBuf::from(&path);
+        let filename = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string();
+
+        let bytes = std::fs::read(&p).map_err(|e| format!("Failed to read selected file: {}", e))?;
+
+        let part = reqwest::blocking::multipart::Part::bytes(bytes).file_name(filename);
+        let form = reqwest::blocking::multipart::Form::new().part("file", part);
+
+        client
+            .post(url)
+            .multipart(form)
+            .send()
+            .map_err(|e| format!("Failed to call remote backend: {}", e))?
+    } else {
+        // Local backend: send the path in JSON (existing behavior)
+        let body = serde_json::json!({"path": path});
+        client
+            .post(url)
+            .json(&body)
+            .send()
+            .map_err(|e| format!("Failed to call backend: {}", e))?
+    };
+
     let j: Value = resp
         .json()
         .map_err(|e| format!("Failed to parse backend response: {}", e))?;

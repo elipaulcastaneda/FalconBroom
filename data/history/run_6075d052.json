@@ -1,0 +1,33 @@
+{
+  "id": "run_6075d052",
+  "recipe_id": "recipe_1781941170406_8f957f12",
+  "started_at": "2026-06-20T07:39:57.470401Z",
+  "status": "completed",
+  "export_format": "csv",
+  "finished_at": "2026-06-20T07:40:02.816429Z",
+  "output_path": "data\\outputs\\recipe_1781941170406_8f957f12_run_6075d052_output_from_text.csv",
+  "diagnostics": [
+    {
+      "step": "swap_by_types",
+      "moves": [
+        {
+          "source": "host_name",
+          "target": "host_since",
+          "type": "numeric",
+          "exceptions": [],
+          "replacement": ""
+        },
+        {
+          "source": "host_since",
+          "target": "host_name",
+          "type": "string",
+          "exceptions": [
+            "date"
+          ],
+          "replacement": ""
+        }
+      ],
+      "rows_changed": 906
+    }
+  ]
+}

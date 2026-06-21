@@ -87,26 +87,33 @@ def infer_action(text: str) -> Optional[str]:
     return None
 
 
-def infer_columns_from_text(text: str, profile: Dict[str, Dict[str, Any]], top_n: int = 3) -> List[Tuple[str, float, str]]:
+def infer_columns_from_text(text: str, profile: Dict[str, Dict[str, Any]], top_n: int = 3, heuristics: Optional[Dict[str, float]] = None) -> List[Tuple[str, float, str]]:
     """Return likely columns from a free-form instruction and column profile.
 
     Output is a list of (column_name, score, reason).
     """
     t = _norm(text)
     scored: List[Tuple[str, float, str]] = []
+    # heuristics may override component weights
+    heur = heuristics or {}
+    name_weight = float(heur.get("name_weight", 0.7))
+    keyword_weight = float(heur.get("keyword_weight", 0.6))
+    nulls_scale = float(heur.get("nulls_scale", 1.0))
+    unique_scale = float(heur.get("unique_scale", 1.0))
+
     for column, meta in profile.items():
         score = 0.0
         reason_parts: List[str] = []
 
         column_score = _match_score(t, column)
         if column_score > 0.5:
-            score += column_score * 0.7
+            score += column_score * name_weight
             reason_parts.append(f"instruction mentions '{column}'")
 
         for token_group, keywords in COLUMN_KEYWORDS.items():
             if any(k in t for k in keywords):
                 if any(k in _norm(column) for k in keywords):
-                    score += 0.6
+                    score += keyword_weight
                     reason_parts.append(f"column name matches {token_group} keywords")
                     break
 
@@ -115,10 +122,10 @@ def infer_columns_from_text(text: str, profile: Dict[str, Dict[str, Any]], top_n
         dtype = _norm(str(meta.get("dtype", "")))
 
         if nulls > 0 and any(k in t for k in ["missing", "blank", "empty", "null", "fill", "impute"]):
-            score += min(0.6, 0.1 + nulls / 10_000)
+            score += min(0.6, 0.1 + nulls / 10_000) * nulls_scale
             reason_parts.append("column has missing values")
         if unique <= 1 and any(k in t for k in ["constant", "same", "duplicate", "remove"]):
-            score += 0.35
+            score += 0.35 * unique_scale
             reason_parts.append("column is constant or near-constant")
         if any(k in t for k in ["lowercase", "uppercase", "trim", "normalize", "standardize"]):
             if "str" in dtype or "utf" in dtype or "object" in dtype:
@@ -286,6 +293,118 @@ def recipe_from_plain_english(text: str, profile: Dict[str, Dict[str, Any]], sou
     # Detect move/copy requests like:
     # "Put all numerical values of the host_name column in the host_since column"
     # Allow multiple clauses joined by 'and' and optional exception clauses like 'except dates'.
+    # First, detect explicit swap/switch phrasing and produce swap_by_types steps.
+    # e.g. "Switch values in columns host_name and host_since in rows where the value of host_name is numerical or a date and where the value of host_since is text (except for dates)"
+    # Accept past-tense/inflected verbs and looser 'swapped' phrasing
+    swap_patterns = [
+        # verb-first: swap A and B, flip A and B
+        r"\b(?:swap|swapped|switch|switched|exchange|exchanged|flip|flipped)\b\s+([a-zA-Z0-9_ ]+?)\s*(?:and|,)\s*([a-zA-Z0-9_ ]+?)\b",
+        # verbose: swap columns A and B
+        r"\b(?:swap|swapped|switch|switched|exchange|exchanged|flip|flipped)\b.*?columns?\s+([a-zA-Z0-9_ ]+?)\s*(?:and|,)\s*([a-zA-Z0-9_ ]+?)\b",
+        # between phrasing
+        r"\b(?:swap|swapped|switch|switched|exchange|exchanged|flip|flipped)\b.*?between\s+([a-zA-Z0-9_ ]+?)\s*(?:and|,)\s*([a-zA-Z0-9_ ]+?)\b",
+        # 'A with B' phrasing
+        r"\b([a-zA-Z0-9_ ]+?)\s+with\s+([a-zA-Z0-9_ ]+?)\b",
+        # passive: A and B should be swapped / swapped where...
+        r"\b([a-zA-Z0-9_ ]+?)\s+and\s+([a-zA-Z0-9_ ]+?)\s+(?:should\s+be\s+)?swapped\b",
+        r"\b([a-zA-Z0-9_ ]+?)\s+and\s+([a-zA-Z0-9_ ]+?)\s+swapped\b",
+        # values/contents phrasing: swap values between A and B, swap contents of A and B
+        r"\b(?:swap|swapped|switch|switched|exchange|exchanged)\b.*?values?\s*(?:between|of)\s*([a-zA-Z0-9_ ]+?)\s*(?:and|,)\s*([a-zA-Z0-9_ ]+?)\b",
+        r"\b(?:swap|swapped|exchange|exchanged)\b.*?contents?\s*(?:of\s*)?([a-zA-Z0-9_ ]+?)\s*(?:and|,)\s*([a-zA-Z0-9_ ]+?)\b",
+        # transpose/invert synonyms
+        r"\b(?:transpose|transposed|invert|inverted|reverse|reversed)\b.*?([a-zA-Z0-9_ ]+?)\s*(?:and|,)\s*([a-zA-Z0-9_ ]+?)\b",
+    ]
+    swap_match = None
+    for pat in swap_patterns:
+        m = re.search(pat, t, flags=re.IGNORECASE)
+        if m:
+            swap_match = m
+            break
+
+    if swap_match:
+        try:
+            col_a = swap_match.group(1).strip()
+            col_b = swap_match.group(2).strip()
+
+            def resolve_col(name):
+                nm = name.strip()
+                if nm in profile:
+                    return nm
+                matches = infer_columns_from_text(nm, profile, top_n=1)
+                return matches[0][0] if matches else nm
+
+            col_a = resolve_col(col_a)
+            col_b = resolve_col(col_b)
+
+            # detect per-column type phrases anywhere in the instruction
+            def extract_clause_types(colname):
+                # look for 'value of COL is ...' or 'COL is ...'
+                patterns = [
+                    rf"(?:value of\s+)?\b{re.escape(colname)}\b\s*(?:is|looks like|contains|appears to be)\s*([^,;\)]+)",
+                    rf"(numeric|number|numerical|digits|date|time|timestamp|string|text|alpha|address|phone|email)\s+(?:values\s+)?(?:of\s+)?\b{re.escape(colname)}\b",
+                    rf"(?:values\s+of\s+)?\b{re.escape(colname)}\b\s*(?:are|is)?\s*(numeric|date|text|string)",
+                ]
+                txt = t
+                for p in patterns:
+                    mm = re.search(p, txt, flags=re.IGNORECASE)
+                    if mm:
+                        # return the matched descriptor (could be 'numerical or a date')
+                        return mm.group(1).strip()
+                return None
+
+            cond_a = extract_clause_types(col_a)
+            cond_b = extract_clause_types(col_b)
+
+            def parse_types(typestr):
+                if not typestr:
+                    return []
+                types = []
+                ts = typestr.lower()
+                if re.search(r"num|digit|number|numeric", ts):
+                    types.append("numeric")
+                if re.search(r"date|time|timestamp", ts):
+                    types.append("date")
+                if re.search(r"text|string|alpha|letter|address|phone|email", ts):
+                    types.append("string")
+                return types
+
+            types_a = parse_types(cond_a) or []
+            types_b = parse_types(cond_b) or []
+
+            # if only one side specified, infer complement types
+            if types_a and not types_b:
+                types_b = ["string"]
+            if types_b and not types_a:
+                types_a = ["numeric"]
+            if not types_a and not types_b:
+                # fallback: assume numeric in a and string in b
+                types_a = ["numeric"]
+                types_b = ["string"]
+
+            # detect exceptions like 'except dates' globally for each col
+            exc_a = []
+            exc_b = []
+            if re.search(rf"{re.escape(col_a)}[\s\S]{{0,60}}except\s+([^,\.]+)", t, flags=re.IGNORECASE):
+                em = re.search(rf"{re.escape(col_a)}[\s\S]{{0,60}}except\s+([^,\.]+)", t, flags=re.IGNORECASE)
+                if em and re.search(r"date", em.group(1), flags=re.IGNORECASE):
+                    exc_a.append("date")
+            if re.search(rf"{re.escape(col_b)}[\s\S]{{0,60}}except\s+([^,\.]+)", t, flags=re.IGNORECASE):
+                em = re.search(rf"{re.escape(col_b)}[\s\S]{{0,60}}except\s+([^,\.]+)", t, flags=re.IGNORECASE)
+                if em and re.search(r"date", em.group(1), flags=re.IGNORECASE):
+                    exc_b.append("date")
+
+            moves = []
+            for ta in types_a:
+                moves.append({"source": col_a, "target": col_b, "type": ta, "exceptions": exc_a or []})
+            for tb in types_b:
+                moves.append({"source": col_b, "target": col_a, "type": tb, "exceptions": exc_b or []})
+
+            if moves:
+                steps.append(CleaningStep(action="swap_by_types", column=None, params={"moves": moves, "replacement": ""}))
+                return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
+        except Exception:
+            pass
+
     # Try strict patterns first to capture '... values of the COL column in the COL column'
     moves = []
     strict1 = re.compile(r"(string|text|numeric|numerical|number|numbers)\s+(?:values|entries)?\s+of\s+the\s+([A-Za-z0-9_]+)\s+column\s*(?:except\s+([^,\.]+?)\s*)?(?:in|into|to)\s+the\s+([A-Za-z0-9_]+)\s+column", flags=re.IGNORECASE)

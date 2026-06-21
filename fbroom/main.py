@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from .connectors import resolve_source
 from .engine import Cleaner, _read_table
+import re
 import csv
 import shutil
 import hashlib
@@ -26,6 +27,7 @@ from .workflow_rules import (
     suggest_join_rules,
 )
 import traceback
+from pydantic import BaseModel
 
 app = FastAPI(title="FalconBroom Prototype API")
 
@@ -76,6 +78,21 @@ class JoinSuggestionSpec(BaseModel):
     right_path: str
 
 
+class JoinPreviewSpec(BaseModel):
+    left_path: str
+    right_path: str
+    left_on: Optional[list] = None
+    right_on: Optional[list] = None
+    join_type: Optional[str] = "inner"  # inner,left,right,outer,anti
+    sample: Optional[int] = 10
+    conflict_resolution: Optional[dict] = None
+
+
+class JoinExportSpec(JoinPreviewSpec):
+    export_format: Optional[str] = "csv"  # csv,xlsx,pandas,sql
+    filename: Optional[str] = None
+
+
 class SourceResolveSpec(BaseModel):
     path: str
 
@@ -83,6 +100,15 @@ class SourceResolveSpec(BaseModel):
 class PatchSpec(BaseModel):
     path: str
     patches: list
+
+
+class SnapshotCleanupSpec(BaseModel):
+    days: int = 30
+
+
+class SnapshotRollbackSpec(BaseModel):
+    snapshot_path: str
+    dest_name: Optional[str] = None
 
 
 @app.get("/health")
@@ -237,10 +263,28 @@ def recipe_from_text(spec: TextRecipeSpec):
         except Exception:
             recipe_dict = recipe.model_dump() if hasattr(recipe, "model_dump") else recipe.dict()
 
+        # determine column candidates: prefer explicitly mentioned columns in the instruction
+        try:
+            tnorm = spec.instruction or ""
+            mentioned_cols = []
+            for c in (profile.keys() if isinstance(profile, dict) else []):
+                try:
+                    if re.search(rf"\b{re.escape(c)}\b", tnorm, flags=re.IGNORECASE):
+                        mentioned_cols.append(c)
+                except Exception:
+                    continue
+            if mentioned_cols:
+                # present as [(col, score, reason), ...] to match infer_columns_from_text output
+                column_candidates = [(c, 1.0, "explicitly mentioned in instruction") for c in mentioned_cols]
+            else:
+                column_candidates = infer_columns_from_text(spec.instruction, profile)
+        except Exception:
+            column_candidates = infer_columns_from_text(spec.instruction, profile)
+
         return {
             "instruction": spec.instruction,
             "action": infer_action(spec.instruction),
-            "column_candidates": infer_columns_from_text(spec.instruction, profile),
+            "column_candidates": column_candidates,
             "recipe": recipe_dict,
             "explanations": [
                 {
@@ -352,6 +396,34 @@ def run_recipe(rid: str, export_format: str = "csv"):
     if status != "approved":
         raise HTTPException(status_code=403, detail="Recipe must be approved before running")
 
+    # schema validation / drift check: compare stored expected_columns (snapshot at save time)
+    expected_columns = data.get("expected_columns") or []
+    if expected_columns:
+        try:
+            # find source path from recipe
+            src_path = None
+            try:
+                src_path = recipe.get("sources", [])[0].get("path")
+            except Exception:
+                src_path = None
+            if src_path:
+                drift = cleaner.validate_schema(src_path, expected_columns)
+                # If critical columns are missing, prevent run
+                if not drift.get("ok"):
+                    # provide details to caller
+                    raise HTTPException(status_code=409, detail={"message": "Schema drift detected", "drift": drift})
+                else:
+                    # attach drift info (extra columns) as run warning
+                    extra = drift.get("extra") or []
+                    if extra:
+                        # attach a warning to history record later
+                        pass
+        except HTTPException:
+            raise
+        except Exception:
+            # if validation fails unexpectedly, treat as non-fatal but record warning
+            pass
+
     # record run (only after approval)
     run_id = f"run_{uuid4().hex[:8]}"
     run_record = {
@@ -444,6 +516,67 @@ def run_recipe(rid: str, export_format: str = "csv"):
         run_record["error"] = str(e)
         run_record["finished_at"] = datetime.utcnow().isoformat() + "Z"
         history_path.write_text(json.dumps(run_record, indent=2, ensure_ascii=False), encoding="utf-8")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/history/snapshots/cleanup")
+def cleanup_snapshots(spec: SnapshotCleanupSpec):
+    try:
+        res = cleaner.cleanup_snapshots(spec.days)
+        return {"cleanup": res}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/history/snapshots/rollback")
+def rollback_snapshot(spec: SnapshotRollbackSpec):
+    try:
+        snap = Path(spec.snapshot_path)
+        # allow both absolute and snapshots dir-relative paths
+        snaps_dir = Path("data") / "history" / "snapshots"
+        if not snap.exists():
+            candidate = snaps_dir / spec.snapshot_path
+            if candidate.exists():
+                snap = candidate
+        if not snap.exists():
+            raise HTTPException(status_code=404, detail=f"Snapshot not found: {spec.snapshot_path}")
+
+        # copy into outputs as a rollback artifact
+        dest_name = spec.dest_name or f"rollback_snapshot_{uuid4().hex[:8]}_{snap.name}"
+        dest_path = OUTPUTS_DIR / dest_name
+        shutil.copyfile(str(snap), str(dest_path))
+
+        record = {"rollback_snapshot": str(snap), "performed_at": datetime.utcnow().isoformat() + "Z", "rollback_path": str(dest_path)}
+        out = HISTORY_DIR / f"rollback_snapshot_{uuid4().hex[:8]}.json"
+        out.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+        return {"rollback": record}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/recipes/{rid}/validate")
+def validate_recipe_schema(rid: str):
+    p = RECIPES_DIR / f"{rid}.json"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="Recipe not found")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        expected = data.get("expected_columns") or []
+        recipe = data.get("recipe") or {}
+        src = None
+        try:
+            src = recipe.get("sources", [])[0].get("path")
+        except Exception:
+            src = None
+        if not src:
+            raise HTTPException(status_code=400, detail="Recipe has no source path to validate against")
+        res = cleaner.validate_schema(src, expected)
+        return {"recipe_id": rid, "validation": res}
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -612,6 +745,429 @@ def join_suggestions(spec: JoinSuggestionSpec):
         return {
             "joins": [join.model_dump() if hasattr(join, "model_dump") else join.dict() for join in joins]
         }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/join-preview")
+def join_preview(spec: JoinPreviewSpec):
+    try:
+        left_res = resolve_source(spec.left_path)
+        right_res = resolve_source(spec.right_path)
+        if not left_res.exists:
+            raise HTTPException(status_code=404, detail=f"Left source not found: {spec.left_path}")
+        if not right_res.exists:
+            raise HTTPException(status_code=404, detail=f"Right source not found: {spec.right_path}")
+
+        left_df = _read_table(left_res.materialized_path or left_res.path)
+        right_df = _read_table(right_res.materialized_path or right_res.path)
+
+        # determine join keys
+        left_on = spec.left_on
+        right_on = spec.right_on
+        if (not left_on or not right_on) or (len(left_on) == 0 or len(right_on) == 0):
+            # infer common columns if not provided
+            lcols = set(left_df.columns)
+            rcols = set(right_df.columns)
+            common = list(lcols & rcols)
+            if not common:
+                raise HTTPException(status_code=400, detail="No join keys provided and no common columns found")
+            left_on = common[:1]
+            right_on = common[:1]
+
+        how = spec.join_type or "inner"
+        # map some common aliases
+        how_map = {"outer": "outer", "full": "outer", "left": "left", "right": "right", "inner": "inner", "anti": "anti"}
+        how = how_map.get(how.lower(), how.lower())
+
+        # handle conflict resolution options: rename maps and suffix/preference
+        conf = spec.conflict_resolution or {}
+        suffix_left = conf.get('suffix_left', '_left')
+        suffix_right = conf.get('suffix_right', '_right')
+        prefer = conf.get('prefer', 'left')
+        rename_map = conf.get('rename_map') or []
+
+        # apply rename_map to left/right before join
+        try:
+            for r in rename_map:
+                side = (r.get('side') or '').lower()
+                frm = r.get('from')
+                to = r.get('to')
+                if not frm or not to:
+                    continue
+                if side == 'left':
+                    try:
+                        left_df = left_df.rename({frm: to})
+                    except Exception:
+                        try:
+                            import pandas as _pd
+                            lpd = left_df.to_pandas() if hasattr(left_df, 'to_pandas') else left_df
+                            lpd = lpd.rename(columns={frm: to})
+                            left_df = pl.from_pandas(lpd)
+                        except Exception:
+                            pass
+                elif side == 'right':
+                    try:
+                        right_df = right_df.rename({frm: to})
+                    except Exception:
+                        try:
+                            import pandas as _pd
+                            rpd = right_df.to_pandas() if hasattr(right_df, 'to_pandas') else right_df
+                            rpd = rpd.rename(columns={frm: to})
+                            right_df = pl.from_pandas(rpd)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        # perform join (use polars), but first rename conflicting right-side columns
+        joined = None
+        try:
+            # identify conflict columns (exclude join keys)
+            lcols = set(left_df.columns)
+            rcols = set(right_df.columns)
+            join_keys = set((left_on or []) + (right_on or []))
+            common = list((lcols & rcols) - join_keys)
+            if common:
+                # rename right-side conflicting columns with suffix_right
+                rename_map_right = {c: f"{c}{suffix_right}" for c in common}
+                try:
+                    right_df = right_df.rename(rename_map_right)
+                except Exception:
+                    try:
+                        import pandas as _pd
+                        rpd = right_df.to_pandas() if hasattr(right_df, 'to_pandas') else right_df
+                        rpd = rpd.rename(columns=rename_map_right)
+                        right_df = pl.from_pandas(rpd)
+                    except Exception:
+                        pass
+
+            joined = left_df.join(right_df, left_on=left_on, right_on=right_on, how=how)
+        except Exception:
+            # try pandas fallback with explicit suffixes
+            try:
+                import pandas as _pd
+                lpd = left_df.to_pandas() if hasattr(left_df, 'to_pandas') else left_df
+                rpd = right_df.to_pandas() if hasattr(right_df, 'to_pandas') else right_df
+                joined = _pd.merge(lpd, rpd, left_on=left_on, right_on=right_on, how=how, suffixes=(suffix_left, suffix_right))
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Join failed: {e}")
+
+        # compute stats
+        try:
+            left_count = len(left_df)
+        except Exception:
+            try:
+                left_count = left_df.shape[0]
+            except Exception:
+                left_count = None
+        try:
+            right_count = len(right_df)
+        except Exception:
+            try:
+                right_count = right_df.shape[0]
+            except Exception:
+                right_count = None
+        try:
+            joined_count = len(joined)
+        except Exception:
+            try:
+                joined_count = joined.shape[0]
+            except Exception:
+                joined_count = None
+
+        # unmatched samples
+        unmatched_left = None
+        unmatched_right = None
+        try:
+            if how in ("inner", "left", "outer"):
+                unmatched_left_df = left_df.join(right_df, left_on=left_on, right_on=right_on, how="anti")
+                unmatched_left = _df_head_records(unmatched_left_df, n=spec.sample)
+        except Exception:
+            unmatched_left = []
+        try:
+            if how in ("inner", "right", "outer"):
+                unmatched_right_df = right_df.join(left_df, left_on=right_on, right_on=left_on, how="anti")
+                unmatched_right = _df_head_records(unmatched_right_df, n=spec.sample)
+        except Exception:
+            unmatched_right = []
+
+        # If prefer == 'right', collapse suffixed right columns into base names
+        try:
+            if prefer == 'right' and common:
+                if isinstance(joined, dict) or not hasattr(joined, 'columns'):
+                    pass
+                else:
+                    if hasattr(joined, 'to_pandas'):
+                        # polars
+                        try:
+                            # build expressions to prefer right non-null over left
+                            exprs = []
+                            for base in common:
+                                rname = f"{base}{suffix_right}"
+                                if rname in joined.columns and base in joined.columns:
+                                    try:
+                                        # polars expression
+                                        joined = joined.with_columns(
+                                            pl.when(pl.col(rname).is_not_null()).then(pl.col(rname)).otherwise(pl.col(base)).alias(base)
+                                        )
+                                        joined = joined.drop(rname)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
+                    else:
+                        # pandas-like
+                        try:
+                            pd = joined
+                            import pandas as _pd
+                            for base in common:
+                                rname = f"{base}{suffix_right}"
+                                if rname in pd.columns and base in pd.columns:
+                                    pd[base] = pd[rname].combine_first(pd[base])
+                                    pd = pd.drop(columns=[rname])
+                            joined = pd
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        preview_rows = _df_head_records(joined, n=spec.sample)
+
+        return {
+            "stats": {"left_count": left_count, "right_count": right_count, "joined_count": joined_count},
+            "preview": preview_rows,
+            "unmatched_left_sample": unmatched_left,
+            "unmatched_right_sample": unmatched_right,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/join-export")
+def join_export(spec: JoinExportSpec):
+    try:
+        left_res = resolve_source(spec.left_path)
+        right_res = resolve_source(spec.right_path)
+        if not left_res.exists:
+            raise HTTPException(status_code=404, detail=f"Left source not found: {spec.left_path}")
+        if not right_res.exists:
+            raise HTTPException(status_code=404, detail=f"Right source not found: {spec.right_path}")
+
+        left_df = _read_table(left_res.materialized_path or left_res.path)
+        right_df = _read_table(right_res.materialized_path or right_res.path)
+
+        left_on = spec.left_on
+        right_on = spec.right_on
+        if (not left_on or not right_on) or (len(left_on) == 0 or len(right_on) == 0):
+            lcols = set(left_df.columns)
+            rcols = set(right_df.columns)
+            common = list(lcols & rcols)
+            if not common:
+                raise HTTPException(status_code=400, detail="No join keys provided and no common columns found")
+            left_on = common[:1]
+            right_on = common[:1]
+
+        how = spec.join_type or "inner"
+        how_map = {"outer": "outer", "full": "outer", "left": "left", "right": "right", "inner": "inner", "anti": "anti"}
+        how = how_map.get(how.lower(), how.lower())
+
+        # conflict resolution options
+        conf = spec.conflict_resolution or {}
+        suffix_left = conf.get('suffix_left', '_left')
+        suffix_right = conf.get('suffix_right', '_right')
+        prefer = conf.get('prefer', 'left')
+        rename_map = conf.get('rename_map') or []
+
+        # apply rename_map to left/right before join
+        try:
+            for r in rename_map:
+                side = (r.get('side') or '').lower()
+                frm = r.get('from')
+                to = r.get('to')
+                if not frm or not to:
+                    continue
+                if side == 'left':
+                    try:
+                        left_df = left_df.rename({frm: to})
+                    except Exception:
+                        try:
+                            import pandas as _pd
+                            lpd = left_df.to_pandas() if hasattr(left_df, 'to_pandas') else left_df
+                            lpd = lpd.rename(columns={frm: to})
+                            left_df = pl.from_pandas(lpd)
+                        except Exception:
+                            pass
+                elif side == 'right':
+                    try:
+                        right_df = right_df.rename({frm: to})
+                    except Exception:
+                        try:
+                            import pandas as _pd
+                            rpd = right_df.to_pandas() if hasattr(right_df, 'to_pandas') else right_df
+                            rpd = rpd.rename(columns={frm: to})
+                            right_df = pl.from_pandas(rpd)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        try:
+            # identify conflict columns (exclude join keys)
+            lcols = set(left_df.columns)
+            rcols = set(right_df.columns)
+            join_keys = set((left_on or []) + (right_on or []))
+            common = list((lcols & rcols) - join_keys)
+            if common:
+                rename_map_right = {c: f"{c}{suffix_right}" for c in common}
+                try:
+                    right_df = right_df.rename(rename_map_right)
+                except Exception:
+                    try:
+                        import pandas as _pd
+                        rpd = right_df.to_pandas() if hasattr(right_df, 'to_pandas') else right_df
+                        rpd = rpd.rename(columns=rename_map_right)
+                        right_df = pl.from_pandas(rpd)
+                    except Exception:
+                        pass
+
+            joined = left_df.join(right_df, left_on=left_on, right_on=right_on, how=how)
+        except Exception:
+            try:
+                import pandas as _pd
+                lpd = left_df.to_pandas() if hasattr(left_df, 'to_pandas') else left_df
+                rpd = right_df.to_pandas() if hasattr(right_df, 'to_pandas') else right_df
+                joined = _pd.merge(lpd, rpd, left_on=left_on, right_on=right_on, how=how, suffixes=(suffix_left, suffix_right))
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Join failed: {e}")
+
+        # apply prefer==right collapse for common columns if requested
+        try:
+            if prefer == 'right' and common:
+                if hasattr(joined, 'to_pandas'):
+                    try:
+                        for base in common:
+                            rname = f"{base}{suffix_right}"
+                            if rname in joined.columns and base in joined.columns:
+                                try:
+                                    joined = joined.with_columns(
+                                        pl.when(pl.col(rname).is_not_null()).then(pl.col(rname)).otherwise(pl.col(base)).alias(base)
+                                    )
+                                    joined = joined.drop(rname)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        pd = joined
+                        for base in common:
+                            rname = f"{base}{suffix_right}"
+                            if rname in pd.columns and base in pd.columns:
+                                pd[base] = pd[rname].combine_first(pd[base])
+                                pd = pd.drop(columns=[rname])
+                        joined = pd
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # prepare output filename
+        fname = spec.filename or f"join_{uuid4().hex[:8]}"
+        fmt = (spec.export_format or "csv").lower()
+        out_path = OUTPUTS_DIR / f"{fname}.{ 'csv' if fmt!='pandas' and fmt!='sql' else ('pkl' if fmt=='pandas' else 'sqlite') }"
+
+        # CSV export
+        if fmt == "csv":
+            try:
+                _write_csv(joined, str(out_path))
+                return {"export_path": str(out_path)}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+
+        if fmt == "xlsx":
+            # write CSV first then convert to xlsx
+            try:
+                tmp_csv = str(OUTPUTS_DIR / f"{fname}.csv")
+                _write_csv(joined, tmp_csv)
+                from openpyxl import Workbook
+                import csv as _csv
+
+                wb = Workbook()
+                ws = wb.active
+                with open(tmp_csv, newline='', encoding='utf-8') as fh:
+                    reader = _csv.reader(fh)
+                    for r in reader:
+                        ws.append(r)
+                xlsx_path = str(OUTPUTS_DIR / f"{fname}.xlsx")
+                wb.save(xlsx_path)
+                return {"export_path": xlsx_path}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+
+        if fmt == "pandas":
+            try:
+                import pandas as _pd
+                pd_df = joined.to_pandas() if hasattr(joined, 'to_pandas') else joined
+                pkl_path = str(OUTPUTS_DIR / f"{fname}.pkl")
+                pd_df.to_pickle(pkl_path)
+                return {"export_path": pkl_path}
+            except Exception:
+                # fallback to parquet using polars
+                try:
+                    pq_path = str(OUTPUTS_DIR / f"{fname}.parquet")
+                    try:
+                        joined.write_parquet(pq_path)
+                    except Exception:
+                        # if joined is pandas
+                        pd_df.to_parquet(pq_path)
+                    return {"export_path": pq_path}
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=str(e))
+
+        if fmt == "sql":
+            try:
+                import sqlite3
+                db_path = str(OUTPUTS_DIR / f"{fname}.sqlite")
+                # convert to records and insert
+                recs = None
+                if hasattr(joined, 'to_dicts'):
+                    recs = joined.to_dicts()
+                else:
+                    try:
+                        recs = joined.to_dict('records')
+                    except Exception:
+                        recs = []
+                if recs is None:
+                    recs = []
+                if recs:
+                    cols = list(recs[0].keys())
+                else:
+                    cols = []
+                con = sqlite3.connect(db_path)
+                cur = con.cursor()
+                if cols:
+                    cols_sql = ", ".join([f'"{c}" TEXT' for c in cols])
+                    cur.execute(f'CREATE TABLE joined ({cols_sql})')
+                    placeholders = ",".join(["?" for _ in cols])
+                    to_insert = [[str(r.get(c, None)) for c in cols] for r in recs]
+                    cur.executemany(f'INSERT INTO joined VALUES ({placeholders})', to_insert)
+                    con.commit()
+                con.close()
+                return {"export_path": db_path}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+
+        # default: fallback to csv
+        try:
+            _write_csv(joined, str(out_path))
+            return {"export_path": str(out_path)}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

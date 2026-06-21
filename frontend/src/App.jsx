@@ -1,4 +1,4 @@
-import React, {useMemo, useRef, useState} from "react"
+import React, {useMemo, useRef, useState, useEffect} from "react"
 
 const BACKEND = "http://127.0.0.1:3009"
 const NAV_ITEMS = [
@@ -72,6 +72,28 @@ export default function App() {
   const [suggest, setSuggest] = useState(null)
   const [cleaningSuggestions, setCleaningSuggestions] = useState(null)
   const [joinSuggestions, setJoinSuggestions] = useState(null)
+  const [joinPreviewResult, setJoinPreviewResult] = useState(null)
+  const [joinPreviewLoading, setJoinPreviewLoading] = useState(false)
+  const [joinExporting, setJoinExporting] = useState(false)
+  const [exportFormat, setExportFormat] = useState('csv')
+  const [exportFilename, setExportFilename] = useState('joined')
+  const [joinLeftOn, setJoinLeftOn] = useState('')
+  const [joinRightOn, setJoinRightOn] = useState('')
+  const [joinType, setJoinType] = useState('inner')
+  const [joinSampleSize, setJoinSampleSize] = useState(5)
+  const [joinLeftPreview, setJoinLeftPreview] = useState(null)
+  const [joinRightPreview, setJoinRightPreview] = useState(null)
+  const [suffixLeft, setSuffixLeft] = useState('_left')
+  const [suffixRight, setSuffixRight] = useState('_right')
+  const [preferResolve, setPreferResolve] = useState('left')
+  const [mappingText, setMappingText] = useState('')
+  const [joinLeftColsOptions, setJoinLeftColsOptions] = useState([])
+  const [joinRightColsOptions, setJoinRightColsOptions] = useState([])
+  const [joinLeftOnArr, setJoinLeftOnArr] = useState([])
+  const [joinRightOnArr, setJoinRightOnArr] = useState([])
+  const [leftFilter, setLeftFilter] = useState('')
+  const [rightFilter, setRightFilter] = useState('')
+  const [compositePairs, setCompositePairs] = useState([])
   const [recipeFromText, setRecipeFromText] = useState(null)
   const [recipeText, setRecipeText] = useState("")
   const [sourceInspection, setSourceInspection] = useState(null)
@@ -368,6 +390,73 @@ export default function App() {
     return ()=> window.removeEventListener('keydown', onKey)
   }, [showCustomRevisions])
 
+  // populate column options for left/right when paths change and are present in uploads
+  React.useEffect(() => {
+    let cancelled = false
+    async function fetchLeftCols() {
+      if (!leftPath) { setJoinLeftColsOptions([]); return }
+      try {
+        const presentPaths = (uploadsList || []).map((u) => u.path)
+        if (!presentPaths.includes(leftPath)) { setJoinLeftColsOptions([]); return }
+        const res = await fetch(`${BACKEND}/inspect`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: leftPath, offset: 0, limit: 1 }) })
+        if (!res.ok) return
+        const j = await res.json()
+        if (cancelled) return
+        const insp = j.inspection || j
+        let cols = []
+        if (insp && insp.columns && Array.isArray(insp.columns)) cols = insp.columns
+        else if (insp && insp.rows && Array.isArray(insp.rows) && insp.rows.length > 0 && typeof insp.rows[0] === 'object') cols = Object.keys(insp.rows[0])
+        setJoinLeftColsOptions(cols || [])
+      } catch (e) { setJoinLeftColsOptions([]) }
+    }
+    fetchLeftCols()
+    return () => { cancelled = true }
+  }, [leftPath, uploadsList])
+
+  React.useEffect(() => {
+    let cancelled = false
+    async function fetchRightCols() {
+      if (!rightPath) { setJoinRightColsOptions([]); return }
+      try {
+        const presentPaths = (uploadsList || []).map((u) => u.path)
+        if (!presentPaths.includes(rightPath)) { setJoinRightColsOptions([]); return }
+        const res = await fetch(`${BACKEND}/inspect`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: rightPath, offset: 0, limit: 1 }) })
+        if (!res.ok) return
+        const j = await res.json()
+        if (cancelled) return
+        const insp = j.inspection || j
+        let cols = []
+        if (insp && insp.columns && Array.isArray(insp.columns)) cols = insp.columns
+        else if (insp && insp.rows && Array.isArray(insp.rows) && insp.rows.length > 0 && typeof insp.rows[0] === 'object') cols = Object.keys(insp.rows[0])
+        setJoinRightColsOptions(cols || [])
+      } catch (e) { setJoinRightColsOptions([]) }
+    }
+    fetchRightCols()
+    return () => { cancelled = true }
+  }, [rightPath, uploadsList])
+
+  // keep compositePairs in sync with selected arrays
+  React.useEffect(()=>{
+    const maxLen = Math.max((joinLeftOnArr||[]).length, (joinRightOnArr||[]).length)
+    const next = []
+    for(let i=0;i<maxLen;i++) next.push({ left: joinLeftOnArr[i] || '', right: joinRightOnArr[i] || '' })
+    setCompositePairs(next)
+  }, [joinLeftOnArr, joinRightOnArr])
+
+  const pairWarnings = React.useMemo(()=>{
+    const msgs = []
+    if(!compositePairs || !compositePairs.length) return msgs
+    const empty = compositePairs.filter(p=> !p.left || !p.right)
+    if(empty.length) msgs.push(`${empty.length} pair(s) missing left or right value`)
+    const lefts = compositePairs.map(p=>p.left).filter(Boolean)
+    const rights = compositePairs.map(p=>p.right).filter(Boolean)
+    const dupLefts = lefts.filter((v,i,a)=> a.indexOf(v)!==i)
+    const dupRights = rights.filter((v,i,a)=> a.indexOf(v)!==i)
+    if(dupLefts.length) msgs.push(`Duplicate left keys: ${[...new Set(dupLefts)].join(', ')}`)
+    if(dupRights.length) msgs.push(`Duplicate right keys: ${[...new Set(dupRights)].join(', ')}`)
+    return msgs
+  }, [compositePairs])
+
   // Remove metadata keys (starting with `_`) from preview rows before rendering
   function _stripMeta(obj) {
     if (!obj || typeof obj !== 'object') return obj
@@ -383,6 +472,8 @@ export default function App() {
     })
     return out
   }
+
+  const META_KEYS = ['container_name','sheet_name','slide_number','paragraph_index','table_index','column_index','cell_label','source_kind','source_name','source_path','unit_kind','row_index']
 
   function sanitizePreview(p) {
     if (!p) return p
@@ -736,7 +827,16 @@ export default function App() {
       setRecipeFromText(recipeObj)
       // if multiple candidate columns, ask for confirmation before applying
         if (j.column_candidates && j.column_candidates.length > 1) {
-        setCandidateColumns(j.column_candidates.map((c) => c[0]))
+        // filter out metadata columns (underscore-prefixed or known meta keys)
+        try{
+          const rawCols = j.column_candidates.map((c) => c[0])
+          let filtered = rawCols.filter(col => col && !col.startsWith('_') && !META_KEYS.includes(col))
+          // if filtering removed everything, fall back to raw list
+          if(!filtered || filtered.length === 0) filtered = rawCols
+          setCandidateColumns(filtered)
+        }catch(e){
+          setCandidateColumns(j.column_candidates.map((c) => c[0]))
+        }
         setPendingGenerated(j)
         setShowConfirmModal(true)
       } else {
@@ -792,6 +892,11 @@ export default function App() {
   }
 
   async function doJoinSuggestions() {
+    // only allow suggestions for files that are present in uploads list
+    const presentPaths = (uploadsList || []).map((u) => u.path)
+    if (!presentPaths.includes(leftPath)) { addToast('Left path must be an uploaded file', 'error'); return }
+    if (!presentPaths.includes(rightPath)) { addToast('Right path must be an uploaded file', 'error'); return }
+
     const res = await fetch(`${BACKEND}/join-suggestions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -799,6 +904,127 @@ export default function App() {
     })
     const j = await res.json()
     setJoinSuggestions(j.joins)
+
+    // auto-fill join keys with top suggestion when available
+    try {
+      if (j.joins && j.joins.length > 0) {
+        const top = j.joins[0]
+        const lkeys = Array.isArray(top.left_on) ? top.left_on : []
+        const rkeys = Array.isArray(top.right_on) ? top.right_on : []
+        if (lkeys.length) { setJoinLeftOn(lkeys.join(',')); setJoinLeftOnArr(lkeys) }
+        if (rkeys.length) { setJoinRightOn(rkeys.join(',')); setJoinRightOnArr(rkeys) }
+      }
+    } catch (e) {}
+
+    // also fetch cleaning suggestions for both sides and merge into suggested step list
+    try {
+      const [ls, rs] = await Promise.all([
+        fetch(`${BACKEND}/suggest`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: leftPath }) }).then(r => r.json()).catch(() => ({ suggestions: [] })),
+        fetch(`${BACKEND}/suggest`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: rightPath }) }).then(r => r.json()).catch(() => ({ suggestions: [] })),
+      ])
+      // combine and set as `suggest` for Recipe preview card
+      const combined = []
+      if (ls && ls.suggestions) combined.push(...ls.suggestions.map(s => ({ ...s, source: 'left' })))
+      if (rs && rs.suggestions) combined.push(...rs.suggestions.map(s => ({ ...s, source: 'right' })))
+      setSuggest(combined)
+    } catch (e) { console.warn('Failed to fetch cleaning suggestions', e) }
+  }
+
+  async function doJoinPreview() {
+    setJoinPreviewLoading(true)
+    try {
+      // validate upload presence
+      const presentPaths = (uploadsList || []).map((u) => u.path)
+      if (!presentPaths.includes(leftPath)) { addToast('Left path must be an uploaded file', 'error'); setJoinPreviewLoading(false); return }
+      if (!presentPaths.includes(rightPath)) { addToast('Right path must be an uploaded file', 'error'); setJoinPreviewLoading(false); return }
+
+      // prefer explicit compositePairs ordering when present
+      let left_on, right_on
+      const validPairs = (compositePairs || []).filter(p=>p && p.left && p.right)
+      if(validPairs.length) {
+        left_on = validPairs.map(p=>p.left)
+        right_on = validPairs.map(p=>p.right)
+      } else {
+        left_on = (joinLeftOnArr && joinLeftOnArr.length>0) ? joinLeftOnArr : (joinLeftOn ? joinLeftOn.split(',').map(s => s.trim()).filter(Boolean) : undefined)
+        right_on = (joinRightOnArr && joinRightOnArr.length>0) ? joinRightOnArr : (joinRightOn ? joinRightOn.split(',').map(s => s.trim()).filter(Boolean) : undefined)
+      }
+      // if compositePairs exist but have incomplete pairs, alert user
+      const hasAnyPairs = (compositePairs || []).length > 0
+      const incomplete = (compositePairs || []).some(p=> !p.left || !p.right)
+      if(hasAnyPairs && incomplete) { addToast('Cannot preview: some composite pairs are incomplete', 'error'); setJoinPreviewLoading(false); return }
+      // parse rename mappings from textarea
+      const mappings = []
+      (mappingText || '').split('\n').map(l=>l.trim()).filter(Boolean).forEach(line=>{
+        const m = line.match(/^(left|right)\s*:\s*(.+?)\s*->\s*(.+)$/i)
+        if(m){ mappings.push({ side: m[1].toLowerCase(), from: m[2].trim(), to: m[3].trim() }) }
+      })
+      const conflict = { suffix_left: suffixLeft, suffix_right: suffixRight, prefer: preferResolve, rename_map: mappings }
+      const payload = { left_path: leftPath, right_path: rightPath, left_on, right_on, join_type: joinType, sample: Number(joinSampleSize), conflict_resolution: conflict }
+      const res = await fetch(`${BACKEND}/join-preview`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+      if(!res.ok) {
+        const txt = await res.text()
+        throw new Error(txt || 'Join preview failed')
+      }
+      const j = await res.json()
+      setJoinPreviewResult(j)
+      // also fetch before-samples for left and right via /inspect to show before/after
+      try{
+        const [linsp, rins] = await Promise.all([
+          fetch(`${BACKEND}/inspect`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({path:leftPath, offset:0, limit: Number(joinSampleSize)})}).then(r=>r.json()).catch(()=>null),
+          fetch(`${BACKEND}/inspect`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({path:rightPath, offset:0, limit: Number(joinSampleSize)})}).then(r=>r.json()).catch(()=>null),
+        ])
+        setJoinLeftPreview(linsp && linsp.inspection && linsp.inspection.rows ? linsp.inspection.rows : (linsp && linsp.inspection? linsp.inspection : null))
+        setJoinRightPreview(rins && rins.inspection && rins.inspection.rows ? rins.inspection.rows : (rins && rins.inspection? rins.inspection : null))
+      }catch(e){console.warn('inspect failed', e); setJoinLeftPreview(null); setJoinRightPreview(null)}
+    } catch (e) {
+      addToast('Join preview failed: '+(e.message||e), 'error')
+      setJoinPreviewResult(null)
+    } finally {
+      setJoinPreviewLoading(false)
+    }
+  }
+
+  async function doJoinExport() {
+    setJoinExporting(true)
+    try {
+      const presentPaths = (uploadsList || []).map((u) => u.path)
+      if (!presentPaths.includes(leftPath)) { addToast('Left path must be an uploaded file', 'error'); setJoinExporting(false); return }
+      if (!presentPaths.includes(rightPath)) { addToast('Right path must be an uploaded file', 'error'); setJoinExporting(false); return }
+      let left_on, right_on
+      const validPairs = (compositePairs || []).filter(p=>p && p.left && p.right)
+      if(validPairs.length) {
+        left_on = validPairs.map(p=>p.left)
+        right_on = validPairs.map(p=>p.right)
+      } else {
+        left_on = (joinLeftOnArr && joinLeftOnArr.length>0) ? joinLeftOnArr : (joinLeftOn ? joinLeftOn.split(',').map(s=>s.trim()).filter(Boolean) : undefined)
+        right_on = (joinRightOnArr && joinRightOnArr.length>0) ? joinRightOnArr : (joinRightOn ? joinRightOn.split(',').map(s=>s.trim()).filter(Boolean) : undefined)
+      }
+      const hasAnyPairs = (compositePairs || []).length > 0
+      const incomplete = (compositePairs || []).some(p=> !p.left || !p.right)
+      if(hasAnyPairs && incomplete) { addToast('Cannot export: some composite pairs are incomplete', 'error'); setJoinExporting(false); return }
+      const mappings = []
+      (mappingText || '').split('\n').map(l=>l.trim()).filter(Boolean).forEach(line=>{
+        const m = line.match(/^(left|right)\s*:\s*(.+?)\s*->\s*(.+)$/i)
+        if(m){ mappings.push({ side: m[1].toLowerCase(), from: m[2].trim(), to: m[3].trim() }) }
+      })
+      const conflict = { suffix_left: suffixLeft, suffix_right: suffixRight, prefer: preferResolve, rename_map: mappings }
+      const payload = { left_path: leftPath, right_path: rightPath, left_on, right_on, join_type: joinType, export_format: exportFormat, filename: exportFilename, conflict_resolution: conflict }
+      const res = await fetch(`${BACKEND}/join-export`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
+      })
+      if(!res.ok) {
+        const txt = await res.text()
+        throw new Error(txt || 'Join export failed')
+      }
+      const j = await res.json()
+      addToast('Export created: ' + (j.export_path || ''), 'success')
+      // surface download link to user
+      setApplyRes((prev)=> ({...(prev||{}), last_export: j.export_path}))
+    } catch (e) {
+      addToast('Join export failed: '+(e.message||e), 'error')
+    } finally {
+      setJoinExporting(false)
+    }
   }
 
   async function doPreview() {
@@ -1408,6 +1634,13 @@ export default function App() {
     if (activeTab === "joins") {
       return (
         <div className="tab-stack tab-panel">
+          <input
+            ref={uploadInputRef}
+            type="file"
+            accept=".csv,.tsv,.txt,.xlsx"
+            onChange={onUploadInputChange}
+            style={{ display: "none" }}
+          />
           <Card eyebrow="Joins" title="Join hints" subtitle="Find the most likely keys before blending datasets.">
             <div className="inline-grid">
               <div>
@@ -1433,6 +1666,219 @@ export default function App() {
 
           <Card eyebrow="Recipe preview" title="Suggested step list" subtitle="What the current recipe suggestion engine produced.">
             <JsonBlock value={suggest} empty="No suggestion set yet." />
+          </Card>
+          <Card eyebrow="Join actions" title="Preview & export" subtitle="Preview the join and export results in multiple formats.">
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+              <div>
+                <label>Left keys (select)</label>
+                <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                  <input placeholder="Filter..." value={leftFilter} onChange={(e)=>setLeftFilter(e.target.value)} />
+                  <div style={{maxHeight:160,overflow:'auto',border:'1px solid var(--muted)',padding:6}}>
+                    {(joinLeftColsOptions||[]).filter(c=>!leftFilter || c.toLowerCase().includes(leftFilter.toLowerCase())).map(c=> (
+                      <label key={c} style={{display:'block',marginBottom:4}}>
+                        <input type="checkbox" checked={joinLeftOnArr.includes(c)} onChange={(e)=>{
+                          const next = e.target.checked ? [...joinLeftOnArr, c] : joinLeftOnArr.filter(x=>x!==c)
+                          setJoinLeftOnArr(next)
+                          setJoinLeftOn(next.join(','))
+                          // regenerate pairs when selections change
+                          const maxLen = Math.max(next.length, joinRightOnArr.length)
+                          const newPairs = []
+                          for(let i=0;i<maxLen;i++) newPairs.push({ left: next[i] || '', right: joinRightOnArr[i] || '' })
+                          setCompositePairs(newPairs)
+                        }} /> {c}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              </div>
+              <div>
+                <label>Right keys (select)</label>
+                <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                  <input placeholder="Filter..." value={rightFilter} onChange={(e)=>setRightFilter(e.target.value)} />
+                  <div style={{maxHeight:160,overflow:'auto',border:'1px solid var(--muted)',padding:6}}>
+                    {(joinRightColsOptions||[]).filter(c=>!rightFilter || c.toLowerCase().includes(rightFilter.toLowerCase())).map(c=> (
+                      <label key={c} style={{display:'block',marginBottom:4}}>
+                        <input type="checkbox" checked={joinRightOnArr.includes(c)} onChange={(e)=>{
+                          const next = e.target.checked ? [...joinRightOnArr, c] : joinRightOnArr.filter(x=>x!==c)
+                          setJoinRightOnArr(next)
+                          setJoinRightOn(next.join(','))
+                          const maxLen = Math.max(joinLeftOnArr.length, next.length)
+                          const newPairs = []
+                          for(let i=0;i<maxLen;i++) newPairs.push({ left: joinLeftOnArr[i] || '', right: next[i] || '' })
+                          setCompositePairs(newPairs)
+                        }} /> {c}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              {/* Composite pairing UI */}
+              <div style={{gridColumn:'1 / -1',marginTop:8}}>
+                <label>Composite key mapping (pair left → right)</label>
+                <div style={{display:'flex',flexDirection:'column',gap:6,marginTop:6}}>
+                  {pairWarnings && pairWarnings.length ? (
+                    <div style={{background:'#fff4e5',border:'1px solid #ffd8a8',padding:8,borderRadius:4}}>
+                      {pairWarnings.map((m,mi)=> <div key={mi} style={{color:'#92400e'}}>{m}</div>)}
+                    </div>
+                  ) : null}
+                  {compositePairs && compositePairs.length ? compositePairs.map((p, idx)=> (
+                    <div key={idx} style={{display:'flex',gap:8,alignItems:'center'}}>
+                      <div style={{display:'flex',flexDirection:'column'}}>
+                        <button title="Move up" disabled={idx===0} onClick={()=>{
+                          if(idx===0) return
+                          const next = compositePairs.slice()
+                          const item = next.splice(idx,1)[0]
+                          next.splice(idx-1,0,item)
+                          setCompositePairs(next)
+                          const lefts = next.map(x=>x.left).filter(Boolean)
+                          const rights = next.map(x=>x.right).filter(Boolean)
+                          setJoinLeftOnArr(lefts); setJoinRightOnArr(rights)
+                          setJoinLeftOn(lefts.join(',')); setJoinRightOn(rights.join(','))
+                        }}>▲</button>
+                        <button title="Move down" disabled={idx===compositePairs.length-1} onClick={()=>{
+                          if(idx===compositePairs.length-1) return
+                          const next = compositePairs.slice()
+                          const item = next.splice(idx,1)[0]
+                          next.splice(idx+1,0,item)
+                          setCompositePairs(next)
+                          const lefts = next.map(x=>x.left).filter(Boolean)
+                          const rights = next.map(x=>x.right).filter(Boolean)
+                          setJoinLeftOnArr(lefts); setJoinRightOnArr(rights)
+                          setJoinLeftOn(lefts.join(',')); setJoinRightOn(rights.join(','))
+                        }}>▼</button>
+                      </div>
+                      <select value={p.left} onChange={(e)=>{
+                        const next = compositePairs.slice(); next[idx] = { ...next[idx], left: e.target.value }
+                        setCompositePairs(next)
+                        // propagate to arrays
+                        const lefts = next.map(x=>x.left).filter(Boolean)
+                        const rights = next.map(x=>x.right).filter(Boolean)
+                        setJoinLeftOnArr(lefts); setJoinRightOnArr(rights)
+                        setJoinLeftOn(lefts.join(',')); setJoinRightOn(rights.join(','))
+                      }}>
+                        <option value="">-- select left --</option>
+                        {(joinLeftColsOptions||[]).map(c=> <option key={c} value={c}>{c}</option>)}
+                      </select>
+                      <div style={{flex:'0 0 24px',textAlign:'center'}}>→</div>
+                      <select value={p.right} onChange={(e)=>{
+                        const next = compositePairs.slice(); next[idx] = { ...next[idx], right: e.target.value }
+                        setCompositePairs(next)
+                        const lefts = next.map(x=>x.left).filter(Boolean)
+                        const rights = next.map(x=>x.right).filter(Boolean)
+                        setJoinLeftOnArr(lefts); setJoinRightOnArr(rights)
+                        setJoinLeftOn(lefts.join(',')); setJoinRightOn(rights.join(','))
+                      }}>
+                        <option value="">-- select right --</option>
+                        {(joinRightColsOptions||[]).map(c=> <option key={c} value={c}>{c}</option>)}
+                      </select>
+                      <button onClick={()=>{
+                        const next = compositePairs.slice(); next.splice(idx,1)
+                        setCompositePairs(next)
+                        const lefts = next.map(x=>x.left).filter(Boolean)
+                        const rights = next.map(x=>x.right).filter(Boolean)
+                        setJoinLeftOnArr(lefts); setJoinRightOnArr(rights)
+                        setJoinLeftOn(lefts.join(',')); setJoinRightOn(rights.join(','))
+                      }}>Remove</button>
+                    </div>
+                  )) : <div className="empty-state">No key pairs yet — select keys above or add pairs.</div>}
+                  <div>
+                    <button onClick={()=>{
+                      const next = (compositePairs || []).concat([{ left: '', right: '' }])
+                      setCompositePairs(next)
+                    }}>Add pair</button>
+                  </div>
+                </div>
+              </div>
+              <div>
+                <label>Join type</label>
+                <select value={joinType} onChange={(e)=>setJoinType(e.target.value)}>
+                  <option value="inner">Inner</option>
+                  <option value="left">Left</option>
+                  <option value="right">Right</option>
+                  <option value="outer">Full outer</option>
+                  <option value="anti">Anti</option>
+                </select>
+              </div>
+              <div>
+                <label>Sample rows</label>
+                <input type="number" value={joinSampleSize} onChange={(e)=>setJoinSampleSize(Number(e.target.value))} />
+              </div>
+            </div>
+            <div className="button-row" style={{marginTop:8}}>
+              <button className="primary" onClick={doJoinPreview} disabled={joinPreviewLoading}> {joinPreviewLoading ? 'Previewing…' : 'Preview Join'}</button>
+              <button onClick={doJoinSuggestions}>Suggest keys</button>
+            </div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8,marginTop:10}}>
+              <div>
+                <label>Suffix (left)</label>
+                <input value={suffixLeft} onChange={(e)=>setSuffixLeft(e.target.value)} />
+              </div>
+              <div>
+                <label>Suffix (right)</label>
+                <input value={suffixRight} onChange={(e)=>setSuffixRight(e.target.value)} />
+              </div>
+              <div>
+                <label>Conflict preference</label>
+                <select value={preferResolve} onChange={(e)=>setPreferResolve(e.target.value)}>
+                  <option value="left">Prefer left</option>
+                  <option value="right">Prefer right (overwrite)</option>
+                </select>
+              </div>
+              <div>
+                <label>Rename mappings (one per line: side:left|right from->to)</label>
+                <textarea value={mappingText} onChange={(e)=>setMappingText(e.target.value)} rows={3} placeholder="left:old_col->new_col" />
+              </div>
+            </div>
+            {joinPreviewResult ? (
+              <div style={{marginTop:12}}>
+                <div style={{display:'flex',gap:12}}>
+                  <div><strong>Left:</strong> {joinPreviewResult.stats && joinPreviewResult.stats.left_count}</div>
+                  <div><strong>Right:</strong> {joinPreviewResult.stats && joinPreviewResult.stats.right_count}</div>
+                  <div><strong>Joined:</strong> {joinPreviewResult.stats && joinPreviewResult.stats.joined_count}</div>
+                </div>
+                <div style={{marginTop:8,display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+                  <div>
+                    <label>Before (left sample)</label>
+                    <JsonBlock value={joinLeftPreview} empty="No sample" />
+                  </div>
+                  <div>
+                    <label>Before (right sample)</label>
+                    <JsonBlock value={joinRightPreview} empty="No sample" />
+                  </div>
+                </div>
+                <div style={{marginTop:8}}>
+                  <label>Preview rows</label>
+                  <JsonBlock value={joinPreviewResult.preview} empty="No preview rows" />
+                </div>
+                <div style={{marginTop:8,display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+                  <div>
+                    <label>Unmatched (left)</label>
+                    <JsonBlock value={joinPreviewResult.unmatched_left_sample} empty="None" />
+                  </div>
+                  <div>
+                    <label>Unmatched (right)</label>
+                    <JsonBlock value={joinPreviewResult.unmatched_right_sample} empty="None" />
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
+            <hr />
+            <div style={{display:'flex',gap:8,alignItems:'center'}}>
+              <label style={{marginRight:8}}>Export format</label>
+              <select value={exportFormat} onChange={(e)=>setExportFormat(e.target.value)}>
+                <option value="csv">CSV</option>
+                <option value="xlsx">XLSX</option>
+                <option value="pandas">Pandas (pkl)</option>
+                <option value="sql">SQLite</option>
+              </select>
+              <input value={exportFilename} onChange={(e)=>setExportFilename(e.target.value)} placeholder="filename" style={{marginLeft:8}} />
+              <button className="primary" onClick={doJoinExport} disabled={joinExporting}>{joinExporting ? 'Exporting…' : 'Export Join'}</button>
+            </div>
+            {applyRes && applyRes.last_export ? (
+              <div style={{marginTop:8}}>Download: <a href={`${BACKEND}/download?path=${encodeURIComponent(applyRes.last_export)}`} target="_blank" rel="noreferrer">{applyRes.last_export}</a></div>
+            ) : null}
           </Card>
         </div>
       )
