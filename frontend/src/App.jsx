@@ -135,6 +135,8 @@ export default function App() {
   }
   const [uploadHistory, setUploadHistory] = useState(() => loadUploadHistory())
   const [uploadsList, setUploadsList] = useState([])
+  const [uploadExplanationsOpen, setUploadExplanationsOpen] = useState({})
+  const [uploadExplanationsData, setUploadExplanationsData] = useState({})
   const [uploadsLoading, setUploadsLoading] = useState(false)
   const [inspectionLoading, setInspectionLoading] = useState(false)
   const [inspectingPath, setInspectingPath] = useState(null)
@@ -160,6 +162,10 @@ export default function App() {
   const [dedupeConfirmText, setDedupeConfirmText] = useState('')
   const [candidateColumns, setCandidateColumns] = useState([])
   const [pendingGenerated, setPendingGenerated] = useState(null)
+  const [lastGeneratedResponse, setLastGeneratedResponse] = useState(null)
+  const [explanations, setExplanations] = useState(null)
+  const [showExplanations, setShowExplanations] = useState(false)
+  const [explainLoading, setExplainLoading] = useState(false)
   const [showCustomRevisions, setShowCustomRevisions] = useState(false)
   const [showDuplicatesModal, setShowDuplicatesModal] = useState(false)
   const [duplicateGroups, setDuplicateGroups] = useState([])
@@ -345,6 +351,44 @@ export default function App() {
       setUploadsList(uploadHistory || [])
     } finally {
       setUploadsLoading(false)
+    }
+  }
+
+  async function toggleUploadExplanations(item) {
+    const key = item.path
+    setUploadExplanationsOpen((s) => ({ ...(s || {}), [key]: !(s && s[key]) }))
+    // if opening, fetch persisted explanations (server) or use in-memory
+    if (!uploadExplanationsOpen[key]) {
+      // try to use item.explanations_history if present
+      const hist = item.explanations_history || []
+      if (hist && hist.length > 0) {
+        // enrich each entry by fetching recipe metadata to ensure it's approved
+        const enriched = []
+        for (const entry of hist) {
+          try {
+            const rid = entry.recipe_id
+            let recipe_name = null
+            let status = null
+            try {
+              const rres = await fetch(`${BACKEND}/recipes/${encodeURIComponent(rid)}`)
+              if (rres.ok) {
+                const rj = await rres.json()
+                status = rj.status || null
+                recipe_name = rj.name || null
+              }
+            } catch (e) {}
+            // only include entries with approved recipes
+            if (status === 'approved') {
+              enriched.push({ recipe_id: rid, recipe_name, timestamp: entry.timestamp, explanations: entry.explanations })
+            }
+          } catch (e) {
+            continue
+          }
+        }
+        setUploadExplanationsData((s) => ({ ...(s || {}), [key]: enriched }))
+      } else {
+        setUploadExplanationsData((s) => ({ ...(s || {}), [key]: [] }))
+      }
     }
   }
 
@@ -811,6 +855,7 @@ export default function App() {
         }),
       })
       const j = await res.json()
+      setLastGeneratedResponse(j)
       // embed parsed sentinels into impute steps for display if the user provided any
       const recipeObj = sanitizeRecipe(j.recipe || j)
       if (sentinelsArr && Array.isArray(sentinelsArr) && sentinelsArr.length > 0 && recipeObj && Array.isArray(recipeObj.cleaning_steps)) {
@@ -1074,6 +1119,109 @@ export default function App() {
     }
   }
 
+  async function loadExplanations() {
+    // prefer last generated response if available
+    try {
+      setExplainLoading(true)
+      if (lastGeneratedResponse && lastGeneratedResponse.explanations) {
+        const ex = lastGeneratedResponse.explanations || []
+        setExplanations(ex)
+        // only auto-open when there are explanations
+        if (ex && ex.length > 0) setShowExplanations(true)
+        setExplainLoading(false)
+        // attempt to log into uploads if recipe id present and uploads available
+        try {
+          const maybeId = lastGeneratedResponse.id || recipeId
+          if (maybeId && ex && ex.length > 0) {
+            // fetch saved recipe to find source path
+            try {
+              const rres = await fetch(`${BACKEND}/recipes/${encodeURIComponent(maybeId)}`)
+              if (rres.ok) {
+                const rj = await rres.json()
+                const src = (rj.recipe && rj.recipe.sources && rj.recipe.sources[0] && rj.recipe.sources[0].path) || null
+                  if (src) {
+                  // persist on server and refresh uploads listing
+                  try {
+                    const pres = await fetch(`${BACKEND}/uploads/explanations`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source_path: src, recipe_id: maybeId, explanations: ex }) })
+                    if (pres && pres.ok) await fetchUploads()
+                  } catch (e) {}
+                  setUploadsList((list) => {
+                    if (!list) return list
+                    return list.map((it) => {
+                      try {
+                        if (it.path === src) {
+                          const hist = (it.explanations_history && Array.isArray(it.explanations_history)) ? it.explanations_history.slice() : []
+                          hist.unshift({ recipe_id: maybeId, timestamp: new Date().toISOString(), explanations: ex })
+                          return { ...it, explanations_history: hist }
+                        }
+                      } catch (e) {}
+                      return it
+                    })
+                  })
+                }
+              }
+            } catch (e) {}
+          }
+        } catch (e) {}
+        return
+      }
+      if (!recipeId) {
+        addToast('No saved recipe and no generated explanations available', 'warn')
+        setExplainLoading(false)
+        return
+      }
+      const qs = []
+      const nParam = typeof rowsToShow === 'number' ? rowsToShow : Number(rowsToShow)
+      if (nParam != null) qs.push(`sample_rows=${encodeURIComponent(nParam)}`)
+      const url = `${BACKEND}/recipes/${encodeURIComponent(recipeId)}/explain${qs.length ? `?${qs.join('&')}` : ''}`
+      const res = await fetch(url)
+      if (!res.ok) {
+        const txt = await res.text()
+        throw new Error(txt || 'Explain fetch failed')
+      }
+      const j = await res.json()
+      const ex = j.explanations || null
+      setExplanations(ex)
+      if (ex && ex.length > 0) setShowExplanations(true)
+      // if we have explanations and a recipe id, log into matching upload's explanations_history
+      try {
+        if (ex && ex.length > 0 && recipeId) {
+          const rres = await fetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}`)
+          if (rres.ok) {
+            const rj = await rres.json()
+            const src = (rj.recipe && rj.recipe.sources && rj.recipe.sources[0] && rj.recipe.sources[0].path) || null
+            if (src) {
+              // persist on server and refresh uploads listing
+              try {
+                const pres = await fetch(`${BACKEND}/uploads/explanations`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source_path: src, recipe_id: recipeId, explanations: ex }) })
+                if (pres && pres.ok) await fetchUploads()
+              } catch (e) {}
+              setUploadsList((list) => {
+                if (!list) return list
+                return list.map((it) => {
+                  try {
+                    if (it.path === src) {
+                      const hist = (it.explanations_history && Array.isArray(it.explanations_history)) ? it.explanations_history.slice() : []
+                      hist.unshift({ recipe_id: recipeId, timestamp: new Date().toISOString(), explanations: ex })
+                      return { ...it, explanations_history: hist }
+                    }
+                  } catch (e) {}
+                  return it
+                })
+              })
+            }
+          }
+        }
+      } catch (e) {}
+    } catch (e) {
+      addToast('Failed to load explanations: ' + (e.message || e), 'error')
+      setExplanations(null)
+      setShowExplanations(false)
+    } finally {
+      setExplainLoading(false)
+    }
+  }
+
   async function doApply() {
     setApplyLoading(true)
     try {
@@ -1157,6 +1305,12 @@ export default function App() {
         }
       }
       addToast(`Saved recipe ${name}`, "success")
+      // auto-fetch explanations after save to surface step-level rationale
+      try {
+        await loadExplanations()
+      } catch (e) {
+        // ignore: loadExplanations handles its own errors and toasts
+      }
     } catch (e) {
       addToast("Failed to save recipe: " + e.message, "error")
     }
@@ -1187,6 +1341,12 @@ export default function App() {
       setRecipeStatus(j.status)
       setShowApproveConfirm(false)
       addToast(`Recipe ${recipeId} approved`, "success")
+      // auto-refresh explanations after approval
+      try {
+        await loadExplanations()
+      } catch (e) {
+        // ignore; loadExplanations handles errors/toasts
+      }
     } catch (e) {
       setShowApproveConfirm(false)
       addToast("Failed to approve: " + (e.message || e), "error")
@@ -1976,6 +2136,38 @@ export default function App() {
                       >
                         Delete
                       </button>
+                      {item.explanations_history && item.explanations_history.length > 0 ? (
+                        <button onClick={() => toggleUploadExplanations(item)} style={{marginLeft:8}}>
+                          {uploadExplanationsOpen[item.path] ? 'Hide explanations' : `Explanations (${item.explanations_history.length})`}
+                        </button>
+                      ) : null}
+                    </div>
+                    <div style={{width:'100%'}}>
+                      {uploadExplanationsOpen[item.path] && (
+                        <div style={{marginTop:8,borderTop:'1px dashed rgba(255,255,255,0.04)',paddingTop:8}}>
+                          {uploadExplanationsData[item.path] ? (
+                            uploadExplanationsData[item.path].length === 0 ? (
+                              <div className="empty-state">No approved-recipe explanations for this upload.</div>
+                            ) : (
+                              uploadExplanationsData[item.path].map((e, idx) => (
+                                <div key={idx} style={{padding:'6px 0',borderBottom:'1px solid rgba(255,255,255,0.02)'}}>
+                                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                                    <div><strong>{e.recipe_name || e.recipe_id}</strong> <small style={{color:'var(--muted)'}}>({e.recipe_id})</small></div>
+                                    <div><small style={{color:'var(--muted)'}}>{new Date(e.timestamp).toLocaleString()}</small></div>
+                                  </div>
+                                  <div style={{marginTop:6}}>
+                                    {e.explanations && e.explanations.length ? (
+                                      <div style={{fontSize:'0.95rem',color:'var(--muted)'}}>{e.explanations[0].reason || JSON.stringify(e.explanations[0].step)}</div>
+                                    ) : <div className="empty-state">No explanation details.</div>}
+                                  </div>
+                                </div>
+                              ))
+                            )
+                          ) : (
+                            <div style={{display:'flex',gap:8,alignItems:'center'}}><div>⏳</div><div>Loading explanations…</div></div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -2322,6 +2514,7 @@ export default function App() {
                   <div style={{display:'flex',gap:8,alignItems:'center'}}>
                     <small style={{color:'var(--muted)'}}>Optional — generated from instruction</small>
                     <button onClick={() => setShowRecipeJson((s)=>!s)}>{showRecipeJson ? 'Hide JSON' : 'Show JSON'}</button>
+                    <button onClick={() => loadExplanations()} style={{marginLeft:8}}>{explainLoading ? 'Loading…' : 'Show explanations'}</button>
                   </div>
                 </div>
                 {showRecipeJson ? (
@@ -2329,6 +2522,30 @@ export default function App() {
                 ) : (
                   <div className="empty-state">Recipe JSON hidden. Click "Generate JSON" below the instruction to create a recipe JSON. Click "Show JSON" to edit manually.</div>
                 )}
+                {showExplanations && explanations ? (
+                  <div style={{marginTop:12}}>
+                    <div style={{display:'flex',alignItems:'center',gap:8}}>
+                      <h4 style={{margin:0}}>Explanations</h4>
+                      {explainLoading && <div style={{fontSize:'0.9rem',color:'var(--muted)'}}>Loading explanations…</div>}
+                    </div>
+                    {explanations.length === 0 && <div className="empty-state">No explanations available.</div>}
+                    {explanations.map((exp, i) => (
+                      <div key={i} style={{borderTop:'1px solid rgba(255,255,255,0.03)', paddingTop:8, marginTop:8}}>
+                        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                          <div><strong>{exp.step?.action || exp.step?.action}</strong> <small style={{color:'var(--muted)'}}>confidence: {Number(exp.confidence).toFixed(2)}</small></div>
+                          <div><button onClick={() => { setShowExplanations(false); setExplanations(null) }}>Close</button></div>
+                        </div>
+                        <div style={{marginTop:6}}><div style={{fontSize:'0.95rem'}}>{exp.reason}</div></div>
+                        {exp.preview && (
+                          <div style={{marginTop:8, display:'flex', gap:12}}>
+                            <div><strong>Before</strong><pre style={{fontFamily:'monospace', margin:0}}>{JSON.stringify(exp.preview.before)}</pre></div>
+                            <div><strong>After</strong><pre style={{fontFamily:'monospace', margin:0}}>{JSON.stringify(exp.preview.after)}</pre></div>
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
                 {showConfirmModal ? (
                   <div className="modal">
                     <div className="modal-content">

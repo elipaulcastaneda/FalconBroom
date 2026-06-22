@@ -362,6 +362,13 @@ class WriteParquetResponse(BaseModel):
         schema_extra = {"example": {"path": "data/outputs/sample_abc123.parquet"}}
 
 
+class ExplanationsLogSpec(BaseModel):
+    source_path: str
+    recipe_id: str
+    explanations: list
+
+
+
 @app.get("/suggest-buckets", response_model=SuggestBucketsResponse)
 def suggest_buckets(path: str, col: str, strategy: str = "quantile", n_buckets: int = 5):
     """Suggest numeric buckets for a column.
@@ -1006,7 +1013,17 @@ def list_uploads():
         try:
             if p.is_file():
                 st = p.stat()
-                out.append({"name": p.name, "path": str(p), "size": st.st_size, "modified_at": datetime.utcfromtimestamp(st.st_mtime).isoformat() + "Z"})
+                item = {"name": p.name, "path": str(p), "size": st.st_size, "modified_at": datetime.utcfromtimestamp(st.st_mtime).isoformat() + "Z"}
+                # include persisted explanations history if present
+                try:
+                    meta = p.parent / (p.name + ".meta.json")
+                    if meta.exists():
+                        mj = json.loads(meta.read_text(encoding="utf-8"))
+                        if mj.get("explanations_history"):
+                            item["explanations_history"] = mj.get("explanations_history")
+                except Exception:
+                    pass
+                out.append(item)
         except Exception:
             continue
     return {"uploads": sorted(out, key=lambda r: r.get("modified_at", ""), reverse=True)}
@@ -1721,6 +1738,49 @@ def find_upload_duplicates():
                     dup_groups.append({"hash": digest, "paths": paths, "size": sz})
 
         return {"duplicates": dup_groups}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/uploads/explanations")
+def persist_explanations(spec: ExplanationsLogSpec):
+    """Persist explanation history for a source upload.
+
+    Body: { source_path, recipe_id, explanations }
+    Creates or updates a meta file next to the upload named `<filename>.meta.json` with
+    an `explanations_history` array (newest first).
+    """
+    try:
+        src = Path(spec.source_path)
+        # prefer exact path, otherwise attempt to find matching upload by name
+        if not src.exists():
+            candidates = list(UPLOAD_DIR.glob(src.name))
+            if candidates:
+                src = candidates[0]
+            else:
+                matches = [p for p in UPLOAD_DIR.iterdir() if p.name == src.name]
+                if matches:
+                    src = matches[0]
+        if not src.exists():
+            raise HTTPException(status_code=404, detail="Source upload not found")
+
+        meta = src.parent / (src.name + ".meta.json")
+        existing = {}
+        if meta.exists():
+            try:
+                existing = json.loads(meta.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+
+        hist = existing.get("explanations_history") or []
+        entry = {"recipe_id": spec.recipe_id, "timestamp": datetime.utcnow().isoformat() + "Z", "explanations": spec.explanations}
+        hist.insert(0, entry)
+        # cap history length
+        existing["explanations_history"] = hist[:20]
+        meta.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
+        return {"ok": True}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
