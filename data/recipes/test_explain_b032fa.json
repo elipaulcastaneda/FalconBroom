@@ -1,0 +1,1 @@
+{"id": "test_explain_b032fa", "name": "test_explain_b032fa", "created_at": "now", "status": "draft", "expected_columns": ["name", "age"], "recipe": {"sources": [{"path": "data\\demo\\explain_src_3cbb04.csv"}], "cleaning_steps": [{"action": "normalize", "column": "name", "params": {"case": "lower"}}], "joins": [], "outputs": [{"path": "out.csv"}]}}

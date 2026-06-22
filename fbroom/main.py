@@ -7,9 +7,20 @@ import shutil
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from .connectors import resolve_source
-from .engine import Cleaner, _read_table
+from .engine import (
+    Cleaner,
+    _read_table,
+    _suggest_buckets,
+    _write_parquet,
+    _map_values,
+    _string_transform_column,
+    _fill_null_column,
+    _unicode_normalize_column,
+    _regex_replace,
+    _cast_column,
+)
 import re
 import csv
 import shutil
@@ -17,7 +28,7 @@ import hashlib
 from .ingest import convert_uploaded_file
 from .ingest import _google_drive_access_token
 from .recipe_schema import Recipe
-from typing import Optional
+from typing import Optional, Any, List
 from .workflow_rules import (
     explain_recipe,
     infer_columns_from_text,
@@ -27,7 +38,7 @@ from .workflow_rules import (
     suggest_join_rules,
 )
 import traceback
-from pydantic import BaseModel
+# pydantic models used below
 
 app = FastAPI(title="FalconBroom Prototype API")
 
@@ -186,6 +197,244 @@ def suggest(spec: SourceSpec):
         profile = cleaner.profile(spec.path)
         suggestions = cleaner.suggest_fixes(profile)
         return {"suggestions": suggestions}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Pydantic models for bucket suggestion and parquet write endpoints
+class Bucket(BaseModel):
+    min: Optional[float] = None
+    max: Optional[float] = None
+    label: str
+
+
+class SuggestBucketsResponse(BaseModel):
+    buckets: list[Bucket]
+
+    class Config:
+        schema_extra = {
+            "example": {
+                "buckets": [
+                    {"min": 1.0, "max": 25.0, "label": "low"},
+                    {"min": 25.1, "max": 75.0, "label": "medium"},
+                    {"min": 75.1, "max": 100.0, "label": "high"},
+                ]
+            }
+        }
+
+
+class WriteParquetSpec(BaseModel):
+    path: str = Field(..., example="data/uploads/sample.csv")
+    out_path: Optional[str] = Field(None, example="reports/output.parquet")
+    compression: Optional[str] = Field(None, example="snappy")
+    atomic: Optional[bool] = Field(True, example=True)
+
+
+# Explainability/OpenAPI models
+class ExplainedStepPreview(BaseModel):
+    column: Optional[str] = None
+    before: Optional[List[Any]] = None
+    after: Optional[List[Any]] = None
+    class Config:
+        schema_extra = {
+            "examples": {
+                "normalize": {"summary": "Normalized text preview", "value": {"column": "name", "before": ["Alice", "Bob"], "after": ["alice", "bob"]}},
+                "impute": {"summary": "Imputation preview", "value": {"column": "age", "before": [None, 25], "after": [30, 25]}},
+                "map": {"summary": "Mapping preview", "value": {"column": "status", "before": ["A","B"], "after": ["active","blocked"]}},
+            }
+        }
+
+
+class ExplainedStepResponse(BaseModel):
+    step: dict
+    reason: str
+    confidence: float
+    preview: Optional[ExplainedStepPreview] = None
+    class Config:
+        schema_extra = {
+            "examples": {
+                "normalize": {
+                    "summary": "Normalize step",
+                    "value": {
+                        "step": {"action": "normalize", "column": "name", "params": {"case": "lower"}},
+                        "reason": "name appears to be a text column, so normalization is safe and deterministic.",
+                        "confidence": 0.75,
+                        "preview": {"column": "name", "before": ["Alice", "Bob"], "after": ["alice", "bob"]},
+                    },
+                },
+                "impute": {
+                    "summary": "Impute step",
+                    "value": {
+                        "step": {"action": "impute", "column": "age", "params": {"strategy": "median"}},
+                        "reason": "age has missing values; using median imputation.",
+                        "confidence": 0.8,
+                        "preview": {"column": "age", "before": [None, 25], "after": [30, 25]},
+                    },
+                },
+                "map": {
+                    "summary": "Map values",
+                    "value": {
+                        "step": {"action": "map", "column": "status", "params": {"mapping": {"A": "active", "B": "blocked"}}},
+                        "reason": "status mapped from short codes to readable labels.",
+                        "confidence": 0.85,
+                        "preview": {"column": "status", "before": ["A","B"], "after": ["active","blocked"]},
+                    },
+                },
+                "cast": {
+                    "summary": "Cast to datetime",
+                    "value": {
+                        "step": {"action": "cast", "column": "ts", "params": {"to": "datetime", "fmt": "%Y-%m-%d"}},
+                        "reason": "attempt to coerce column to datetime",
+                        "confidence": 0.6,
+                        "preview": {"column": "ts", "before": ["2025-01-01", "2025-02-02"], "after": ["2025-01-01T00:00:00", "2025-02-02T00:00:00"]},
+                    },
+                },
+                "regex_replace": {
+                    "summary": "Regex replace",
+                    "value": {
+                        "step": {"action": "regex_replace", "column": "desc", "params": {"pattern": "\\\d+", "replace": "#"}},
+                        "reason": "remove numeric tokens from descriptions",
+                        "confidence": 0.7,
+                        "preview": {"column": "desc", "before": ["item 123","foo 45"], "after": ["item #","foo #"]},
+                    },
+                },
+                "drop_column": {
+                    "summary": "Drop column",
+                    "value": {
+                        "step": {"action": "drop_column", "column": "legacy_id", "params": {}},
+                        "reason": "legacy_id is deprecated and will be removed.",
+                        "confidence": 0.9,
+                        "preview": {"column": "legacy_id", "before": ["x1","x2"], "after": [None, None]},
+                    },
+                },
+            }
+        }
+
+
+class ExplainResponse(BaseModel):
+    id: str
+    explanations: List[ExplainedStepResponse]
+    class Config:
+        schema_extra = {
+            "examples": {
+                "single_normalize": {
+                    "summary": "Single normalize explanation",
+                    "value": {
+                        "id": "test_explain_abcdef",
+                        "explanations": [
+                            {
+                                "step": {"action": "normalize", "column": "name", "params": {"case": "lower"}},
+                                "reason": "name appears to be a text column, so normalization is safe and deterministic.",
+                                "confidence": 0.75,
+                                "preview": {"column": "name", "before": ["Alice", "Bob"], "after": ["alice", "bob"]},
+                            }
+                        ],
+                    },
+                },
+                "multi_steps": {
+                    "summary": "Multiple-step explanation",
+                    "value": {
+                        "id": "test_explain_multi",
+                        "explanations": [
+                            {
+                                "step": {"action": "impute", "column": "age", "params": {"strategy": "median"}},
+                                "reason": "age has missing values; using median imputation.",
+                                "confidence": 0.8,
+                                "preview": {"column": "age", "before": [None, 25], "after": [30, 25]},
+                            },
+                            {
+                                "step": {"action": "map", "column": "status", "params": {"mapping": {"A": "active"}}},
+                                "reason": "status mapped from short codes to readable labels.",
+                                "confidence": 0.85,
+                                "preview": {"column": "status", "before": ["A"], "after": ["active"]},
+                            }
+                        ],
+                    },
+                },
+            }
+        }
+
+
+class WriteParquetResponse(BaseModel):
+    path: str
+
+    class Config:
+        schema_extra = {"example": {"path": "data/outputs/sample_abc123.parquet"}}
+
+
+@app.get("/suggest-buckets", response_model=SuggestBucketsResponse)
+def suggest_buckets(path: str, col: str, strategy: str = "quantile", n_buckets: int = 5):
+    """Suggest numeric buckets for a column.
+
+    Query params:
+    - `path`: source path (materialized CSV/parquet)
+    - `col`: column name to analyze
+    - `strategy`: one of `quantile`|`equal`|`kmeans`
+    - `n_buckets`: number of buckets to propose
+
+    Returns a JSON object with `buckets` list of `{min,max,label}` entries.
+
+    Example cURL (quantile):
+
+    ```bash
+    curl -G 'http://127.0.0.1:3009/suggest-buckets' \
+      --data-urlencode 'path=data/demo/customers.csv' \
+      --data-urlencode 'col=age' \
+      --data-urlencode 'strategy=quantile' \
+      --data-urlencode 'n_buckets=4'
+    ```
+
+    Example response:
+    ```json
+    {"buckets": [{"min":1.0,"max":25.0,"label":"b1"}, {"min":26.0,"max":50.0,"label":"b2"}]}
+    ```
+    """
+    try:
+        df = _read_table(path)
+        buckets = _suggest_buckets(df, col, strategy=strategy, n_buckets=int(n_buckets))
+        return {"buckets": buckets}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/write-parquet", response_model=WriteParquetResponse)
+def write_parquet(spec: WriteParquetSpec):
+    """Write a materialized source to Parquet.
+
+    Body JSON fields (`WriteParquetSpec`):
+    - `path` (required): source path to read (CSV/parquet)
+    - `out_path` (optional): destination path (relative to `data/outputs` if not absolute)
+    - `compression` (optional): snappy|gzip|zstd|brotli
+    - `atomic` (optional): whether to write atomically (default true)
+
+    Example cURL:
+
+    ```bash
+    curl -X POST 'http://127.0.0.1:3009/write-parquet' \
+      -H 'Content-Type: application/json' \
+      -d '{"path":"data/demo/customers.csv","out_path":"customers.parquet","compression":"snappy"}'
+    ```
+
+    Example response:
+    ```json
+    {"path": "data/outputs/customers_abc123.parquet"}
+    ```
+    """
+    try:
+        df = _read_table(spec.path)
+        if not spec.out_path:
+            out = OUTPUTS_DIR / f"{Path(spec.path).stem}_{uuid4().hex[:8]}.parquet"
+        else:
+            out = Path(spec.out_path)
+            if not out.is_absolute():
+                out = OUTPUTS_DIR / out
+        out.parent.mkdir(parents=True, exist_ok=True)
+        res = _write_parquet(df, str(out), compression=spec.compression, atomic=bool(spec.atomic))
+        if not res:
+            raise HTTPException(status_code=500, detail="Failed to write parquet file")
+        return {"path": str(out)}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -370,6 +619,122 @@ def get_recipe(rid: str):
     except Exception:
         pass
     return data
+
+
+def _apply_step_preview(df, step, n=5):
+    """Apply a best-effort preview of a single CleaningStep to up to `n` rows.
+    Returns dict with `column`, `before`, `after` lists when applicable.
+    """
+    try:
+        col = getattr(step, "column", None) or (step.get("column") if isinstance(step, dict) else None)
+    except Exception:
+        col = None
+    if not col:
+        return {"column": None}
+
+    # take a small sample
+    try:
+        sample = df.head(n)
+    except Exception:
+        try:
+            sample = df[:n]
+        except Exception:
+            return {"column": col, "before": [], "after": []}
+
+    before_vals = []
+    try:
+        before_vals = [r.get(col) for r in (sample.to_dicts() if hasattr(sample, 'to_dicts') else list(sample.to_dict('records')))]
+    except Exception:
+        try:
+            before_vals = [r.get(col) for r in sample]
+        except Exception:
+            before_vals = []
+
+    action = getattr(step, "action", None) or (step.get("action") if isinstance(step, dict) else None)
+    params = getattr(step, "params", None) or (step.get("params") if isinstance(step, dict) else {}) or {}
+
+    after_vals = list(before_vals)
+    try:
+        if action in ("normalize",):
+            # prefer unicode normalize when requested
+            if params.get("unicode") or params.get("remove_diacritics"):
+                df2 = _unicode_normalize_column(sample, col, form=params.get("form", "NFKC"), remove_diacritics=bool(params.get("remove_diacritics", False)))
+            else:
+                case = params.get("case", "lower")
+                df2 = _string_transform_column(sample, col, case=case)
+            after_vals = [r.get(col) for r in (df2.to_dicts() if hasattr(df2, 'to_dicts') else list(df2.to_dict('records')))]
+        elif action in ("impute", "fill"):
+            val = params.get("value") if params.get("value") is not None else ""
+            df2 = _fill_null_column(sample, col, val, strategy=params.get("strategy"))
+            after_vals = [r.get(col) for r in (df2.to_dicts() if hasattr(df2, 'to_dicts') else list(df2.to_dict('records')))]
+        elif action in ("map",):
+            mapping = params.get("mapping") or params.get("map") or {}
+            if mapping:
+                df2 = _map_values(sample, col, mapping)
+                after_vals = [r.get(col) for r in (df2.to_dicts() if hasattr(df2, 'to_dicts') else list(df2.to_dict('records')))]
+        elif action in ("regex_replace", "replace"):
+            pattern = params.get("pattern") or params.get("old")
+            repl = params.get("replace") or params.get("new")
+            flags = params.get("flags")
+            if pattern is not None and repl is not None:
+                df2 = _regex_replace(sample, col, pattern, repl, flags=flags)
+                after_vals = [r.get(col) for r in (df2.to_dicts() if hasattr(df2, 'to_dicts') else list(df2.to_dict('records')))]
+        elif action in ("cast",):
+            to_type = params.get("to") or params.get("type")
+            if to_type:
+                df2, info = _cast_column(sample, col, to_type, fmt=params.get("fmt"), errors=params.get("errors", "coerce"))
+                try:
+                    after_vals = [r.get(col) for r in (df2.to_dicts() if hasattr(df2, 'to_dicts') else list(df2.to_dict('records')))]
+                except Exception:
+                    pass
+        elif action in ("drop_column",):
+            # show removal by returning after as list of None
+            after_vals = [None for _ in before_vals]
+        else:
+            # unknown action: leave after as before
+            after_vals = list(before_vals)
+    except Exception:
+        after_vals = list(before_vals)
+
+    return {"column": col, "before": before_vals, "after": after_vals}
+
+
+
+
+@app.get("/recipes/{rid}/explain", response_model=ExplainResponse)
+def explain_recipe_endpoint(rid: str, sample_rows: int = 5):
+    """Return step-level explanations and small before/after samples for a saved recipe."""
+    p = RECIPES_DIR / f"{rid}.json"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="Recipe not found")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        recipe_dict = data.get("recipe") or {}
+        # coerce into Recipe model via recipe_schema if available
+        from .recipe_schema import Recipe as RecipeModel
+        recipe = RecipeModel(**recipe_dict) if isinstance(recipe_dict, dict) else RecipeModel(**recipe_dict)
+
+        # build profile from first source
+        src = recipe.sources[0]["path"] if recipe.sources else None
+        profile = cleaner.profile(src) if src else {}
+        explanations = explain_recipe(recipe, profile)
+
+        # load dataframe sample for previews
+        df = _read_table(src) if src else None
+        previews = []
+        for exp in explanations:
+            step = exp.step
+            preview = _apply_step_preview(df, step, n=int(sample_rows)) if df is not None else {"column": getattr(step, 'column', None)}
+            previews.append({
+                "step": step.model_dump() if hasattr(step, 'model_dump') else (step.dict() if hasattr(step, 'dict') else step),
+                "reason": exp.reason,
+                "confidence": exp.confidence,
+                "preview": preview,
+            })
+
+        return {"id": rid, "explanations": previews}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/recipes/{rid}/approve")
@@ -666,6 +1031,49 @@ def rollback_run(run_id: str):
     rbpath = HISTORY_DIR / f"rollback_{run_id}.json"
     rbpath.write_text(json.dumps(rollback_record, indent=2, ensure_ascii=False), encoding="utf-8")
     return {"rollback": rollback_record}
+
+
+@app.delete("/history/{run_id}")
+def delete_history_entry(run_id: str):
+    p = HISTORY_DIR / f"{run_id}.json"
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="Run not found")
+    try:
+        p.unlink()
+        return {"deleted": run_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/history/dedupe")
+def dedupe_history(by: str = "output_path"):
+    """Remove duplicate history records. By default de-duplicates by `output_path`.
+
+    Returns list of removed run ids.
+    """
+    try:
+        seen = set()
+        removed = []
+        for p in sorted(HISTORY_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            key = data.get(by)
+            # fallback to full record hash when key is missing
+            if not key:
+                key = hashlib.sha256(json.dumps(data, sort_keys=True).encode("utf-8")).hexdigest()
+            if key in seen:
+                try:
+                    removed.append(data.get("id") or p.stem)
+                    p.unlink()
+                except Exception:
+                    continue
+            else:
+                seen.add(key)
+        return {"removed": removed}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/recipes/{rid}/export_sheets")

@@ -152,7 +152,12 @@ export default function App() {
   const [showFullPreview, setShowFullPreview] = useState(false)
   const [showRecipeJson, setShowRecipeJson] = useState(false)
   const [showConfirmModal, setShowConfirmModal] = useState(false)
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
+  const [deleteTarget, setDeleteTarget] = useState(null)
+  const [deleteConfirmText, setDeleteConfirmText] = useState('')
   const [previewRows, setPreviewRows] = useState(6)
+  const [showDedupeConfirm, setShowDedupeConfirm] = useState(false)
+  const [dedupeConfirmText, setDedupeConfirmText] = useState('')
   const [candidateColumns, setCandidateColumns] = useState([])
   const [pendingGenerated, setPendingGenerated] = useState(null)
   const [showCustomRevisions, setShowCustomRevisions] = useState(false)
@@ -1346,6 +1351,34 @@ export default function App() {
     }
   }
 
+  async function deleteHistory(runId) {
+    try {
+      const res = await fetch(`${BACKEND}/history/${encodeURIComponent(runId)}`, { method: "DELETE" })
+      if (res.ok) {
+        const j = await res.json()
+        addToast(`Deleted run ${j.deleted}`, 'success')
+        fetchHistory()
+      } else {
+        let text = 'Delete failed'
+        try { const j = await res.json(); text = j.detail || JSON.stringify(j) } catch { text = await res.text() }
+        addToast(text, 'error')
+      }
+    } catch (e) {
+      addToast('Delete failed: ' + e.message, 'error')
+    }
+  }
+
+  async function dedupeHistory() {
+    try {
+      const res = await fetch(`${BACKEND}/history/dedupe`, { method: "POST" })
+      const j = await res.json()
+      addToast(`Removed ${j.removed.length} duplicate runs`, 'info')
+      fetchHistory()
+    } catch (e) {
+      addToast('Dedupe failed: ' + e.message, 'error')
+    }
+  }
+
   function downloadPreviewCsv() {
     if (!generatedPreview || !generatedPreview.after) {
       addToast('No preview available to download. Run Preview or generate a recipe.', 'warn')
@@ -1588,8 +1621,9 @@ export default function App() {
           {/* Custom revisions modal rendered globally */}
 
           <Card eyebrow="Run history" title="Runs and lineage" subtitle="View previous runs, outputs, and create rollbacks.">
-            <div className="button-row">
+              <div className="button-row">
               <button onClick={fetchHistory}>Refresh history</button>
+              <button onClick={() => setShowDedupeConfirm(true)}>Remove duplicates</button>
             </div>
             {historyList.length ? (
               <div className="history-list">
@@ -1611,6 +1645,7 @@ export default function App() {
                     </div>
                     <div className="history-actions">
                       <button onClick={() => rollbackRun(r.id)}>Rollback</button>
+                      <button onClick={() => { setDeleteTarget(r.id); setShowDeleteConfirm(true) }} style={{marginLeft:8,color:'#fff',background:'#ef4444',border:'none',padding:'6px 8px'}}>Delete</button>
                     </div>
                   </div>
                 ))}
@@ -1826,8 +1861,8 @@ export default function App() {
                 </select>
               </div>
               <div>
-                <label>Rename mappings (one per line: side:left|right from->to)</label>
-                <textarea value={mappingText} onChange={(e)=>setMappingText(e.target.value)} rows={3} placeholder="left:old_col->new_col" />
+                <label>Rename mappings (one per line: side:left|right from-&gt;to)</label>
+                <textarea value={mappingText} onChange={(e)=>setMappingText(e.target.value)} rows={3} placeholder="left:old_col-&gt;new_col" />
               </div>
             </div>
             {joinPreviewResult ? (
@@ -2564,6 +2599,69 @@ export default function App() {
                     </div>
                   </div>
                 ))}
+              </div>
+            </div>
+          </div>
+        )}
+        {showDeleteConfirm && (
+          <div className="modal-overlay" onClick={() => setShowDeleteConfirm(false)}>
+            <div className="modal-panel card" onClick={(e) => e.stopPropagation()} role="dialog" aria-label="Confirm delete">
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                <div>
+                  <h3>Confirm delete</h3>
+                  <div style={{color:'var(--muted)'}}>Are you sure you want to delete this run record? This action cannot be undone.</div>
+                </div>
+                <div>
+                  <button onClick={() => setShowDeleteConfirm(false)}>Cancel</button>
+                </div>
+              </div>
+              <div style={{marginTop:12}}>
+                <div style={{marginBottom:8}}>
+                  <label style={{display:'block', fontSize:'0.95rem'}}>Type "DELETE" to confirm:</label>
+                  <input value={deleteConfirmText} onChange={(e) => setDeleteConfirmText(e.target.value)} placeholder="DELETE" />
+                </div>
+                <div style={{display:'flex', gap:8}}>
+                  <button
+                    disabled={deleteConfirmText.trim().toUpperCase() !== 'DELETE'}
+                    onClick={async () => { await deleteHistory(deleteTarget); setShowDeleteConfirm(false); setDeleteTarget(null); setDeleteConfirmText('') }}
+                    style={{background:'#ef4444', color:'#fff', border:'none', padding:'8px 12px'}}
+                  >
+                    Delete
+                  </button>
+                  <button onClick={() => { setShowDeleteConfirm(false); setDeleteTarget(null); setDeleteConfirmText('') }}>Cancel</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {showDedupeConfirm && (
+          <div className="modal-overlay" onClick={() => setShowDedupeConfirm(false)}>
+            <div className="modal-panel card" onClick={(e) => e.stopPropagation()} role="dialog" aria-label="Confirm dedupe">
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                <div>
+                  <h3>Remove duplicate runs</h3>
+                  <div style={{color:'var(--muted)'}}>This will remove duplicate run records (keeps the most recent per output). Proceed?</div>
+                </div>
+                <div>
+                  <button onClick={() => setShowDedupeConfirm(false)}>Close</button>
+                </div>
+              </div>
+              <div style={{marginTop:12}}>
+                <div style={{marginBottom:8}}>
+                  <label style={{display:'block', fontSize:'0.95rem'}}>Type "REMOVE DUPLICATES" to confirm:</label>
+                  <input value={dedupeConfirmText} onChange={(e) => setDedupeConfirmText(e.target.value)} placeholder="REMOVE DUPLICATES" />
+                </div>
+                <div style={{display:'flex', gap:8}}>
+                  <button
+                    disabled={dedupeConfirmText.trim().toUpperCase() !== 'REMOVE DUPLICATES'}
+                    onClick={async () => { await dedupeHistory(); setShowDedupeConfirm(false); setDedupeConfirmText('') }}
+                    style={{background:'#ef4444', color:'#fff', border:'none', padding:'8px 12px'}}
+                  >
+                    Remove duplicates
+                  </button>
+                  <button onClick={() => setShowDedupeConfirm(false)}>Cancel</button>
+                </div>
               </div>
             </div>
           </div>

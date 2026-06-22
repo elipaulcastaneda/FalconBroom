@@ -1,8 +1,0 @@
-{
-  "id": "export_4fc8781b",
-  "recipe_id": "recipe_1781498707475_f89c65ce",
-  "requested_at": "2026-06-15T04:45:17.806659Z",
-  "output_path": "output_from_text.csv",
-  "sheet_name": "Sheet1",
-  "status": "pending_auth"
-}

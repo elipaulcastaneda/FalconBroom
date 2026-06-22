@@ -331,6 +331,115 @@ def _write_csv(df, out_path):
             return None
 
 
+def _resolve_conflict_name(existing_names, desired_name):
+    """Return a non-conflicting column name based on `desired_name`.
+    Appends a numeric suffix if needed: name, name_1, name_2, ...
+    """
+    if desired_name not in existing_names:
+        return desired_name
+    base = desired_name
+    i = 1
+    while True:
+        cand = f"{base}_{i}"
+        if cand not in existing_names:
+            return cand
+        i += 1
+
+
+def _safe_rename_columns(df, rename_map: dict):
+    """Rename columns in `df` safely avoiding conflicts by using `_resolve_conflict_name`.
+    `rename_map` is {old_name: desired_new_name}.
+    Returns (df_new, applied_map) where applied_map maps old->actual_new.
+    """
+    if not rename_map:
+        return df, {}
+    cols = list(df.columns if _is_polars_df(df) else list(df.columns))
+    applied = {}
+    taken = set(cols)
+    # compute actual new names without collisions
+    for old, desired in rename_map.items():
+        if old not in cols:
+            continue
+        new_name = desired or old
+        if new_name == old:
+            applied[old] = old
+            continue
+        actual = _resolve_conflict_name(taken - {old}, new_name)
+        applied[old] = actual
+        # reserve the name
+        taken.add(actual)
+
+    # apply renames
+    try:
+        if _is_polars_df(df):
+            mapping = {old: new for old, new in applied.items() if old in cols and new != old}
+            if mapping:
+                return df.rename(mapping), applied
+            return df, applied
+        else:
+            import pandas as _pd
+            pd_df = df.copy()
+            mapping = {old: new for old, new in applied.items() if old in pd_df.columns and new != old}
+            if mapping:
+                pd_df = pd_df.rename(columns=mapping)
+            return pd_df, applied
+    except Exception:
+        return df, applied
+
+
+def _write_parquet(df, out_path, compression: str = None, atomic: bool = True):
+    """Write dataframe to parquet with optional `compression` (snappy,gzip,zstd,brotli)
+    and atomic write (write to temp then move).
+    Returns the final path on success, else None.
+    """
+    try:
+        tmp = None
+        dirp = os.path.dirname(out_path) or '.'
+        # atomic write via temp file in same dir
+        if atomic:
+            fd, tmp = tempfile.mkstemp(dir=dirp, prefix="tmp_parquet_")
+            os.close(fd)
+            target = tmp
+        else:
+            target = out_path
+
+        if _is_polars_df(df):
+            kwargs = {}
+            if compression:
+                kwargs['compression'] = compression
+            try:
+                df.write_parquet(target, **kwargs)
+            except Exception:
+                # try via pyarrow table
+                try:
+                    import pyarrow as pa
+                    import pyarrow.parquet as pq
+                    tbl = df.to_arrow()
+                    pq.write_table(tbl, target, compression=compression)
+                except Exception:
+                    raise
+        else:
+            # pandas path using pyarrow
+            try:
+                import pyarrow as pa
+                import pyarrow.parquet as pq
+                tbl = pa.Table.from_pandas(df)
+                pq.write_table(tbl, target, compression=compression)
+            except Exception:
+                return None
+
+        if atomic and tmp:
+            shutil.move(tmp, out_path)
+        return out_path
+    except Exception:
+        try:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return None
+
+
 def _replace_values(df, col, old, new):
     # perform literal replacements (avoid regex metacharacters for literal match)
     old_raw = str(old)

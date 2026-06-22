@@ -154,3 +154,49 @@ Notes and caveats:
 
 
 A tool to join data sources and automate data preparation. 
+
+API cURL examples
+------------------
+
+Suggest buckets (GET):
+
+```bash
+curl -G 'http://127.0.0.1:3009/suggest-buckets' \
+	--data-urlencode 'path=data/demo/customers.csv' \
+	--data-urlencode 'col=age' \
+	--data-urlencode 'strategy=quantile' \
+	--data-urlencode 'n_buckets=4'
+```
+
+Write Parquet (POST):
+
+```bash
+curl -X POST 'http://127.0.0.1:3009/write-parquet' \
+	-H 'Content-Type: application/json' \
+	-d '{"path":"data/demo/customers.csv","out_path":"customers.parquet","compression":"snappy"}'
+```
+
+These examples appear in the API docs at `/docs` when the backend is running.
+
+Explain recipe steps (GET):
+
+```bash
+curl -G 'http://127.0.0.1:3009/recipes/test_explain_abcdef/explain' \
+	--data-urlencode 'sample_rows=5'
+```
+
+Response (excerpt):
+
+```json
+{
+	"id": "test_explain_abcdef",
+	"explanations": [
+		{
+			"step": {"action": "normalize", "column": "name", "params": {"case": "lower"}},
+			"reason": "name appears to be a text column, so normalization is safe and deterministic.",
+			"confidence": 0.75,
+			"preview": {"column": "name", "before": ["Alice","Bob"], "after": ["alice","bob"]}
+		}
+	]
+}
+```
