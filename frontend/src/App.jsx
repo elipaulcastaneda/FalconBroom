@@ -1,14 +1,16 @@
 import React, {useMemo, useRef, useState, useEffect} from "react"
-
-const BACKEND = "http://127.0.0.1:3009"
+import { BACKEND } from './config'
+import authFetch from './utils/authFetch'
 const NAV_ITEMS = [
   { section: "Start", id: "source", label: "Source", detail: "Profile and prompt to recipe", icon: "⟡" },
   { section: "Start", id: "uploads", label: "Uploads", detail: "Saved uploads", icon: "⇪" },
   { section: "Build", id: "joins", label: "Joins", detail: "Match and merge hints", icon: "⧉" },
   { section: "Review", id: "preview", label: "Preview", detail: "Compare before and after", icon: "↔" },
+  { section: "Account", id: "settings", label: "Settings", detail: "Account & privacy", icon: "⚙" },
+  { section: "Account", id: "team", label: "Team", detail: "Team members & sharing", icon: "👥" },
 ]
 
-const NAV_SECTIONS = ["Start", "Build", "Review"]
+const NAV_SECTIONS = ["Start", "Build", "Review", "Account"]
 
 function Card({ eyebrow, title, subtitle, children, className = "" }) {
   return (
@@ -138,6 +140,45 @@ export default function App() {
   const [uploadExplanationsOpen, setUploadExplanationsOpen] = useState({})
   const [uploadExplanationsData, setUploadExplanationsData] = useState({})
   const [uploadsLoading, setUploadsLoading] = useState(false)
+  const [userId, setUserId] = useState(() => {
+    try {
+      let id = window.localStorage.getItem('falconbroom_user_id')
+      if (!id) {
+        id = `user_${Math.random().toString(36).slice(2,9)}`
+        window.localStorage.setItem('falconbroom_user_id', id)
+      }
+      return id
+    } catch {
+      return null
+    }
+  })
+  const [consent, setConsent] = useState(() => {
+    try { return JSON.parse(window.localStorage.getItem('falconbroom_consent') || 'null') } catch { return null }
+  })
+  const [consentHistory, setConsentHistory] = useState(null)
+  const [showConsentHistory, setShowConsentHistory] = useState(false)
+  const [analyticsId, setAnalyticsId] = useState(() => {
+    try { return window.localStorage.getItem('falconbroom_analytics_id') || '' } catch { return '' }
+  })
+  const [authToken, setAuthToken] = useState(() => { try { return window.localStorage.getItem('falconbroom_access_token') || '' } catch { return '' } })
+  const [accountUser, setAccountUser] = useState(null)
+  const [signupUsername, setSignupUsername] = useState('')
+  const [signupEmail, setSignupEmail] = useState('')
+  const [signupPassword, setSignupPassword] = useState('')
+  const [loginIdentity, setLoginIdentity] = useState('')
+  const [loginPassword, setLoginPassword] = useState('')
+  const [teamName, setTeamName] = useState('')
+  const [teamMembers, setTeamMembers] = useState([])
+  const [teamMemberObjects, setTeamMemberObjects] = useState([])
+  const [pendingInvites, setPendingInvites] = useState([])
+  const [sharedUploads, setSharedUploads] = useState([])
+  const [wsConnected, setWsConnected] = useState(false)
+  const [inviteToken, setInviteToken] = useState('')
+  const [acceptUsername, setAcceptUsername] = useState('')
+  const [acceptPasswordLocal, setAcceptPasswordLocal] = useState('')
+  const [newMemberEmail, setNewMemberEmail] = useState('')
+  const [deletePassword, setDeletePassword] = useState('')
+  const [deleteConfirmTextLocal, setDeleteConfirmTextLocal] = useState('')
   const [inspectionLoading, setInspectionLoading] = useState(false)
   const [inspectingPath, setInspectingPath] = useState(null)
   const [profileLoading, setProfileLoading] = useState(false)
@@ -291,6 +332,321 @@ export default function App() {
     } finally {
       setProfileLoading(false)
     }
+  }
+
+  useEffect(() => {
+    async function fetchMe() {
+      let token = authToken || window.localStorage.getItem('falconbroom_access_token')
+      if (!token) {
+        // try to refresh via httpOnly cookie
+        try {
+          const rres = await fetch(`${BACKEND}/refresh`, { method: 'POST', credentials: 'include' })
+          if (rres.ok) {
+            const jr = await rres.json()
+            token = jr.access_token
+            saveToken(token)
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+      if (!token) return
+      try {
+        const res = await authFetch(`${BACKEND}/me`, { headers: {} })
+        if (!res.ok) {
+          setAccountUser(null)
+          return
+        }
+        const j = await res.json()
+        setAccountUser(j)
+        setTeamName(j.team_name || '')
+        setTeamMembers(j.team_members || [])
+      } catch (e) {
+        // ignore
+      }
+    }
+    fetchMe()
+  }, [authToken])
+
+  // unauthenticated view (rendered inside main return to keep hooks order stable)
+  const unauthView = !accountUser ? (
+    <div className={`auth-root-wrap`}>
+      <div className="toasts-root" aria-live="polite">
+        {toasts.map((t) => (
+          <div key={t.id} className={`toast toast-${t.tone || 'info'}`}>
+            <div className="toast-left"><span className="toast-icon" aria-hidden>{t.tone === 'success' ? '✔' : t.tone === 'error' ? '✖' : t.tone === 'warn' ? '⚠' : 'ℹ'}</span></div>
+            <div className="toast-body">{t.message}</div>
+            <button className="toast-close" aria-label="Dismiss" onClick={() => removeToast(t.id)}>✕</button>
+            <div className="toast-progress" style={{animationDuration: `${t.ttl || 4200}ms`}} />
+          </div>
+        ))}
+      </div>
+
+      <div className="auth-root" style={{display:'flex',justifyContent:'center',alignItems:'center',minHeight:'60vh',padding:24}}>
+        <div style={{maxWidth:720,display:'flex',gap:24,alignItems:'flex-start',width:'100%'}}>
+          <div className="card" style={{flex:1}}>
+            <div className="card-header"><h2>Welcome back</h2><p>Log in to access your team, uploads, and recipes.</p></div>
+            <div style={{padding:12}}>
+              <label>Username or email</label>
+              <input value={loginIdentity} onChange={(e)=>setLoginIdentity(e.target.value)} placeholder="username or email" />
+              <label style={{marginTop:8}}>Password</label>
+              <input type="password" value={loginPassword} onChange={(e)=>setLoginPassword(e.target.value)} placeholder="password" />
+              <div style={{marginTop:12,display:'flex',gap:8}}>
+                <button className="primary" onClick={doLogin}>Log in</button>
+                <button onClick={()=>{ setLoginIdentity(''); setLoginPassword('') }}>Clear</button>
+              </div>
+              <div style={{marginTop:12,color:'var(--muted)'}}>If you don't have an account, create one below.</div>
+            </div>
+          </div>
+          <div className="card" style={{flex:1}}>
+            <div className="card-header"><h2>Create account</h2><p>Sign up to save your work and invite teammates.</p></div>
+            <div style={{padding:12}}>
+              <label>Username</label>
+              <input value={signupUsername} onChange={(e)=>setSignupUsername(e.target.value)} placeholder="username" />
+              <label style={{marginTop:8}}>Email</label>
+              <input value={signupEmail} onChange={(e)=>setSignupEmail(e.target.value)} placeholder="you@example.com" />
+              <label style={{marginTop:8}}>Password</label>
+              <input type="password" value={signupPassword} onChange={(e)=>setSignupPassword(e.target.value)} placeholder="password" />
+              <div style={{marginTop:12,display:'flex',gap:8}}>
+                <button className="primary" onClick={doSignup}>Create account</button>
+                <button onClick={()=>{ setSignupUsername(''); setSignupEmail(''); setSignupPassword('') }}>Clear</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  ) : null
+  async function fetchSharedUploads() {
+    try {
+      const res = await fetch(`${BACKEND}/uploads/shared`)
+      if (!res.ok) return
+      const j = await res.json()
+      setSharedUploads(j.uploads || [])
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  async function inviteTeamMember() {
+    if (!newMemberEmail || !newMemberEmail.includes('@')) { addToast('Enter a valid email', 'warn'); return }
+    try {
+      const res = await authFetch(`${BACKEND}/team/invite`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: newMemberEmail, team_name: teamName }) })
+      if (!res.ok) { const t = await res.text(); addToast('Invite failed: ' + t, 'error'); return }
+      addToast('Invite sent', 'success')
+      setTeamMembers((s) => [...(s || []), newMemberEmail])
+      setNewMemberEmail('')
+    } catch (e) { addToast('Invite error: ' + e.message, 'error') }
+  }
+
+  async function fetchTeamInvites() {
+    try {
+      const res = await authFetch(`${BACKEND}/team/invites`, { method: 'GET' })
+      if (!res.ok) return
+      const j = await res.json()
+      setPendingInvites(j.invites || [])
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  async function fetchTeamMembers() {
+    try {
+      const res = await authFetch(`${BACKEND}/team/members`, { method: 'GET' })
+      if (!res.ok) return
+      const j = await res.json()
+      setTeamMemberObjects(j.members || [])
+      setTeamName(j.team_name || teamName)
+    } catch (e) {}
+  }
+
+  async function adminRevokeInvite(inviteId) {
+    try {
+      if (!window.confirm('Revoke this invite?')) return
+      const res = await authFetch(`${BACKEND}/team/invites/${encodeURIComponent(inviteId)}`, { method: 'DELETE' })
+      if (!res.ok) { addToast('Revoke failed', 'error'); return }
+      addToast('Invite revoked', 'info')
+      await fetchTeamInvites()
+    } catch (e) { addToast('Revoke error: ' + e.message, 'error') }
+  }
+
+  async function changeMemberRole(email, role) {
+    try {
+      const res = await authFetch(`${BACKEND}/team/members`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'update_role', email, role }) })
+      if (!res.ok) { addToast('Role update failed', 'error'); return }
+      addToast('Role updated', 'success')
+      await fetchTeamMembers()
+    } catch (e) { addToast('Role update error: ' + e.message, 'error') }
+  }
+
+  async function transferOwnership(email) {
+    try {
+      if (!window.confirm(`Transfer ownership to ${email}? This will make them the team owner.`)) return
+      const res = await authFetch(`${BACKEND}/team/owners`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'transfer', email }) })
+      if (!res.ok) { const t = await res.text(); addToast('Transfer failed: ' + t, 'error'); return }
+      addToast('Ownership transferred', 'success')
+      await fetchTeamMembers()
+      await fetchTeamInvites()
+    } catch (e) { addToast('Transfer error: ' + e.message, 'error') }
+  }
+
+  async function acceptInvite() {
+    if (!inviteToken) { addToast('Enter invite token', 'warn'); return }
+    try {
+      const res = await fetch(`${BACKEND}/team/accept`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: inviteToken, username: acceptUsername || undefined, password: acceptPasswordLocal || undefined }), credentials: 'include' })
+      if (!res.ok) { const t = await res.text(); addToast('Accept failed: ' + t, 'error'); return }
+      const j = await res.json()
+      if (j.access_token) saveToken(j.access_token)
+      addToast('Invite accepted', 'success')
+      setInviteToken(''); setAcceptUsername(''); setAcceptPasswordLocal('')
+      // refresh user info
+      try { const mres = await authFetch(`${BACKEND}/me`, { headers: {} }); if (mres.ok) { const mj = await mres.json(); setAccountUser(mj); setTeamName(mj.team_name || ''); setTeamMembers(mj.team_members || []) } } catch(e){}
+    } catch (e) { addToast('Accept error: ' + e.message, 'error') }
+  }
+
+  async function removeTeamMember(email) {
+    try {
+      // call server-side removal (owner endpoint) if authenticated
+      const token = authToken || window.localStorage.getItem('falconbroom_access_token')
+      if (token) {
+        const res = await authFetch(`${BACKEND}/team/members`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'remove', email }) })
+        if (!res.ok) { addToast('Remove failed', 'error'); return }
+        addToast('Removed ' + email, 'info')
+        await fetchTeamMembers()
+        await fetchTeamInvites()
+        return
+      }
+      const next = (teamMembers || []).filter(x => x !== email)
+      setTeamMembers(next)
+      await saveAccountUpdates()
+      addToast('Removed ' + email, 'info')
+    } catch (e) { addToast('Remove failed: ' + e.message, 'error') }
+  }
+
+  async function toggleShare(upload, share) {
+    try {
+      const res = await authFetch(`${BACKEND}/uploads/${encodeURIComponent(upload.name)}/share`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ shared: !!share }) })
+      if (!res.ok) { const t = await res.text(); addToast('Share failed: ' + t, 'error'); return }
+      addToast((share ? 'Shared' : 'Unshared') + ' ' + upload.name, 'success')
+      await fetchSharedUploads()
+      await fetchUploads()
+    } catch (e) { addToast('Share error: ' + e.message, 'error') }
+  }
+
+  // Open WebSocket when Team tab is active for live updates
+  useEffect(() => {
+    let ws = null
+    if (activeTab === 'team') {
+      fetchTeamInvites()
+      fetchTeamMembers()
+      try {
+        const wsUrl = (BACKEND || '').replace(/^http/, 'ws') + '/ws/shared'
+        ws = new WebSocket(wsUrl)
+        ws.onopen = () => {
+          setWsConnected(true)
+          // request initial state via server-initiated init message
+        }
+        ws.onmessage = (ev) => {
+          try {
+            const msg = JSON.parse(ev.data)
+            if (msg.type === 'init' && Array.isArray(msg.uploads)) {
+              setSharedUploads(msg.uploads)
+            } else if (msg.type === 'shared_changed' || msg.type === 'uploads_changed') {
+              // refresh lists when server indicates a change
+              fetchSharedUploads()
+              fetchUploads()
+            }
+          } catch (e) {
+            // ignore parse errors
+          }
+        }
+        ws.onclose = () => { setWsConnected(false) }
+        ws.onerror = () => { setWsConnected(false) }
+      } catch (e) {
+        setWsConnected(false)
+      }
+    }
+    return () => { try { if (ws) ws.close() } catch (e) {} }
+  }, [activeTab])
+
+  function saveToken(access) {
+    setAuthToken(access)
+    try { window.localStorage.setItem('falconbroom_access_token', access) } catch {}
+  }
+
+  // use global authFetch from ./utils/authFetch
+
+  async function doSignup() {
+    try {
+      const res = await fetch(`${BACKEND}/signup`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: signupUsername, email: signupEmail, password: signupPassword }) })
+      if (!res.ok) {
+        const txt = await res.text()
+        addToast('Signup failed: ' + txt, 'error')
+        return
+      }
+      addToast('Account created — please log in', 'success')
+      setSignupUsername(''); setSignupEmail(''); setSignupPassword('')
+    } catch (e) { addToast('Signup error: ' + e.message, 'error') }
+  }
+
+  async function doLogin() {
+    try {
+      const payload = loginIdentity.includes('@') ? { email: loginIdentity, password: loginPassword, persistent: true } : { username: loginIdentity, password: loginPassword, persistent: true }
+      const res = await fetch(`${BACKEND}/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), credentials: 'include' })
+      if (!res.ok) {
+        addToast('Login failed', 'error')
+        return
+      }
+      const j = await res.json()
+      saveToken(j.access_token)
+      setLoginIdentity(''); setLoginPassword('')
+      addToast('Logged in', 'success')
+    } catch (e) { addToast('Login error: ' + e.message, 'error') }
+  }
+
+  async function doLogout() {
+    try {
+      const token = authToken || window.localStorage.getItem('falconbroom_access_token')
+      if (token) await authFetch(`${BACKEND}/logout`, { method: 'POST' })
+    } catch (e) { /* ignore */ }
+    setAccountUser(null); setAuthToken(''); try { window.localStorage.removeItem('falconbroom_access_token') } catch {}
+    // refresh cookie cleared by server during logout
+    addToast('Logged out', 'info')
+  }
+
+  async function saveAccountUpdates() {
+    try {
+      const token = authToken || window.localStorage.getItem('falconbroom_access_token')
+      if (!token) { addToast('Not authenticated', 'error'); return }
+      const body = { email: accountUser?.email || '', team_name: teamName, team_members: teamMembers }
+      const res = await authFetch(`${BACKEND}/account`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      if (!res.ok) { addToast('Update failed', 'error'); return }
+      const j = await res.json()
+      setAccountUser(j)
+      addToast('Account updated', 'success')
+    } catch (e) { addToast('Update error: ' + e.message, 'error') }
+  }
+
+  async function doAccountExport() {
+    try {
+      const token = authToken || window.localStorage.getItem('falconbroom_access_token')
+      if (!token) { addToast('Not authenticated', 'error'); return }
+      const res = await authFetch(`${BACKEND}/account/export`, { method: 'POST' })
+      if (!res.ok) { addToast('Export request failed', 'error'); return }
+      const j = await res.json()
+      addToast('Export enqueued: ' + j.job_id, 'info')
+    } catch (e) { addToast('Export error: ' + e.message, 'error') }
+  }
+
+  async function doAccountDelete() {
+    try {
+      const token = authToken || window.localStorage.getItem('falconbroom_access_token')
+      if (!token) { addToast('Not authenticated', 'error'); return }
+      const res = await authFetch(`${BACKEND}/account/delete`, { method: 'POST', headers: { 'Content-Type':'application/json' }, body: JSON.stringify({ password: deletePassword, confirm_text: deleteConfirmTextLocal }) })
+      if (!res.ok) { const t = await res.text(); addToast('Delete failed: ' + t, 'error'); return }
+      addToast('Account deletion requested', 'info')
+      doLogout()
+    } catch (e) { addToast('Delete error: ' + e.message, 'error') }
   }
 
   async function doProfile() {
@@ -1221,6 +1577,122 @@ export default function App() {
       setExplainLoading(false)
     }
   }
+
+  async function persistConsent(consents) {
+    try {
+      const payload = { user_id: userId, consents, user_agent: navigator.userAgent }
+      const res = await fetch(`${BACKEND}/consent`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+      if (res.ok) {
+        // refresh consent history
+        await fetchConsentHistory()
+      }
+    } catch (e) {
+      console.warn('Failed to persist consent', e)
+    }
+  }
+
+  async function fetchConsentHistory() {
+    try {
+      const res = await fetch(`${BACKEND}/consent?user_id=${encodeURIComponent(userId)}`)
+      if (!res.ok) return
+      const j = await res.json()
+      setConsentHistory(j.consents || [])
+    } catch (e) { console.warn('Failed to fetch consent history', e) }
+  }
+
+  function acceptAllConsents() {
+    const cons = { essential: true, analytics: true, marketing: true, personalized_ads: true }
+    setConsent(cons)
+    try { window.localStorage.setItem('falconbroom_consent', JSON.stringify(cons)) } catch {}
+    persistConsent(cons)
+  }
+
+  function rejectNonEssential() {
+    const cons = { essential: true, analytics: false, marketing: false, personalized_ads: false }
+    setConsent(cons)
+    try { window.localStorage.setItem('falconbroom_consent', JSON.stringify(cons)) } catch {}
+    persistConsent(cons)
+  }
+
+  // Dynamic analytics loader — loads/unloads analytics scripts based on consent
+  function loadAnalyticsScript() {
+    if (!consent || !consent.analytics) return
+    if (!analyticsId) return
+    if (document.getElementById('analytics-script')) return
+    // Dynamic loader: analytics provider ID must be supplied in Settings.
+    const s = document.createElement('script')
+    s.id = 'analytics-script'
+    s.async = true
+    s.src = `https://www.googletagmanager.com/gtag/js?id=${encodeURIComponent(analyticsId)}`
+    s.onload = () => {
+      try {
+        window.dataLayer = window.dataLayer || []
+        function gtag(){window.dataLayer.push(arguments)}
+        window.gtag = gtag
+        gtag('js', new Date())
+        gtag('config', analyticsId)
+        addToast('Analytics enabled', 'info')
+      } catch (e) { console.warn(e) }
+    }
+    document.head.appendChild(s)
+  }
+
+  function unloadAnalyticsScript() {
+    const s = document.getElementById('analytics-script')
+    if (s) s.remove()
+    if (window.gtag) try { delete window.gtag } catch(e){}
+    addToast('Analytics disabled', 'info')
+  }
+
+  // Initialize cookieconsent CMP when available
+  React.useEffect(() => {
+    // load/unload analytics based on consent state
+    if (consent && consent.analytics) {
+      loadAnalyticsScript()
+    } else {
+      unloadAnalyticsScript()
+    }
+  }, [consent])
+
+  React.useEffect(() => {
+    // Initialize Osano CookieConsent if present and not yet initialized
+    try {
+      if (window.cookieconsent && !window._falconbroom_cookieconsent_init) {
+        window.cookieconsent.initialise({
+          palette: { popup: { background: '#2f2f2f' }, button: { background: '#f1d600' } },
+          theme: 'classic',
+          position: 'bottom',
+          content: {
+            message: 'FalconBroom uses cookies to improve your experience.',
+            dismiss: 'Accept all',
+            deny: 'Reject non-essential',
+            link: 'Manage',
+            href: '#',
+          },
+          // on initialisation, sync state with our consent handlers
+          onInitialise: function(status) {
+            // status is 'allow' or 'deny'
+            window._falconbroom_cookieconsent_init = true
+            if (status === 'allow') acceptAllConsents()
+            else rejectNonEssential()
+          },
+          onStatusChange: function(status) {
+            if (status === 'allow') acceptAllConsents()
+            else rejectNonEssential()
+          },
+          onRevokeChoice: function() {
+            // user revoked consent; treat as revoke
+            rejectNonEssential()
+          }
+        })
+      }
+    } catch (e) { console.warn('cookieconsent init failed', e) }
+  }, [])
+
+  // Persist analyticsId when changed
+  React.useEffect(() => {
+    try { window.localStorage.setItem('falconbroom_analytics_id', analyticsId || '') } catch {}
+  }, [analyticsId])
 
   async function doApply() {
     setApplyLoading(true)
@@ -2228,6 +2700,270 @@ export default function App() {
       )
     }
 
+    if (activeTab === "team") {
+      return (
+        <div className="tab-stack tab-panel">
+          <Card eyebrow="Team" title="Team collaboration" subtitle="Invite members and share files with your team">
+            <div style={{display:'grid',gap:12}}>
+              <div>
+                <h4 style={{margin:0}}>{teamName || 'Your team'}</h4>
+                <div style={{color:'var(--muted)'}}>Members</div>
+                <div style={{marginTop:8}}>
+                  {((teamMemberObjects && teamMemberObjects.length) || (teamMembers && teamMembers.length)) === 0 && <div className="empty-state">No team members yet.</div>}
+                  {(teamMemberObjects && teamMemberObjects.length ? teamMemberObjects : (teamMembers || [])).map((m) => {
+                    const email = m.email || m
+                    const role = (m.role || (teamMemberObjects && m.role) || 'member')
+                    return (
+                      <div key={email} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'6px 0',borderBottom:'1px solid rgba(255,255,255,0.03)'}}>
+                        <div>
+                          <div>{m.username || email}</div>
+                          <small style={{color:'var(--muted)'}}>Role: {role}</small>
+                        </div>
+                        <div style={{display:'flex',gap:8}}>
+                          {accountUser && accountUser.team_name && <>
+                            <select value={role} onChange={(e) => changeMemberRole(email, e.target.value)}>
+                              <option value="member">member</option>
+                              <option value="admin">admin</option>
+                              <option value="guest">guest</option>
+                            </select>
+                            <button onClick={() => removeTeamMember(email)}>Remove</button>
+                            {accountUser.team_owner && accountUser.email !== email && (
+                              <button onClick={() => transferOwnership(email)}>Transfer ownership</button>
+                            )}
+                          </>}
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+
+              <div>
+                <h5>Invite member</h5>
+                <div style={{display:'flex',gap:8}}>
+                  <input value={newMemberEmail} onChange={(e)=>setNewMemberEmail(e.target.value)} placeholder="email@example.com" />
+                  <button className="primary" onClick={inviteTeamMember}>Send invite</button>
+                </div>
+                <div style={{marginTop:12}}>
+                  <h6>Accept invite (token)</h6>
+                  <div style={{display:'flex',gap:8}}>
+                    <input value={inviteToken} onChange={(e)=>setInviteToken(e.target.value)} placeholder="invite token" />
+                    <input value={acceptUsername} onChange={(e)=>setAcceptUsername(e.target.value)} placeholder="username (if creating)" />
+                    <input type="password" value={acceptPasswordLocal} onChange={(e)=>setAcceptPasswordLocal(e.target.value)} placeholder="password (if creating)" />
+                    <button onClick={acceptInvite}>Accept</button>
+                  </div>
+                </div>
+              </div>
+
+              <div>
+                <h5>Pending invites</h5>
+                <div style={{marginTop:8}}>
+                  {(!pendingInvites || pendingInvites.length === 0) && <div className="empty-state">No pending invites.</div>}
+                  {(pendingInvites || []).map((inv) => (
+                    <div key={inv.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'6px 0',borderBottom:'1px solid rgba(255,255,255,0.03)'}}>
+                      <div>
+                        <div>{inv.email} {inv.inviter_username ? <small style={{color:'var(--muted)', marginLeft:8}}>invited by {inv.inviter_username}</small> : null}</div>
+                        <small style={{color:'var(--muted)'}}>
+                          Role: {inv.role || 'member'} • Created: {inv.created_at ? new Date(inv.created_at).toLocaleString() : ''}
+                          {inv.token_payload && inv.token_payload.exp ? (
+                            <span> • Expires: {new Date(inv.token_payload.exp * 1000).toLocaleString()}</span>
+                          ) : null}
+                        </small>
+                      </div>
+                      <div style={{display:'flex',gap:8}}>
+                        {accountUser && accountUser.team_name && inv.can_manage && <button onClick={() => adminRevokeInvite(inv.id)}>Revoke</button>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <h5>Shared files</h5>
+                <div style={{marginTop:8}}>
+                  {sharedUploads.length === 0 && <div className="empty-state">No files shared with your team.</div>}
+                  {sharedUploads.map((s) => (
+                    <div key={s.path} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'6px 0',borderBottom:'1px solid rgba(255,255,255,0.03)'}}>
+                      <div>
+                        <div><strong>{s.name}</strong></div>
+                        <small style={{color:'var(--muted)'}}>Shared by {s.shared_by || 'unknown'} • {s.shared_at ? new Date(s.shared_at).toLocaleString() : ''}</small>
+                      </div>
+                      <div style={{display:'flex',gap:8}}>
+                        <button onClick={() => { if(window.confirm('Unshare this file?')) toggleShare({name: s.name}, false) }}>Unshare</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <h5>All uploads</h5>
+                <div style={{maxHeight:220, overflow:'auto', marginTop:8}}>
+                  {(uploadsList || []).map((u) => {
+                    const isShared = (sharedUploads || []).some(s => s.name === u.name)
+                    return (
+                      <div key={u.path} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'6px 0',borderBottom:'1px solid rgba(255,255,255,0.03)'}}>
+                        <div style={{flex:'1 1 0'}}>
+                          <div><strong>{u.name}</strong></div>
+                          <small style={{color:'var(--muted)'}}>{u.path}</small>
+                        </div>
+                        <div style={{display:'flex',gap:8}}>
+                          <button onClick={() => toggleShare(u, !isShared)}>{isShared ? 'Unshare' : 'Share'}</button>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              </div>
+            </div>
+          </Card>
+        </div>
+      )
+    }
+
+    if (activeTab === "settings") {
+      return (
+        <div className="tab-stack tab-panel">
+          <Card eyebrow="Account" title="Settings" subtitle="Manage your account and privacy preferences">
+            <div style={{display:'grid',gridTemplateColumns:'1fr',gap:12}}>
+              <div>
+                <h4>Account</h4>
+                {!accountUser ? (
+                  <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
+                    <div>
+                      <h5>Create account</h5>
+                      <label style={{display:'flex',flexDirection:'column',gap:6}}>
+                        <span style={{fontSize:12,color:'var(--muted)'}}>Username</span>
+                        <input value={signupUsername} onChange={(e)=>setSignupUsername(e.target.value)} placeholder="username" />
+                      </label>
+                      <label style={{display:'flex',flexDirection:'column',gap:6,marginTop:8}}>
+                        <span style={{fontSize:12,color:'var(--muted)'}}>Email (optional)</span>
+                        <input value={signupEmail} onChange={(e)=>setSignupEmail(e.target.value)} placeholder="you@example.com" />
+                      </label>
+                      <label style={{display:'flex',flexDirection:'column',gap:6,marginTop:8}}>
+                        <span style={{fontSize:12,color:'var(--muted)'}}>Password</span>
+                        <input type="password" value={signupPassword} onChange={(e)=>setSignupPassword(e.target.value)} placeholder="choose a password" />
+                      </label>
+                      <div style={{marginTop:10}}>
+                        <button className="primary" onClick={doSignup}>Create account</button>
+                      </div>
+                    </div>
+                    <div>
+                      <h5>Sign in</h5>
+                      <label style={{display:'flex',flexDirection:'column',gap:6}}>
+                        <span style={{fontSize:12,color:'var(--muted)'}}>Username or email</span>
+                        <input value={loginIdentity} onChange={(e)=>setLoginIdentity(e.target.value)} placeholder="username or email" />
+                      </label>
+                      <label style={{display:'flex',flexDirection:'column',gap:6,marginTop:8}}>
+                        <span style={{fontSize:12,color:'var(--muted)'}}>Password</span>
+                        <input type="password" value={loginPassword} onChange={(e)=>setLoginPassword(e.target.value)} placeholder="password" />
+                      </label>
+                      <div style={{marginTop:10}}>
+                        <button className="primary" onClick={doLogin}>Sign in</button>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div>
+                    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                      <div>
+                        <strong>{accountUser.username}</strong>
+                        <div style={{color:'var(--muted)'}}>Member since {new Date(accountUser.created_at).toLocaleDateString()}</div>
+                      </div>
+                      <div>
+                        <button onClick={doLogout}>Logout</button>
+                      </div>
+                    </div>
+                    <div style={{marginTop:12}}>
+                      <label style={{display:'flex',flexDirection:'column',gap:6}}>
+                        <span style={{fontSize:12,color:'var(--muted)'}}>Email (optional)</span>
+                        <input value={accountUser.email||''} onChange={(e)=>setAccountUser({...accountUser,email:e.target.value})} placeholder="you@example.com" />
+                      </label>
+                      <div style={{marginTop:8}}>
+                        <button className="primary" onClick={saveAccountUpdates}>Save account</button>
+                        <button style={{marginLeft:8}} onClick={doAccountExport}>Export data</button>
+                        <button style={{marginLeft:8}} onClick={doLogout}>Logout</button>
+                      </div>
+                      <div style={{marginTop:12,borderTop:'1px dashed rgba(255,255,255,0.04)',paddingTop:12}}>
+                        <h5 style={{margin:0}}>Danger zone</h5>
+                        <div style={{marginTop:8}}>
+                          <label style={{display:'flex',flexDirection:'column',gap:6}}>
+                            <span style={{fontSize:12,color:'var(--muted)'}}>Confirm password</span>
+                            <input type="password" value={deletePassword} onChange={(e)=>setDeletePassword(e.target.value)} />
+                          </label>
+                          <label style={{display:'flex',flexDirection:'column',gap:6,marginTop:8}}>
+                            <span style={{fontSize:12,color:'var(--muted)'}}>Type exactly: DELETE MY ACCOUNT</span>
+                            <input value={deleteConfirmTextLocal} onChange={(e)=>setDeleteConfirmTextLocal(e.target.value)} />
+                          </label>
+                          <div style={{marginTop:8}}>
+                            <button onClick={doAccountDelete} style={{background:'#a33',color:'#fff'}}>Delete account</button>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div style={{marginTop:18}}>
+                  <h5>Team settings</h5>
+                  <label style={{display:'flex',flexDirection:'column',gap:6}}>
+                    <span style={{fontSize:12,color:'var(--muted)'}}>Team name</span>
+                    <input value={teamName} onChange={(e)=>setTeamName(e.target.value)} placeholder="Your team" />
+                  </label>
+                  <div style={{marginTop:8}}>
+                    <div style={{display:'flex',gap:8}}>
+                      <input value={newMemberEmail} onChange={(e)=>setNewMemberEmail(e.target.value)} placeholder="invite member email" />
+                      <button onClick={()=>{ if(newMemberEmail && !teamMembers.includes(newMemberEmail)){ setTeamMembers([...teamMembers,newMemberEmail]); setNewMemberEmail('') } }}>Add</button>
+                    </div>
+                    <div style={{marginTop:8}}>
+                      {teamMembers.length === 0 ? <div className="empty-state">No team members</div> : (
+                        teamMembers.map((m)=> (
+                          <div key={m} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'6px 0'}}>
+                            <div>{m}</div>
+                            <button onClick={()=>setTeamMembers(teamMembers.filter(x=>x!==m))}>Remove</button>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                    <div style={{marginTop:10}}>
+                      <button className="primary" onClick={saveAccountUpdates}>Save team</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div>
+                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                  <h4 style={{margin:0}}>Consent history</h4>
+                  <div>
+                    <button onClick={async () => { if (!showConsentHistory) await fetchConsentHistory(); setShowConsentHistory(s => !s); }}>{showConsentHistory ? 'Hide' : 'Show'}</button>
+                  </div>
+                </div>
+                {showConsentHistory && (
+                  <div style={{maxHeight:320,overflow:'auto',marginTop:8}}>
+                    {!consentHistory ? (
+                      <div className="empty-state">No consent history loaded. <button onClick={()=>fetchConsentHistory()}>Load</button></div>
+                    ) : consentHistory.length === 0 ? (
+                      <div className="empty-state">No consent records</div>
+                    ) : (
+                      consentHistory.map((c) => (
+                        <div key={c.id} style={{borderBottom:'1px solid rgba(255,255,255,0.03)',padding:'8px 0'}}>
+                          <div style={{display:'flex',justifyContent:'space-between'}}>
+                            <div><strong>{c.id}</strong></div>
+                            <div><small style={{color:'var(--muted)'}}>{new Date(c.timestamp).toLocaleString()}</small></div>
+                          </div>
+                          <div style={{marginTop:6}}><pre style={{fontFamily:'monospace',margin:0}}>{JSON.stringify(c.consents,null,2)}</pre></div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </Card>
+        </div>
+      )
+    }
+
     return (
       <div className="tab-stack tab-panel">
         <div className="insight-grid">
@@ -2259,7 +2995,23 @@ export default function App() {
           <h1 className="app-title">FalconBroom</h1>
         </div>
       </header>
+      {/* CMP banner */}
+      {!consent && (
+        <div className="cmp-banner card" style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:12}}>
+          <div>
+            <strong>FalconBroom uses cookies</strong>
+            <div style={{color:'var(--muted)'}}>We use essential cookies and optional analytics/marketing cookies to improve the product. You can manage preferences in Settings.</div>
+          </div>
+          <div style={{display:'flex',gap:8}}>
+            <button className="primary" onClick={() => { acceptAllConsents() }}>Accept all</button>
+            <button onClick={() => { rejectNonEssential() }}>Reject non-essential</button>
+            <button onClick={() => setActiveTab('settings')}>Manage</button>
+          </div>
+        </div>
+      )}
+      
       {/* header styles moved to styles.css */}
+      {unauthView}
       {/* Toasts container */}
       <div className="toasts-root" aria-live="polite">
         {toasts.map((t) => (

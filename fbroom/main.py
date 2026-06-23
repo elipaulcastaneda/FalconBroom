@@ -1,10 +1,14 @@
 from pathlib import Path
 from uuid import uuid4
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import shutil
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, Request, Response, WebSocket, WebSocketDisconnect
+import os
+from celery import Celery
+import threading
+import time
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -29,6 +33,9 @@ from .ingest import convert_uploaded_file
 from .ingest import _google_drive_access_token
 from .recipe_schema import Recipe
 from typing import Optional, Any, List
+import jwt
+import smtplib
+from email.message import EmailMessage
 from .workflow_rules import (
     explain_recipe,
     infer_columns_from_text,
@@ -41,6 +48,10 @@ import traceback
 # pydantic models used below
 
 app = FastAPI(title="FalconBroom Prototype API")
+
+# Application-wide JWT settings (cache a secret so tokens remain verifiable across calls)
+JWT_SECRET = os.environ.get("JWT_SECRET") or uuid4().hex
+JWT_ALGO = os.environ.get("JWT_ALGO") or "HS256"
 
 # Allow the Vite dev server and Tauri webview during local development.
 app.add_middleware(
@@ -62,6 +73,29 @@ OUTPUTS_DIR = Path("data") / "outputs"
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 INSPECTIONS_DIR = Path("data") / "inspections"
 INSPECTIONS_DIR.mkdir(parents=True, exist_ok=True)
+JOBS_DIR = Path("data") / "jobs"
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# Connected websockets for broadcasting shared-upload updates
+_connected_ws = set()
+
+async def _broadcast_shared_update_message(message: dict):
+    import asyncio
+    to_remove = []
+    text = json.dumps(message, default=str)
+    for ws in list(_connected_ws):
+        try:
+            await ws.send_text(text)
+        except Exception:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+            to_remove.append(ws)
+    for ws in to_remove:
+        _connected_ws.discard(ws)
+
 
 
 class SourceSpec(BaseModel):
@@ -143,6 +177,12 @@ async def upload_file(file: UploadFile = File(...)):
 
         target.write_bytes(contents)
         conversion = convert_uploaded_file(target, UPLOAD_DIR)
+        # notify websocket clients of updated uploads list
+        try:
+            import asyncio
+            asyncio.create_task(_broadcast_shared_update_message({"type": "uploads_changed"}))
+        except Exception:
+            pass
         return {
             "path": conversion["path"],
             "normalized_path": conversion["normalized_path"],
@@ -175,7 +215,7 @@ def inspect(spec: SourceInspectSpec):
         # persist full inspection JSON for auditing and later retrieval
         insp_id = f"inspection_{uuid4().hex[:8]}"
         dest = INSPECTIONS_DIR / f"{insp_id}.json"
-        payload = {"id": insp_id, "created_at": datetime.utcnow().isoformat() + "Z", "path": spec.path, "inspection": inspection}
+        payload = {"id": insp_id, "created_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), "path": spec.path, "inspection": inspection}
         dest.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
         return {"inspection": inspection, "dump_id": insp_id, "dump_path": str(dest)}
     except Exception as e:
@@ -292,7 +332,7 @@ class ExplainedStepResponse(BaseModel):
                 "regex_replace": {
                     "summary": "Regex replace",
                     "value": {
-                        "step": {"action": "regex_replace", "column": "desc", "params": {"pattern": "\\\d+", "replace": "#"}},
+                        "step": {"action": "regex_replace", "column": "desc", "params": {"pattern": r"\d+", "replace": "#"}},
                         "reason": "remove numeric tokens from descriptions",
                         "confidence": 0.7,
                         "preview": {"column": "desc", "before": ["item 123","foo 45"], "after": ["item #","foo #"]},
@@ -366,6 +406,52 @@ class ExplanationsLogSpec(BaseModel):
     source_path: str
     recipe_id: str
     explanations: list
+
+
+class ConsentSpec(BaseModel):
+    user_id: Optional[str] = None
+    consents: dict
+    user_agent: Optional[str] = None
+    ip: Optional[str] = None
+
+
+def _consent_audit(action: str, payload: dict):
+    """Append an audit entry for consent-related operations."""
+    try:
+        CONSENT_DIR = Path("data") / "consents"
+        CONSENT_DIR.mkdir(parents=True, exist_ok=True)
+        audit_file = CONSENT_DIR / "audit.log"
+        # redact any tokens from payload to avoid leaking secrets in logs
+        def _redact(d):
+            try:
+                if not isinstance(d, dict):
+                    return d
+                out = {}
+                for k, v in d.items():
+                    lk = k.lower() if isinstance(k, str) else k
+                    if lk in ("refresh_token", "access_token", "token"):
+                        out[k] = "<redacted>"
+                    else:
+                        out[k] = v
+                return out
+            except Exception:
+                return d
+
+        entry = {"action": action, "payload": _redact(payload or {}), "ts": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}
+        with open(audit_file, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+# Celery initialization: if CELERY_BROKER_URL is not set, enable eager mode
+CELERY_BROKER = os.getenv('CELERY_BROKER_URL')
+if CELERY_BROKER:
+    celery_app = Celery('fbroom_tasks', broker=CELERY_BROKER)
+else:
+    # run tasks eagerly (synchronous) when no broker configured — convenient for local dev/tests
+    celery_app = Celery('fbroom_tasks', broker='memory://')
+    celery_app.conf.task_always_eager = True
 
 
 
@@ -575,7 +661,7 @@ def save_recipe(spec: SaveRecipeSpec):
         payload = {
             "id": rid,
             "name": spec.name,
-            "created_at": datetime.utcnow().isoformat() + "Z",
+            "created_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),
             "status": "draft",
             "expected_columns": expected_columns,
             "recipe": spec.recipe.model_dump() if hasattr(spec.recipe, "model_dump") else spec.recipe.dict(),
@@ -751,7 +837,7 @@ def approve_recipe(rid: str):
         raise HTTPException(status_code=404, detail="Recipe not found")
     data = json.loads(p.read_text(encoding="utf-8"))
     data["status"] = "approved"
-    data["approved_at"] = datetime.utcnow().isoformat() + "Z"
+    data["approved_at"] = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
     p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     return {"id": rid, "status": "approved"}
 
@@ -801,7 +887,7 @@ def run_recipe(rid: str, export_format: str = "csv"):
     run_record = {
         "id": run_id,
         "recipe_id": rid,
-        "started_at": datetime.utcnow().isoformat() + "Z",
+        "started_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),
         "status": "running",
         "export_format": export_format,
     }
@@ -877,7 +963,7 @@ def run_recipe(rid: str, export_format: str = "csv"):
 
         # finalize run record
         run_record["status"] = "completed"
-        run_record["finished_at"] = datetime.utcnow().isoformat() + "Z"
+        run_record["finished_at"] = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
         run_record["output_path"] = exported
         if diagnostics:
             run_record["diagnostics"] = diagnostics
@@ -886,7 +972,7 @@ def run_recipe(rid: str, export_format: str = "csv"):
     except Exception as e:
         run_record["status"] = "failed"
         run_record["error"] = str(e)
-        run_record["finished_at"] = datetime.utcnow().isoformat() + "Z"
+        run_record["finished_at"] = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
         history_path.write_text(json.dumps(run_record, indent=2, ensure_ascii=False), encoding="utf-8")
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -918,7 +1004,7 @@ def rollback_snapshot(spec: SnapshotRollbackSpec):
         dest_path = OUTPUTS_DIR / dest_name
         shutil.copyfile(str(snap), str(dest_path))
 
-        record = {"rollback_snapshot": str(snap), "performed_at": datetime.utcnow().isoformat() + "Z", "rollback_path": str(dest_path)}
+        record = {"rollback_snapshot": str(snap), "performed_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), "rollback_path": str(dest_path)}
         out = HISTORY_DIR / f"rollback_snapshot_{uuid4().hex[:8]}.json"
         out.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
         return {"rollback": record}
@@ -1042,7 +1128,7 @@ def rollback_run(run_id: str):
     shutil.copyfile(output, dest)
     rollback_record = {
         "rollback_of": run_id,
-        "performed_at": datetime.utcnow().isoformat() + "Z",
+        "performed_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),
         "rollback_path": str(dest.resolve()),
     }
     rbpath = HISTORY_DIR / f"rollback_{run_id}.json"
@@ -1120,7 +1206,7 @@ def export_recipe_to_sheets(rid: str, sheet_name: str = "Sheet1"):
     record = {
         "id": export_id,
         "recipe_id": rid,
-        "requested_at": datetime.utcnow().isoformat() + "Z",
+        "requested_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),
         "output_path": output_path,
         "sheet_name": sheet_name,
     }
@@ -1694,6 +1780,12 @@ def delete_upload(payload: dict):
         if not resolved.exists():
             raise HTTPException(status_code=404, detail="File not found")
         resolved.unlink()
+        # notify websocket clients of updated uploads list
+        try:
+            import asyncio
+            asyncio.create_task(_broadcast_shared_update_message({"type": "uploads_changed", "deleted": str(resolved)}))
+        except Exception:
+            pass
         return {"deleted": str(resolved)}
     except HTTPException:
         raise
@@ -1773,7 +1865,7 @@ def persist_explanations(spec: ExplanationsLogSpec):
                 existing = {}
 
         hist = existing.get("explanations_history") or []
-        entry = {"recipe_id": spec.recipe_id, "timestamp": datetime.utcnow().isoformat() + "Z", "explanations": spec.explanations}
+        entry = {"recipe_id": spec.recipe_id, "timestamp": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), "explanations": spec.explanations}
         hist.insert(0, entry)
         # cap history length
         existing["explanations_history"] = hist[:20]
@@ -1783,6 +1875,1628 @@ def persist_explanations(spec: ExplanationsLogSpec):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/consent/export-job")
+def enqueue_export_job(user_id: Optional[str] = None):
+    try:
+        job = {"type": "export_consents", "user_id": user_id, "status": "pending", "created_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}
+        jid = _write_job(job)
+        _consent_audit("enqueue_export", {"job_id": jid, "user_id": user_id})
+        # dispatch celery task
+        try:
+            celery_process_export_job.delay(jid)
+        except Exception:
+            try:
+                celery_process_export_job(jid)
+            except Exception:
+                pass
+        return {"job_id": jid}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/consent/delete-job")
+def enqueue_delete_job(user_id: Optional[str] = None):
+    try:
+        if not user_id:
+            raise HTTPException(status_code=400, detail="Missing user_id")
+        job = {"type": "delete_consents", "user_id": user_id, "status": "pending", "created_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}
+        jid = _write_job(job)
+        _consent_audit("enqueue_delete", {"job_id": jid, "user_id": user_id})
+        try:
+            celery_process_delete_job.delay(jid)
+        except Exception:
+            try:
+                celery_process_delete_job(jid)
+            except Exception:
+                pass
+        return {"job_id": jid}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/jobs/{job_id}")
+def get_job_status(job_id: str, download: bool = False):
+    try:
+        jf = JOBS_DIR / f"{job_id}.json"
+        if not jf.exists():
+            raise HTTPException(status_code=404, detail="Job not found")
+        job = json.loads(jf.read_text(encoding="utf-8"))
+        if download:
+            res = job.get("result") or {}
+            export_path = res.get("export_path")
+            if export_path and Path(export_path).exists():
+                return FileResponse(export_path, filename=Path(export_path).name, media_type='application/json', headers={"Content-Disposition": f"attachment; filename=\"{Path(export_path).name}\""})
+        return job
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/consent")
+def record_consent(spec: ConsentSpec, request: Request):
+    try:
+        CONSENT_DIR = Path("data") / "consents"
+        CONSENT_DIR.mkdir(parents=True, exist_ok=True)
+        cid = f"consent_{uuid4().hex[:8]}"
+        # prefer explicitly provided IP, otherwise infer from request headers
+        ip = spec.ip or request.headers.get("x-forwarded-for") or (request.client.host if request.client else None)
+        ua = spec.user_agent or request.headers.get("user-agent")
+        payload = {
+            "id": cid,
+            "user_id": spec.user_id,
+            "consents": spec.consents,
+            "user_agent": ua,
+            "ip": ip,
+            "timestamp": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),
+        }
+        dest = CONSENT_DIR / f"{cid}.json"
+        dest.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        # audit
+        try:
+            _consent_audit("record_consent", {"id": cid, "user_id": spec.user_id, "ip": ip, "user_agent": ua})
+        except Exception:
+            pass
+        return {"ok": True, "id": cid}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/consent")
+def get_consents(user_id: Optional[str] = None):
+    try:
+        CONSENT_DIR = Path("data") / "consents"
+        out = []
+        if not CONSENT_DIR.exists():
+            return {"consents": []}
+        for p in sorted(CONSENT_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if user_id and data.get("user_id") != user_id:
+                    continue
+                out.append(data)
+            except Exception:
+                continue
+        return {"consents": out}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/consent/export")
+def export_consents(user_id: Optional[str] = None):
+    """Export consent receipts as a JSON attachment. If `user_id` is provided,
+    only exports receipts for that user, otherwise exports all receipts.
+    """
+    try:
+        CONSENT_DIR = Path("data") / "consents"
+        out = []
+        if not CONSENT_DIR.exists():
+            return {"consents": []}
+        for p in sorted(CONSENT_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if user_id and data.get("user_id") != user_id:
+                    continue
+                out.append(data)
+            except Exception:
+                continue
+        # return as inline JSON; clients can save the response
+        return {"consents": out}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/consent/{consent_id}")
+def delete_consent(consent_id: str):
+        """Delete a single consent receipt immediately. Also logs an audit entry."""
+        try:
+            CONSENT_DIR = Path("data") / "consents"
+            p = CONSENT_DIR / f"{consent_id}.json"
+            if not p.exists():
+                raise HTTPException(status_code=404, detail="Consent receipt not found")
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                data = None
+            p.unlink()
+            _consent_audit("delete_consent", {"id": consent_id, "user_id": data.get("user_id") if data else None})
+            return {"deleted": consent_id}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/consent")
+def delete_consents_by_user(user_id: Optional[str] = None):
+        """Delete all consent receipts for a given `user_id`. If no user_id provided,
+        returns 400. This endpoint can be used to withdraw consent and erase records.
+        """
+        try:
+            if not user_id:
+                raise HTTPException(status_code=400, detail="Missing user_id")
+            CONSENT_DIR = Path("data") / "consents"
+            if not CONSENT_DIR.exists():
+                return {"deleted": []}
+            deleted = []
+            for p in list(CONSENT_DIR.glob("*.json")):
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                    if data.get("user_id") == user_id:
+                        deleted.append(data.get("id") or p.stem)
+                        p.unlink()
+                except Exception:
+                    continue
+            return {"deleted": deleted}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+def _write_job(job: dict):
+    jid = job.get("id") or f"job_{uuid4().hex[:8]}"
+    job["id"] = jid
+    job_file = JOBS_DIR / f"{jid}.json"
+    job_file.write_text(json.dumps(job, indent=2, ensure_ascii=False), encoding="utf-8")
+    return jid
+
+
+def _update_job_status(jid: str, status: str, result: Optional[dict] = None):
+    job_file = JOBS_DIR / f"{jid}.json"
+    try:
+        job = json.loads(job_file.read_text(encoding="utf-8"))
+    except Exception:
+        job = {"id": jid}
+    job["status"] = status
+    if result is not None:
+        job["result"] = result
+    job["updated_at"] = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
+    job_file.write_text(json.dumps(job, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _process_export_job(job: dict):
+    jid = job.get("id")
+    user_id = job.get("user_id")
+    try:
+        # gather consents matching user_id (or all)
+        CONSENT_DIR = Path("data") / "consents"
+        out = []
+        if CONSENT_DIR.exists():
+            for p in sorted(CONSENT_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+                try:
+                    data = json.loads(p.read_text(encoding="utf-8"))
+                    if user_id and data.get("user_id") != user_id:
+                        continue
+                    out.append(data)
+                except Exception:
+                    continue
+        export_dir = CONSENT_DIR / "exports"
+        export_dir.mkdir(parents=True, exist_ok=True)
+        export_path = export_dir / f"export_{jid}.json"
+        export_path.write_text(json.dumps({"consents": out}, indent=2, ensure_ascii=False), encoding="utf-8")
+        _consent_audit("export_consents", {"job_id": jid, "user_id": user_id, "export_path": str(export_path)})
+        return {"export_path": str(export_path), "count": len(out)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _process_delete_job(job: dict):
+    jid = job.get("id")
+    user_id = job.get("user_id")
+    try:
+        deleted = []
+        CONSENT_DIR = Path("data") / "consents"
+        if not CONSENT_DIR.exists():
+            return {"deleted": deleted}
+        for p in list(CONSENT_DIR.glob("*.json")):
+            try:
+                data = json.loads(p.read_text(encoding="utf-8"))
+                if data.get("user_id") == user_id:
+                    deleted.append(data.get("id") or p.stem)
+                    p.unlink()
+            except Exception:
+                continue
+        _consent_audit("delete_consents", {"job_id": jid, "user_id": user_id, "deleted": deleted})
+        return {"deleted": deleted}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@celery_app.task(name='fbroom.process_export_job')
+def celery_process_export_job(jid: str):
+    # load job file
+    jf = JOBS_DIR / f"{jid}.json"
+    try:
+        job = json.loads(jf.read_text(encoding="utf-8"))
+    except Exception:
+        job = {"id": jid}
+    _update_job_status(jid, "processing")
+    res = _process_export_job(job)
+    _update_job_status(jid, "completed" if not res.get('error') else 'failed', res)
+
+
+@celery_app.task(name='fbroom.process_delete_job')
+def celery_process_delete_job(jid: str):
+    jf = JOBS_DIR / f"{jid}.json"
+    try:
+        job = json.loads(jf.read_text(encoding="utf-8"))
+    except Exception:
+        job = {"id": jid}
+    _update_job_status(jid, "processing")
+    res = _process_delete_job(job)
+    _update_job_status(jid, "completed" if not res.get('error') else 'failed', res)
+
+
+# --- Simple user account and Utah-style privacy request flow ---
+
+
+class UserCreate(BaseModel):
+    username: str
+    email: str
+    password: str
+
+
+class UserLogin(BaseModel):
+    username: Optional[str] = None
+    email: Optional[str] = None
+    password: str
+    persistent: Optional[bool] = False
+
+
+class DeleteAccountRequest(BaseModel):
+    password: str
+    confirm_text: str
+
+
+def _users_dir():
+    d = Path("data") / "users"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _sessions_dir():
+    d = Path("data") / "sessions"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _hash_password(password: str, salt: Optional[bytes] = None):
+    if salt is None:
+        salt = os.urandom(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
+    return salt.hex(), dk.hex()
+
+
+def _verify_password(password: str, salt_hex: str, hash_hex: str) -> bool:
+    salt = bytes.fromhex(salt_hex)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 100_000)
+    return dk.hex() == hash_hex
+
+
+def _find_user_by_username(username: str):
+    d = _users_dir()
+    for p in d.glob("*.json"):
+        try:
+            u = json.loads(p.read_text(encoding="utf-8"))
+            if u.get("username") == username:
+                return u
+        except Exception:
+            continue
+    return None
+
+
+def _find_user_by_email(email: str):
+    d = _users_dir()
+    for p in d.glob("*.json"):
+        try:
+            u = json.loads(p.read_text(encoding="utf-8"))
+            if u.get("email") == email:
+                return u
+        except Exception:
+            continue
+    return None
+
+
+def _create_user(username: str, email: str, password: str):
+    uid = f"user_{uuid4().hex[:8]}"
+    salt, ph = _hash_password(password)
+    user = {
+        "id": uid,
+        "username": username,
+        "email": email,
+        "pw_salt": salt,
+        "pw_hash": ph,
+        "created_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),
+    }
+    p = _users_dir() / f"{uid}.json"
+    p.write_text(json.dumps(user, indent=2, ensure_ascii=False), encoding="utf-8")
+    _consent_audit("create_user", {"user_id": uid, "username": username, "email": email})
+    return user
+
+
+def _create_session(user_id: str, duration_seconds: Optional[int] = 60 * 60 * 24 * 7):
+    # Create a JWT for production-style bearer sessions
+    jwt_secret = JWT_SECRET
+    jwt_algo = JWT_ALGO
+    now = datetime.now(timezone.utc)
+    jti = uuid4().hex
+    payload = {"sub": user_id, "iat": int(now.timestamp()), "jti": jti}
+    if duration_seconds is not None:
+        exp = now.timestamp() + float(duration_seconds)
+        payload["exp"] = int(exp)
+    token = jwt.encode(payload, jwt_secret, algorithm=jwt_algo)
+    # persist a lightweight session record for revocation/inspection
+    try:
+        s = {"token": token, "user_id": user_id, "created_at": now.isoformat() + "Z", "jti": jti}
+        p = _sessions_dir() / f"session_{jti}.json"
+        p.write_text(json.dumps(s, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+    return token
+
+
+def _create_session_tokens(user_id: str, access_seconds: int = 60 * 15, refresh_seconds: Optional[int] = 60 * 60 * 24 * 30, persistent: bool = False, ip: Optional[str] = None, user_agent: Optional[str] = None):
+    jwt_secret = JWT_SECRET
+    jwt_algo = JWT_ALGO
+    now = datetime.now(timezone.utc)
+    rjti = uuid4().hex
+    ajti = uuid4().hex
+
+    # Refresh token: if persistent, omit exp to allow server-side session file to control lifetime
+    refresh_payload = {"sub": user_id, "iat": int(now.timestamp()), "jti": rjti, "purpose": "refresh"}
+    if not persistent and refresh_seconds is not None:
+        refresh_payload["exp"] = int(now.timestamp() + float(refresh_seconds))
+    refresh_token = jwt.encode(refresh_payload, jwt_secret, algorithm=jwt_algo)
+
+    # Access token references the refresh jti so we can validate against the session record
+    access_payload = {"sub": user_id, "iat": int(now.timestamp()), "jti": ajti, "rjti": rjti}
+    if access_seconds is not None:
+        access_payload["exp"] = int(now.timestamp() + float(access_seconds))
+    access_token = jwt.encode(access_payload, jwt_secret, algorithm=jwt_algo)
+
+    # persist session record keyed by refresh jti
+    try:
+        s = {
+            "refresh_jti": rjti,
+            "access_jti": ajti,
+            "user_id": user_id,
+            "created_at": now.isoformat() + "Z",
+            "last_seen": now.isoformat() + "Z",
+            "ip": ip,
+            "user_agent": user_agent,
+        }
+        p = _sessions_dir() / f"session_{rjti}.json"
+        # write with optional encryption or restrictive permissions
+        try:
+            _write_session_file(p, s)
+        except Exception:
+            p.write_text(json.dumps(s, indent=2, ensure_ascii=False), encoding="utf-8")
+            try:
+                os.chmod(p, 0o600)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return {"access_token": access_token, "refresh_token": refresh_token, "refresh_jti": rjti, "access_jti": ajti}
+
+
+def _get_user_by_id(user_id: str):
+    p = _users_dir() / f"{user_id}.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _find_team_owner_by_name(team_name: str):
+    """Find a canonical owner user object for a given team name.
+    Preference: user with explicit 'team_owner' flag; otherwise first user with matching team_name.
+    """
+    if not team_name:
+        return None
+    try:
+        udir = _users_dir()
+        candidates = []
+        for p in udir.glob("*.json"):
+            try:
+                uu = json.loads(p.read_text(encoding="utf-8"))
+                if uu.get("team_name") == team_name:
+                    if uu.get("team_owner"):
+                        return uu
+                    candidates.append(uu)
+            except Exception:
+                continue
+        if candidates:
+            return candidates[0]
+    except Exception:
+        pass
+    return None
+
+
+def _get_user_from_token(token: str):
+    # Support both pre-existing session files and JWT tokens
+    try:
+        # if token contains dots assume JWT
+        if "." in token:
+            jwt_secret = JWT_SECRET
+            jwt_algo = JWT_ALGO
+            try:
+                payload = jwt.decode(token, jwt_secret, algorithms=[jwt_algo], leeway=60)
+            except Exception:
+                return None
+            uid = payload.get("sub")
+            # Refresh tokens carry purpose="refresh" and their jti is the session key
+            if payload.get("purpose") == "refresh":
+                rjti = payload.get("jti")
+                if not rjti:
+                    return None
+                p = _sessions_dir() / f"session_{rjti}.json"
+                if not p.exists():
+                    return None
+                # update last_seen
+                try:
+                    s = _read_session_file(p)
+                    s["last_seen"] = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
+                    try:
+                        _write_session_file(p, s)
+                    except Exception:
+                        p.write_text(json.dumps(s, indent=2, ensure_ascii=False), encoding="utf-8")
+                except Exception:
+                    pass
+                return _get_user_by_id(uid)
+            # Access tokens carry rjti linking to session record
+            rjti = payload.get("rjti")
+            if not rjti:
+                return None
+            p = _sessions_dir() / f"session_{rjti}.json"
+            if not p.exists():
+                return None
+            # update last_seen
+            try:
+                s = _read_session_file(p)
+                s["last_seen"] = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
+                try:
+                    _write_session_file(p, s)
+                except Exception:
+                    p.write_text(json.dumps(s, indent=2, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                pass
+            return _get_user_by_id(uid)
+    except Exception:
+        pass
+    # fallback: legacy session file keyed by jti or token
+    p = _sessions_dir() / f"session_{token}.json"
+    if not p.exists():
+        return None
+    try:
+        s = json.loads(p.read_text(encoding="utf-8"))
+        return _get_user_by_id(s.get("user_id"))
+    except Exception:
+        return None
+
+
+def _send_email_message(to_email: str, subject: str, body: str):
+    smtp_host = os.environ.get("SMTP_HOST")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user = os.environ.get("SMTP_USER")
+    smtp_pass = os.environ.get("SMTP_PASS")
+    from_addr = os.environ.get("FROM_EMAIL") or "noreply@falconbroom.local"
+    msg = EmailMessage()
+
+
+# Session file helpers: optional encryption using SESSION_ENCRYPTION_KEY env var.
+def _get_session_encryption_key():
+    k = os.environ.get("SESSION_ENCRYPTION_KEY")
+    if not k:
+        return None
+    try:
+        return k.encode('utf-8')
+    except Exception:
+        return None
+
+def _write_session_file(path: Path, obj: dict):
+    key = _get_session_encryption_key()
+    data = json.dumps(obj, indent=2, ensure_ascii=False).encode('utf-8')
+    if key:
+        try:
+            # use cryptography.Fernet if available
+            from cryptography.fernet import Fernet
+            f = Fernet(key)
+            enc = f.encrypt(data)
+            path.write_bytes(enc)
+            try:
+                os.chmod(path, 0o600)
+            except Exception:
+                pass
+            return
+        except Exception:
+            pass
+    # fallback: write plaintext and tighten perms when possible
+    path.write_text(data.decode('utf-8'), encoding='utf-8')
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+def _read_session_file(path: Path):
+    key = _get_session_encryption_key()
+    raw = path.read_bytes()
+    if key:
+        try:
+            from cryptography.fernet import Fernet
+            f = Fernet(key)
+            dec = f.decrypt(raw)
+            return json.loads(dec.decode('utf-8'))
+        except Exception:
+            pass
+    try:
+        return json.loads(raw.decode('utf-8'))
+    except Exception:
+        # fall back to reading as text
+        try:
+            return json.loads(path.read_text(encoding='utf-8'))
+        except Exception:
+            return {}
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = to_email
+    msg.set_content(body)
+    # If SMTP configured, send; otherwise persist to data/emails for dev
+    if smtp_host and smtp_user and smtp_pass:
+        try:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=10) as s:
+                s.starttls()
+                s.login(smtp_user, smtp_pass)
+                s.send_message(msg)
+            return True
+        except Exception:
+            pass
+    # fallback: write to data/emails
+    try:
+        emdir = Path("data") / "emails"
+        emdir.mkdir(parents=True, exist_ok=True)
+        fn = emdir / f"email_{uuid4().hex}.txt"
+        fn.write_text(f"To: {to_email}\nSubject: {subject}\n\n{body}\n", encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def _make_verification_token(user_id: str, email: str, expires_seconds: int = 60 * 60 * 24):
+    jwt_secret = JWT_SECRET
+    jwt_algo = JWT_ALGO
+    now = datetime.now(timezone.utc)
+    exp = now.timestamp() + expires_seconds
+    payload = {"sub": user_id, "email": email, "purpose": "verify_email", "iat": int(now.timestamp()), "exp": int(exp), "jti": uuid4().hex}
+    return jwt.encode(payload, jwt_secret, algorithm=jwt_algo)
+
+
+def _make_invite_token(inviter_id: str, invitee_email: str, team_name: Optional[str] = None, expires_seconds: int = 60 * 60 * 24 * 7):
+    jwt_secret = JWT_SECRET
+    jwt_algo = JWT_ALGO
+    now = datetime.now(timezone.utc)
+    exp = now.timestamp() + expires_seconds
+    payload = {"inviter": inviter_id, "email": invitee_email, "team": team_name, "purpose": "invite", "iat": int(now.timestamp()), "exp": int(exp), "jti": uuid4().hex}
+    return jwt.encode(payload, jwt_secret, algorithm=jwt_algo)
+
+
+def _require_auth(request: Request):
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    if not auth or not auth.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    token = auth.split(None, 1)[1].strip()
+    user = _get_user_from_token(token)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    return user
+
+
+@app.post("/signup")
+def signup(spec: UserCreate):
+    try:
+        if _find_user_by_username(spec.username):
+            raise HTTPException(status_code=400, detail="Username already exists")
+        if _find_user_by_email(spec.email):
+            raise HTTPException(status_code=400, detail="Email already registered")
+        user = _create_user(spec.username, spec.email, spec.password)
+        # send verification email if email present
+        try:
+            if spec.email:
+                token = _make_verification_token(user.get("id"), spec.email)
+                link = os.environ.get("APP_URL", "http://localhost:3000") + f"/verify-email?token={token}"
+                _send_email_message(spec.email, "Verify your FalconBroom email", f"Please verify your email by visiting: {link}")
+                _consent_audit("send_verification", {"user_id": user.get("id"), "email": spec.email})
+        except Exception:
+            pass
+        return {"ok": True, "user_id": user["id"]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/login")
+def login(spec: UserLogin, request: Request, response: Response):
+    try:
+        user = None
+        if spec.username:
+            user = _find_user_by_username(spec.username)
+        if not user and spec.email:
+            user = _find_user_by_email(spec.email)
+        if not user:
+            raise HTTPException(status_code=400, detail="Invalid credentials")
+        if not _verify_password(spec.password, user.get("pw_salt"), user.get("pw_hash")):
+            raise HTTPException(status_code=400, detail="Invalid credentials")
+        # Create access + refresh tokens; include request metadata if available
+        req = None
+        try:
+            # FastAPI will inject Request if provided; attempt to get from locals
+            req = globals().get('request')
+        except Exception:
+            req = None
+        ip = None
+        ua = None
+        # If a Request object is available via the framework, capture client info
+        try:
+            # 'spec' is the body model; the actual Request is not passed here. Use environment heuristics.
+            pass
+        except Exception:
+            pass
+        ip = None
+        ua = None
+        try:
+            ip = request.client.host if getattr(request, 'client', None) else None
+            ua = request.headers.get('user-agent')
+        except Exception:
+            pass
+        tokens = _create_session_tokens(user.get("id"), persistent=getattr(spec, "persistent", False), ip=ip, user_agent=ua)
+        # set httpOnly refresh cookie; access token returned in body only
+        cookie_name = os.environ.get("REFRESH_COOKIE_NAME") or "falconbroom_refresh"
+        secure_flag = True if os.environ.get("ENV") == "production" else False
+        try:
+            response.set_cookie(cookie_name, tokens.get("refresh_token"), httponly=True, samesite="lax", secure=secure_flag)
+        except Exception:
+            pass
+        _consent_audit("login", {"user_id": user.get("id")})
+        return {"access_token": tokens.get("access_token"), "user_id": user.get("id")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/logout")
+def logout(request: Request, response: Response):
+    try:
+        auth = request.headers.get("authorization") or request.headers.get("Authorization")
+        if not auth or not auth.lower().startswith("bearer "):
+            raise HTTPException(status_code=401, detail="Missing Authorization header")
+        token = auth.split(None, 1)[1].strip()
+        # If token is a JWT, decode to find the session refresh jti and remove the session record
+        try:
+            if "." in token:
+                jwt_secret = JWT_SECRET
+                jwt_algo = JWT_ALGO
+                payload = jwt.decode(token, jwt_secret, algorithms=[jwt_algo])
+                # refresh tokens have purpose="refresh" and jti is the session key
+                if payload.get("purpose") == "refresh":
+                    rjti = payload.get("jti")
+                else:
+                    rjti = payload.get("rjti")
+                    if rjti:
+                        p = _sessions_dir() / f"session_{rjti}.json"
+                        if p.exists():
+                            p.unlink()
+                        # clear cookie
+                        cookie_name = os.environ.get("REFRESH_COOKIE_NAME") or "falconbroom_refresh"
+                        try:
+                            response.delete_cookie(cookie_name)
+                        except Exception:
+                            pass
+                        return {"ok": True}
+        except Exception:
+            pass
+        # Fallback: legacy session file keyed by token
+        p = _sessions_dir() / f"session_{token}.json"
+        if p.exists():
+            p.unlink()
+        cookie_name = os.environ.get("REFRESH_COOKIE_NAME") or "falconbroom_refresh"
+        try:
+            response.delete_cookie(cookie_name)
+        except Exception:
+            pass
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/verify-email")
+def verify_email(payload: dict):
+    try:
+        token = payload.get("token")
+        if not token:
+            raise HTTPException(status_code=400, detail="Missing token")
+        jwt_secret = JWT_SECRET
+        jwt_algo = JWT_ALGO
+        try:
+            # Allow small clock skew when verifying tokens
+            data = jwt.decode(token, jwt_secret, algorithms=[jwt_algo], leeway=60)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid or expired token")
+        if data.get("purpose") != "verify_email":
+            raise HTTPException(status_code=400, detail="Invalid token purpose")
+        uid = data.get("sub")
+        email = data.get("email")
+        user = _get_user_by_id(uid)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        user["email_verified"] = True
+        user["email"] = email
+        p = _users_dir() / f"{uid}.json"
+        p.write_text(json.dumps(user, indent=2, ensure_ascii=False), encoding="utf-8")
+        _consent_audit("verify_email", {"user_id": uid, "email": email})
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/refresh")
+def refresh_token(request: Request, response: Response):
+    try:
+        # read refresh token from httpOnly cookie
+        cookie_name = os.environ.get("REFRESH_COOKIE_NAME") or "falconbroom_refresh"
+        token = None
+        try:
+            token = request.cookies.get(cookie_name)
+        except Exception:
+            token = None
+        if not token:
+            raise HTTPException(status_code=400, detail="Missing refresh_token")
+        jwt_secret = JWT_SECRET
+        jwt_algo = JWT_ALGO
+        try:
+            data = jwt.decode(token, jwt_secret, algorithms=[jwt_algo], leeway=60)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid or expired refresh token")
+        if data.get("purpose") != "refresh":
+            raise HTTPException(status_code=400, detail="Invalid token purpose")
+        old_rjti = data.get("jti")
+        if not old_rjti:
+            raise HTTPException(status_code=400, detail="Invalid token")
+        p = _sessions_dir() / f"session_{old_rjti}.json"
+        if not p.exists():
+            # Possible token reuse or already-rotated token
+            raise HTTPException(status_code=401, detail="Session revoked or token reuse detected")
+
+        # Read existing session and create rotated session with new refresh jti
+        try:
+            s = _read_session_file(p)
+        except Exception:
+            s = {}
+
+        now = datetime.now(timezone.utc)
+        new_rjti = uuid4().hex
+        new_ajti = uuid4().hex
+
+        # create new refresh token (rotate)
+        refresh_payload = {"sub": data.get("sub"), "iat": int(now.timestamp()), "jti": new_rjti, "purpose": "refresh"}
+        # preserve expiration semantics: if previous had exp, include similar TTL
+        if data.get("exp"):
+            ttl = int(data.get("exp")) - int(data.get("iat") or int(now.timestamp()))
+            if ttl > 0:
+                refresh_payload["exp"] = int(now.timestamp() + ttl)
+        new_refresh_token = jwt.encode(refresh_payload, jwt_secret, algorithm=jwt_algo)
+
+        # create new access token referencing new refresh jti
+        access_payload = {"sub": data.get("sub"), "iat": int(now.timestamp()), "jti": new_ajti, "rjti": new_rjti}
+        access_payload["exp"] = int(now.timestamp() + float(60 * 15))
+        access_token = jwt.encode(access_payload, jwt_secret, algorithm=jwt_algo)
+
+        # write new session file and remove old one
+        try:
+            new_s = {
+                "refresh_jti": new_rjti,
+                "access_jti": new_ajti,
+                "user_id": s.get("user_id") or data.get("sub"),
+                "created_at": s.get("created_at") or now.isoformat() + "Z",
+                "last_seen": now.isoformat() + "Z",
+                "ip": s.get("ip"),
+                "user_agent": s.get("user_agent"),
+            }
+            p_new = _sessions_dir() / f"session_{new_rjti}.json"
+            _write_session_file(p_new, new_s)
+            try:
+                p.unlink()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # set rotated refresh cookie
+        secure_flag = True if os.environ.get("ENV") == "production" else False
+        try:
+            response.set_cookie(cookie_name, new_refresh_token, httponly=True, samesite="lax", secure=secure_flag)
+        except Exception:
+            pass
+
+        return {"access_token": access_token}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/sessions")
+def list_sessions(request: Request):
+    try:
+        user = _require_auth(request)
+        sessions = []
+        d = _sessions_dir()
+        for p in d.glob("session_*.json"):
+            try:
+                s = json.loads(p.read_text(encoding="utf-8"))
+                if s.get("user_id") == user.get("id"):
+                    sessions.append({"refresh_jti": s.get("refresh_jti"), "access_jti": s.get("access_jti"), "created_at": s.get("created_at"), "last_seen": s.get("last_seen"), "ip": s.get("ip"), "user_agent": s.get("user_agent")})
+            except Exception:
+                continue
+        return {"sessions": sessions}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/sessions/revoke")
+def revoke_session(request: Request, payload: dict):
+    try:
+        user = _require_auth(request)
+        jti = payload.get("jti")
+        if not jti:
+            raise HTTPException(status_code=400, detail="Missing jti")
+        p = _sessions_dir() / f"session_{jti}.json"
+        if not p.exists():
+            return {"ok": True}
+        try:
+            s = json.loads(p.read_text(encoding="utf-8"))
+            if s.get("user_id") != user.get("id"):
+                raise HTTPException(status_code=403, detail="Not allowed")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+        p.unlink()
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/dsar/request")
+def dsar_request(request: Request, payload: dict):
+    """Request a Data Subject Access Request (export or delete).
+    payload: { action: 'export'|'delete', password?: '<password for verification>' }
+    """
+    try:
+        user = _require_auth(request)
+        action = (payload.get("action") or "").lower()
+        if action not in ("export", "delete"):
+            raise HTTPException(status_code=400, detail="Invalid action")
+        dsar_dir = Path("data") / "dsar"
+        dsar_dir.mkdir(parents=True, exist_ok=True)
+        dsar_id = f"dsar_{uuid4().hex[:8]}"
+        record = {"id": dsar_id, "user_id": user.get("id"), "action": action, "requested_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), "status": "requested"}
+        # verify identity for delete requests
+        if action == "delete":
+            pwd = payload.get("password")
+            if not pwd or not _verify_password(pwd, user.get("pw_salt"), user.get("pw_hash")):
+                raise HTTPException(status_code=401, detail="Identity verification failed")
+        # write request record and audit
+        out = dsar_dir / f"{dsar_id}.json"
+        out.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+        audit_dir = dsar_dir / "audit.log"
+        with open(audit_dir, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"dsar_id": dsar_id, "user_id": user.get("id"), "action": action, "ts": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}) + "\n")
+        # For exports, create an export artifact synchronously for now
+        if action == "export":
+            try:
+                import zipfile
+                export_path = OUTPUTS_DIR / f"{dsar_id}.zip"
+                with zipfile.ZipFile(export_path, "w") as zf:
+                    # include user profile
+                    ufile = _users_dir() / f"{user.get('id')}.json"
+                    if ufile.exists():
+                        zf.write(str(ufile), arcname=ufile.name)
+                    # include session files
+                    for p in _sessions_dir().glob("session_*.json"):
+                        try:
+                            s = _read_session_file(p)
+                            if s.get("user_id") == user.get("id"):
+                                zf.write(str(p), arcname=p.name)
+                        except Exception:
+                            continue
+                    # include uploads metadata list
+                    try:
+                        up = UPLOAD_DIR
+                        for f in up.iterdir():
+                            if f.is_file():
+                                zf.write(str(f), arcname=f.name)
+                    except Exception:
+                        pass
+                record["export_path"] = str(export_path)
+                record["status"] = "completed"
+                out.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+            except Exception as e:
+                record["status"] = "failed"
+                record["error"] = str(e)
+                out.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+        return {"dsar_id": dsar_id, "status": record.get("status")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/dsar/delete")
+def dsar_delete(request: Request, payload: dict):
+    """Perform deletion of user data after DSAR verification. Requires password in payload."""
+    try:
+        user = _require_auth(request)
+        pwd = payload.get("password")
+        if not pwd or not _verify_password(pwd, user.get("pw_salt"), user.get("pw_hash")):
+            raise HTTPException(status_code=401, detail="Identity verification failed")
+        # perform deletion: user file, sessions, uploads owned by user (best-effort), consents
+        uid = user.get("id")
+        # delete user file
+        try:
+            p = _users_dir() / f"{uid}.json"
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+        # delete sessions
+        try:
+            for p in _sessions_dir().glob("session_*.json"):
+                try:
+                    s = _read_session_file(p)
+                    if s.get("user_id") == uid:
+                        p.unlink()
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        # record audit
+        dsar_dir = Path("data") / "dsar"
+        dsar_dir.mkdir(parents=True, exist_ok=True)
+        with open(dsar_dir / "audit.log", "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"action": "delete", "user_id": uid, "ts": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}) + "\n")
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/team/invite")
+def team_invite(payload: dict, request: Request):
+    try:
+        user = _require_auth(request)
+        email = payload.get("email")
+        role = payload.get("role") or "member"
+        if not email:
+            raise HTTPException(status_code=400, detail="Missing invite email")
+        inviter = user
+        team_name = inviter.get("team_name") or payload.get("team_name") or inviter.get("username") + "'s team"
+        token = _make_invite_token(inviter.get("id"), email, team_name)
+        # persist invite record
+        invdir = Path("data") / "invites"
+        invdir.mkdir(parents=True, exist_ok=True)
+        invfile = invdir / f"invite_{uuid4().hex}.json"
+        invfile.write_text(json.dumps({"inviter": inviter.get("id"), "email": email, "role": role, "team": team_name, "token": token, "created_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}, indent=2), encoding="utf-8")
+        # send email
+        try:
+            link = os.environ.get("APP_URL", "http://localhost:3000") + f"/accept-invite?token={token}"
+            _send_email_message(email, "You are invited to FalconBroom", f"You were invited to join {team_name}. Accept: {link}")
+        except Exception:
+            pass
+        _consent_audit("team_invite", {"inviter": inviter.get("id"), "email": email, "team": team_name})
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/team/accept")
+def team_accept(payload: dict):
+    try:
+        token = payload.get("token")
+        username = payload.get("username")
+        password = payload.get("password")
+        if not token:
+            raise HTTPException(status_code=400, detail="Missing token")
+        jwt_secret = JWT_SECRET
+        jwt_algo = JWT_ALGO
+        try:
+            data = jwt.decode(token, jwt_secret, algorithms=[jwt_algo])
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid or expired token")
+        if data.get("purpose") != "invite":
+            raise HTTPException(status_code=400, detail="Invalid token purpose")
+        email = data.get("email")
+        inviter_id = data.get("inviter")
+        team_name = data.get("team")
+        # find or create user for invitee
+        existing = _find_user_by_email(email)
+        if existing:
+            # add to inviter's team
+            inviter = _get_user_by_id(inviter_id)
+            if not inviter:
+                raise HTTPException(status_code=404, detail="Inviter not found")
+            inviter.setdefault("team_name", team_name)
+            members = inviter.setdefault("team_members", [])
+            if email not in members:
+                members.append(email)
+            p = _users_dir() / f"{inviter.get('id')}.json"
+            p.write_text(json.dumps(inviter, indent=2, ensure_ascii=False), encoding="utf-8")
+            _consent_audit("team_accept", {"inviter": inviter.get("id"), "added": email})
+            return {"ok": True}
+        # create new user with supplied username/password
+        if not username or not password:
+            raise HTTPException(status_code=400, detail="Missing username/password for account creation")
+        new_user = _create_user(username, email, password)
+        # add to inviter's team
+        inviter = _get_user_by_id(inviter_id)
+        if inviter:
+            inviter.setdefault("team_name", team_name)
+            members = inviter.setdefault("team_members", [])
+            if email not in members:
+                members.append(email)
+            p = _users_dir() / f"{inviter.get('id')}.json"
+            p.write_text(json.dumps(inviter, indent=2, ensure_ascii=False), encoding="utf-8")
+        _consent_audit("team_accept", {"inviter": inviter_id, "new_user": new_user.get('id')})
+        tokens = _create_session_tokens(new_user.get("id"), persistent=True)
+        # set cookie via response semantics not available here; return access token and client should call /login
+        return {"access_token": tokens.get("access_token"), "user_id": new_user.get("id")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/uploads/{name}/share")
+def share_upload(name: str, payload: dict, request: Request):
+    """Mark an uploaded file as shared with the team (or unshare).
+    Persists a small .meta.json file beside the upload to record sharing metadata.
+    """
+    try:
+        user = _require_auth(request)
+        shared = bool(payload.get("shared"))
+        upath = UPLOAD_DIR / name
+        if not upath.exists():
+            raise HTTPException(status_code=404, detail="Upload not found")
+        meta = {
+            "shared_with_team": shared,
+            "shared_by": user.get("id"),
+            "shared_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z') if shared else None,
+        }
+        try:
+            meta_path = upath.parent / (upath.name + ".meta.json")
+            existing = {}
+            if meta_path.exists():
+                try:
+                    existing = json.loads(meta_path.read_text(encoding="utf-8"))
+                except Exception:
+                    existing = {}
+            existing.update(meta)
+            meta_path.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        _consent_audit("upload_share", {"user": user.get("id"), "file": str(upath), "shared": shared})
+        try:
+            import asyncio
+            asyncio.create_task(_broadcast_shared_update_message({"type": "shared_changed", "file": str(upath), "shared": shared}))
+        except Exception:
+            pass
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/uploads/shared")
+def list_shared_uploads():
+    out = []
+    try:
+        for p in UPLOAD_DIR.iterdir():
+            try:
+                if not p.is_file():
+                    continue
+                meta = p.parent / (p.name + ".meta.json")
+                if not meta.exists():
+                    continue
+                mj = json.loads(meta.read_text(encoding="utf-8"))
+                if mj.get("shared_with_team"):
+                    st = p.stat()
+                    out.append({"name": p.name, "path": str(p), "size": st.st_size, "modified_at": datetime.utcfromtimestamp(st.st_mtime).isoformat() + "Z", "shared_by": mj.get("shared_by"), "shared_at": mj.get("shared_at")})
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return {"uploads": sorted(out, key=lambda r: r.get("shared_at") or "", reverse=True)}
+
+
+@app.websocket("/ws/shared")
+async def ws_shared(websocket: WebSocket):
+    await websocket.accept()
+    _connected_ws.add(websocket)
+    try:
+        # send initial state
+        try:
+            init = list_shared_uploads()
+            await websocket.send_text(json.dumps({"type": "init", "uploads": init.get("uploads", [])}, default=str))
+        except Exception:
+            pass
+        while True:
+            # keep connection alive; accept pings from client
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        _connected_ws.discard(websocket)
+    except Exception:
+        _connected_ws.discard(websocket)
+
+
+@app.get("/me")
+def me(request: Request):
+    try:
+        user = _require_auth(request)
+        # don't expose password data
+        safe = {k: v for k, v in user.items() if k not in ("pw_hash", "pw_salt")}
+        return safe
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/team/invites")
+def list_team_invites(request: Request):
+    try:
+        user = _require_auth(request)
+        invdir = Path("data") / "invites"
+        out = []
+        if not invdir.exists():
+            return {"invites": []}
+        for p in invdir.iterdir():
+            try:
+                j = json.loads(p.read_text(encoding="utf-8"))
+                # include file id so clients can act on invites
+                j["id"] = p.name
+                # decode token for expiry and normalize metadata
+                try:
+                    token = j.get("token")
+                    if token and ".." not in token:
+                        jwt_secret = JWT_SECRET
+                        jwt_algo = JWT_ALGO
+                        try:
+                            tk = jwt.decode(token, jwt_secret, algorithms=[jwt_algo], options={"verify_exp": False})
+                            j["token_payload"] = {"exp": tk.get("exp"), "iat": tk.get("iat"), "jti": tk.get("jti")}
+                        except Exception:
+                            j["token_payload"] = None
+                except Exception:
+                    j["token_payload"] = None
+
+                # attach inviter info when available
+                try:
+                    inv = _get_user_by_id(j.get("inviter"))
+                    if inv:
+                        j["inviter_username"] = inv.get("username")
+                        j["inviter_email"] = inv.get("email")
+                except Exception:
+                    pass
+
+                # determine canonical owner for the team and whether current user can manage this invite
+                owner = _find_team_owner_by_name(j.get("team"))
+                can_manage = False
+                if owner and owner.get("id") == user.get("id"):
+                    can_manage = True
+                if j.get("inviter") == user.get("id"):
+                    can_manage = True
+
+                j["can_manage"] = can_manage
+
+                # include invites created by this user, invites for this user's team, or invites targeting this user's email
+                if j.get("inviter") == user.get("id"):
+                    out.append(j)
+                    continue
+                if user.get("team_name") and j.get("team") == user.get("team_name"):
+                    out.append(j)
+                    continue
+                if user.get("email") and j.get("email") == user.get("email"):
+                    out.append(j)
+                    continue
+            except Exception:
+                continue
+        return {"invites": sorted(out, key=lambda x: x.get("created_at") or "", reverse=True)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/team/members")
+def list_team_members(request: Request):
+    try:
+        user = _require_auth(request)
+        # determine owner of the team
+        owner = None
+        if user.get("team_name"):
+            owner = user
+        else:
+            # find any user that lists this user's email in team_members
+            try:
+                udir = _users_dir()
+                for p in udir.glob("*.json"):
+                    try:
+                        uu = json.loads(p.read_text(encoding="utf-8"))
+                        members = uu.get("team_members") or []
+                        if user.get("email") and user.get("email") in members:
+                            owner = uu
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                owner = None
+
+        if not owner:
+            # no team found
+            return {"team_name": None, "members": []}
+
+        team_name = owner.get("team_name")
+        members = []
+        # owner entry
+        members.append({"id": owner.get("id"), "username": owner.get("username"), "email": owner.get("email"), "role": "owner"})
+        # include explicit team_members (emails)
+        for email in (owner.get("team_members") or []):
+            try:
+                u = _find_user_by_email(email)
+                if u:
+                    members.append({"id": u.get("id"), "username": u.get("username"), "email": u.get("email"), "role": "member"})
+                else:
+                    members.append({"id": None, "username": None, "email": email, "role": "member"})
+            except Exception:
+                members.append({"id": None, "username": None, "email": email, "role": "member"})
+
+        return {"team_name": team_name, "members": members}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/team/invites/{invite_id}")
+def revoke_invite(invite_id: str, request: Request):
+    try:
+        user = _require_auth(request)
+        invdir = Path("data") / "invites"
+        p = invdir / invite_id
+        if not p.exists():
+            raise HTTPException(status_code=404, detail="Invite not found")
+        try:
+            j = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            j = {}
+        # allow revocation if requester is the inviter or the canonical team owner
+        allowed = False
+        if j.get("inviter") == user.get("id"):
+            allowed = True
+        owner = _find_team_owner_by_name(j.get("team"))
+        if owner and owner.get("id") == user.get("id"):
+            allowed = True
+        if not allowed:
+            raise HTTPException(status_code=403, detail="Not allowed to revoke invite")
+        try:
+            p.unlink()
+        except Exception:
+            pass
+        _consent_audit("team_invite_revoked", {"by": user.get("id"), "invite": j})
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/team/invite/decline")
+def decline_invite(payload: dict):
+    try:
+        token = payload.get("token")
+        if not token:
+            raise HTTPException(status_code=400, detail="Missing token")
+        jwt_secret = JWT_SECRET
+        jwt_algo = JWT_ALGO
+        try:
+            data = jwt.decode(token, jwt_secret, algorithms=[jwt_algo])
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid or expired token")
+        if data.get("purpose") != "invite":
+            raise HTTPException(status_code=400, detail="Invalid token purpose")
+        # find matching invite file and remove it
+        invdir = Path("data") / "invites"
+        removed = False
+        if invdir.exists():
+            for p in invdir.iterdir():
+                try:
+                    j = json.loads(p.read_text(encoding="utf-8"))
+                    if j.get("token") == token:
+                        try:
+                            p.unlink()
+                        except Exception:
+                            pass
+                        _consent_audit("team_invite_declined", {"token": token, "email": data.get("email")})
+                        removed = True
+                        break
+                except Exception:
+                    continue
+        if not removed:
+            raise HTTPException(status_code=404, detail="Invite not found")
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/team/members")
+def update_team_member(payload: dict, request: Request):
+    try:
+        user = _require_auth(request)
+        # restrict to canonical team owner for this user's team
+        if not user.get("team_name"):
+            raise HTTPException(status_code=403, detail="Only team owners can modify members")
+        owner = _find_team_owner_by_name(user.get("team_name"))
+        if not owner or owner.get("id") != user.get("id"):
+            raise HTTPException(status_code=403, detail="Only team owners can modify members")
+        action = payload.get("action")
+        target_email = payload.get("email")
+        if not target_email:
+            raise HTTPException(status_code=400, detail="Missing target email")
+        owner = user
+        # load owner record, modify team_members and team_roles stored on owner
+        changed = False
+        if action == "remove":
+            members = owner.setdefault("team_members", [])
+            if target_email in members:
+                members.remove(target_email)
+                changed = True
+            # also remove any stored role
+            roles = owner.setdefault("team_roles", {})
+            if roles.pop(target_email, None) is not None:
+                changed = True
+            if changed:
+                p = _users_dir() / f"{owner.get('id')}.json"
+                p.write_text(json.dumps(owner, indent=2, ensure_ascii=False), encoding="utf-8")
+                _consent_audit("team_member_removed", {"by": owner.get("id"), "removed": target_email})
+            return {"ok": True}
+        elif action == "update_role":
+            role = payload.get("role")
+            if not role:
+                raise HTTPException(status_code=400, detail="Missing role")
+            roles = owner.setdefault("team_roles", {})
+            roles[target_email] = role
+            p = _users_dir() / f"{owner.get('id')}.json"
+            p.write_text(json.dumps(owner, indent=2, ensure_ascii=False), encoding="utf-8")
+            _consent_audit("team_member_role_updated", {"by": owner.get('id'), "email": target_email, "role": role})
+            return {"ok": True}
+        else:
+            raise HTTPException(status_code=400, detail="Unknown action")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/team/owners")
+def manage_team_owner(payload: dict, request: Request):
+    try:
+        user = _require_auth(request)
+        # only canonical owner may manage owners
+        if not user.get("team_name"):
+            raise HTTPException(status_code=403, detail="Only team owners can manage owners")
+        owner = _find_team_owner_by_name(user.get("team_name"))
+        if not owner or owner.get("id") != user.get("id"):
+            raise HTTPException(status_code=403, detail="Only team owners can manage owners")
+
+        action = (payload.get("action") or "").lower()
+        email = payload.get("email")
+        if not action or not email:
+            raise HTTPException(status_code=400, detail="Missing action or email")
+
+        target = _find_user_by_email(email)
+        if not target:
+            raise HTTPException(status_code=404, detail="Target user not found")
+
+        # Promote: mark target as team_owner and ensure team_name set
+        if action == "promote":
+            target["team_name"] = owner.get("team_name")
+            target["team_owner"] = True
+            p = _users_dir() / f"{target.get('id')}.json"
+            p.write_text(json.dumps(target, indent=2, ensure_ascii=False), encoding="utf-8")
+            # ensure target is listed in owner's team_members
+            members = owner.setdefault("team_members", [])
+            if target.get("email") and target.get("email") not in members:
+                members.append(target.get("email"))
+                po = _users_dir() / f"{owner.get('id')}.json"
+                po.write_text(json.dumps(owner, indent=2, ensure_ascii=False), encoding="utf-8")
+            _consent_audit("team_owner_promoted", {"by": owner.get("id"), "promoted": target.get("email")})
+            return {"ok": True}
+
+        # Demote: unset team_owner flag (cannot demote self)
+        if action == "demote":
+            if target.get("id") == owner.get("id"):
+                raise HTTPException(status_code=400, detail="Owner cannot demote themselves")
+            # ensure at least one owner remains for the team
+            owners = []
+            try:
+                udir = _users_dir()
+                for pth in udir.glob("*.json"):
+                    try:
+                        uu = json.loads(pth.read_text(encoding="utf-8"))
+                        if uu.get("team_name") == owner.get("team_name") and uu.get("team_owner"):
+                            owners.append(uu)
+                    except Exception:
+                        continue
+            except Exception:
+                owners = [owner]
+            if len(owners) <= 1:
+                raise HTTPException(status_code=400, detail="Cannot demote the last owner; transfer ownership first")
+            target["team_owner"] = False
+            p = _users_dir() / f"{target.get('id')}.json"
+            p.write_text(json.dumps(target, indent=2, ensure_ascii=False), encoding="utf-8")
+            try:
+                _send_email_message(target.get("email"), "Your owner role was removed", f"{owner.get('username')} has removed your owner role for team {owner.get('team_name')}")
+            except Exception:
+                pass
+            _consent_audit("team_owner_demoted", {"by": owner.get("id"), "demoted": target.get("email")})
+            return {"ok": True}
+
+        # Transfer ownership: atomic swap owner -> target
+        if action == "transfer":
+            if target.get("id") == owner.get("id"):
+                raise HTTPException(status_code=400, detail="Cannot transfer ownership to yourself")
+            # set target as owner and unset current owner atomically
+            try:
+                # assign team_name and owner flag to target
+                target["team_name"] = owner.get("team_name")
+                target["team_owner"] = True
+                p_target = _users_dir() / f"{target.get('id')}.json"
+                p_target.write_text(json.dumps(target, indent=2, ensure_ascii=False), encoding="utf-8")
+                # unset owner flag on current owner
+                owner["team_owner"] = False
+                p_owner = _users_dir() / f"{owner.get('id')}.json"
+                p_owner.write_text(json.dumps(owner, indent=2, ensure_ascii=False), encoding="utf-8")
+                # notify both parties
+                try:
+                    _send_email_message(target.get("email"), "You are now a team owner", f"You have been made an owner of team {owner.get('team_name')} by {owner.get('username')}")
+                except Exception:
+                    pass
+                try:
+                    _send_email_message(owner.get("email"), "Ownership transferred", f"You transferred ownership of team {owner.get('team_name')} to {target.get('username')}")
+                except Exception:
+                    pass
+                _consent_audit("team_owner_transferred", {"from": owner.get("id"), "to": target.get("id")})
+                return {"ok": True}
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+
+        raise HTTPException(status_code=400, detail="Unknown action")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/account/export")
+def account_export(request: Request):
+    try:
+        user = _require_auth(request)
+        # enqueue export job scoped to this user
+        return enqueue_export_job(user_id=user.get("id"))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/account/delete")
+def account_delete(spec: DeleteAccountRequest, request: Request):
+    try:
+        # Utah-style verifiable request: require password and explicit confirm text
+        user = _require_auth(request)
+        if spec.confirm_text.strip() != "DELETE MY ACCOUNT":
+            raise HTTPException(status_code=400, detail="Confirmation text mismatch; type exactly: DELETE MY ACCOUNT")
+        if not _verify_password(spec.password, user.get("pw_salt"), user.get("pw_hash")):
+            raise HTTPException(status_code=401, detail="Invalid password")
+        # enqueue deletion of consents for this user
+        resp = enqueue_delete_job(user_id=user.get("id"))
+        # remove user record and sessions
+        try:
+            p = _users_dir() / f"{user.get('id')}.json"
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+        # remove all sessions for user
+        for s in _sessions_dir().glob("session_*.json"):
+            try:
+                data = json.loads(s.read_text(encoding="utf-8"))
+                if data.get("user_id") == user.get("id"):
+                    s.unlink()
+            except Exception:
+                continue
+        _consent_audit("account_delete_requested", {"user_id": user.get("id")})
+        return resp
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/account")
+def account_update(payload: dict, request: Request):
+    try:
+        user = _require_auth(request)
+        # allow updating email and team info
+        allowed = {"email", "team_name", "team_members"}
+        changed = False
+        for k, v in payload.items():
+            if k in allowed:
+                user[k] = v
+                changed = True
+        if changed:
+            p = _users_dir() / f"{user.get('id')}.json"
+            p.write_text(json.dumps(user, indent=2, ensure_ascii=False), encoding="utf-8")
+            _consent_audit("account_update", {"user_id": user.get("id"), "changes": {k: payload.get(k) for k in payload if k in allowed}})
+        safe = {kk: vv for kk, vv in user.items() if kk not in ("pw_hash", "pw_salt")}
+        return safe
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 @app.post("/preview")

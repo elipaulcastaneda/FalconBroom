@@ -16,7 +16,7 @@ try:
 except Exception:
     pl = None
 
-from datetime import datetime
+from datetime import datetime, timezone
 try:
     from dateutil import parser as _dateutil_parser  # type: ignore
 except Exception:
@@ -2569,7 +2569,7 @@ class Cleaner:
         snaps_dir = Path("data") / "history" / "snapshots"
         if not snaps_dir.exists():
             return {"deleted": 0, "remaining": 0}
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         deleted = 0
         remaining = 0
         for p in snaps_dir.iterdir():
@@ -2885,7 +2885,7 @@ class Cleaner:
                         for chunk in iter(lambda: fh.read(8192), b""):
                             h.update(chunk)
                     short = h.hexdigest()[:10]
-                    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                     snap_name = f"{src_p.stem}_snapshot_{ts}_{short}{src_p.suffix}"
                     snap_path = snaps_dir / snap_name
                     shutil.copyfile(str(src_p), str(snap_path))

@@ -1,0 +1,9 @@
+{
+  "refresh_jti": "23c17ca4f8a244a3bfcb235dbc02ba85",
+  "access_jti": "a50f42b83a3346f7b91aadcdc5e953c8",
+  "user_id": "user_ae3bc0e3",
+  "created_at": "2026-06-22T23:23:19.924393Z",
+  "last_seen": "2026-06-22T23:23:19.924393Z",
+  "ip": "127.0.0.1",
+  "user_agent": "python-requests/2.34.2"
+}
