@@ -1,7 +1,7 @@
 from pathlib import Path
 from uuid import uuid4
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import shutil
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, Request, Response, WebSocket, WebSocketDisconnect
@@ -49,6 +49,83 @@ import traceback
 
 app = FastAPI(title="FalconBroom Prototype API")
 
+
+# -- Sensitive file encryption helpers -------------------------------------------------
+def _get_fernet():
+    try:
+        from cryptography.fernet import Fernet
+    except Exception:
+        return None
+    key = os.environ.get('DATA_ENC_KEY')
+    key_file = os.environ.get('DATA_ENC_KEY_FILE')
+    if key_file:
+        try:
+            kf = Path(key_file)
+            if kf.exists():
+                key = kf.read_text(encoding='utf-8').strip()
+        except Exception:
+            key = key
+    if not key:
+        return None
+    try:
+        return Fernet(key.encode('utf-8'))
+    except Exception:
+        try:
+            # maybe key already bytes/base64
+            return Fernet(key)
+        except Exception:
+            return None
+
+
+def save_sensitive_bytes(path: Path, data: bytes) -> Path:
+    f = _get_fernet()
+    if f:
+        out = Path(str(path) + '.enc') if not str(path).endswith('.enc') else path
+        out.write_bytes(f.encrypt(data))
+        try:
+            out.chmod(0o600)
+        except Exception:
+            pass
+        return out
+    else:
+        path.write_bytes(data)
+        try:
+            path.chmod(0o600)
+        except Exception:
+            pass
+        return path
+
+
+def save_sensitive_json(path: Path, obj) -> Path:
+    b = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+    return save_sensitive_bytes(path, b)
+
+
+def load_sensitive_json(path: Path):
+    if not path.exists():
+        return None
+    f = _get_fernet()
+    try:
+        # prefer reading bytes for encrypted files
+        raw = path.read_bytes()
+        if f:
+            try:
+                raw = f.decrypt(raw)
+            except Exception:
+                # if decryption fails, fall back to attempting utf-8 decode
+                pass
+        try:
+            return json.loads(raw.decode('utf-8'))
+        except Exception:
+            return None
+    except Exception:
+        try:
+            return json.loads(path.read_text(encoding='utf-8'))
+        except Exception:
+            return None
+
+# -------------------------------------------------------------------------------------
+
 # Application-wide JWT settings (cache a secret so tokens remain verifiable across calls)
 JWT_SECRET = os.environ.get("JWT_SECRET") or uuid4().hex
 JWT_ALGO = os.environ.get("JWT_ALGO") or "HS256"
@@ -75,6 +152,96 @@ INSPECTIONS_DIR = Path("data") / "inspections"
 INSPECTIONS_DIR.mkdir(parents=True, exist_ok=True)
 JOBS_DIR = Path("data") / "jobs"
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
+PRIVACY_DIR = Path("data") / "privacy"
+PRIVACY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _privacy_file(name: str) -> Path:
+    return PRIVACY_DIR / name
+
+
+def _load_privacy_json(name: str, default=None):
+    p = _privacy_file(name)
+    if not p.exists():
+        return default if default is not None else {}
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return default if default is not None else {}
+
+
+def _save_privacy_json(name: str, data):
+    p = _privacy_file(name)
+    p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _privacy_audit(event: str, payload: dict):
+    rec = {"id": f"rec_{uuid4().hex[:8]}", "event": event, "timestamp": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), "payload": payload}
+    logs = _load_privacy_json("privacy_records.json", []) or []
+    logs.insert(0, rec)
+    # keep most recent 1000
+    _save_privacy_json("privacy_records.json", logs[:1000])
+    # also write single record file for audit
+    try:
+        p = PRIVACY_DIR / f"{rec['id']}.json"
+        p.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        _append_audit_event(PRIVACY_DIR, event, payload or {})
+    except Exception:
+        pass
+
+
+def _append_audit_event(audit_dir: Path, event: str, payload: dict):
+    """Append a tamper-evident audit record using an HMAC chain.
+    Stores `audit.log` and a small `audit.prev` file containing the last HMAC.
+    Requires `AUDIT_HMAC_KEY` env var to enable HMAC; otherwise falls back to plain append.
+    """
+    try:
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        audit_file = audit_dir / "audit.log"
+        prev_file = audit_dir / "audit.prev"
+        now_ts = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
+        entry = {"event": event, "payload": payload or {}, "ts": now_ts}
+        # compact deterministic JSON for HMAC
+        raw = json.dumps(entry, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
+        key = os.environ.get("AUDIT_HMAC_KEY")
+        if key:
+            try:
+                import hmac, hashlib
+                prev = prev_file.read_text(encoding='utf-8') if prev_file.exists() else ""
+                mac = hmac.new(key.encode('utf-8'), (prev + raw).encode('utf-8'), hashlib.sha256).hexdigest()
+                rec = {"data": entry, "hmac": mac}
+                with open(audit_file, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                try:
+                    prev_file.write_text(mac, encoding='utf-8')
+                except Exception:
+                    pass
+                return True
+            except Exception:
+                # fall through to plain append
+                pass
+        # fallback plain append
+        try:
+            with open(audit_file, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            return True
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+
+def _is_opted_out(user_id: Optional[str] = None, email: Optional[str] = None) -> bool:
+    outs = _load_privacy_json("opt_outs.json", []) or []
+    for o in outs:
+        if user_id and o.get("user_id") and str(o.get("user_id")) == str(user_id):
+            return True
+        if email and o.get("email") and str(o.get("email")).lower() == str(email).lower():
+            return True
+    return False
 
 
 # Connected websockets for broadcasting shared-upload updates
@@ -136,6 +303,7 @@ class JoinPreviewSpec(BaseModel):
 class JoinExportSpec(JoinPreviewSpec):
     export_format: Optional[str] = "csv"  # csv,xlsx,pandas,sql
     filename: Optional[str] = None
+    target_user: Optional[str] = None
 
 
 class SourceResolveSpec(BaseModel):
@@ -162,7 +330,7 @@ def health():
 
 
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+async def upload_file(request: Request, file: UploadFile = File(...)):
     try:
         filename = file.filename or "upload"
         source_path = Path(filename)
@@ -177,6 +345,27 @@ async def upload_file(file: UploadFile = File(...)):
 
         target.write_bytes(contents)
         conversion = convert_uploaded_file(target, UPLOAD_DIR)
+        # persist simple metadata (owner if authenticated)
+        try:
+            owner = None
+            try:
+                user = _require_auth(request)
+                owner = {"user_id": user.get("id"), "username": user.get("username"), "email": user.get("email")}
+            except Exception:
+                user = None
+            meta = Path(conversion["path"]).parent / (Path(conversion["path"]).name + ".meta.json")
+            existing = {}
+            if meta.exists():
+                try:
+                    existing = json.loads(meta.read_text(encoding="utf-8"))
+                except Exception:
+                    existing = {}
+            if owner:
+                existing["owner"] = owner
+            existing.setdefault("uploaded_at", datetime.now(timezone.utc).isoformat().replace('+00:00','Z'))
+            meta.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
         # notify websocket clients of updated uploads list
         try:
             import asyncio
@@ -438,8 +627,15 @@ def _consent_audit(action: str, payload: dict):
                 return d
 
         entry = {"action": action, "payload": _redact(payload or {}), "ts": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}
-        with open(audit_file, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        try:
+            _append_audit_event(CONSENT_DIR, action, _redact(payload or {}))
+        except Exception:
+            # fallback to plain write
+            try:
+                with open(audit_file, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -843,7 +1039,7 @@ def approve_recipe(rid: str):
 
 
 @app.post("/recipes/{rid}/run")
-def run_recipe(rid: str, export_format: str = "csv"):
+def run_recipe(rid: str, request: Request, export_format: str = "csv"):
     p = RECIPES_DIR / f"{rid}.json"
     if not p.exists():
         raise HTTPException(status_code=404, detail="Recipe not found")
@@ -891,6 +1087,16 @@ def run_recipe(rid: str, export_format: str = "csv"):
         "status": "running",
         "export_format": export_format,
     }
+    # attach owner if request is authenticated
+    try:
+        if request is not None:
+            try:
+                user = _require_auth(request)
+                run_record["owner"] = {"user_id": user.get("id"), "username": user.get("username"), "email": user.get("email")}
+            except Exception:
+                pass
+    except Exception:
+        pass
     history_path = HISTORY_DIR / f"{run_id}.json"
     history_path.write_text(json.dumps(run_record, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -1107,6 +1313,9 @@ def list_uploads():
                         mj = json.loads(meta.read_text(encoding="utf-8"))
                         if mj.get("explanations_history"):
                             item["explanations_history"] = mj.get("explanations_history")
+                        # include owner metadata if present
+                        if mj.get("owner"):
+                            item["owner"] = mj.get("owner")
                 except Exception:
                     pass
                 out.append(item)
@@ -1180,7 +1389,7 @@ def dedupe_history(by: str = "output_path"):
 
 
 @app.post("/recipes/{rid}/export_sheets")
-def export_recipe_to_sheets(rid: str, sheet_name: str = "Sheet1"):
+def export_recipe_to_sheets(rid: str, sheet_name: str = "Sheet1", target_user: Optional[str] = None):
     p = RECIPES_DIR / f"{rid}.json"
     if not p.exists():
         raise HTTPException(status_code=404, detail="Recipe not found")
@@ -1201,7 +1410,21 @@ def export_recipe_to_sheets(rid: str, sheet_name: str = "Sheet1"):
     latest = sorted(completed, key=lambda r: r.get("finished_at", ""), reverse=True)[0]
     output_path = latest.get("output_path")
 
+    def _owner_opt_out_from_run(record):
+        try:
+            owner = record.get("owner")
+            if owner and owner.get("user_id") and _is_opted_out(user_id=owner.get("user_id")):
+                return True
+        except Exception:
+            pass
+        return False
+
     export_id = f"export_{uuid4().hex[:8]}"
+    # if explicit target_user provided, block if they opted out
+    if target_user and _is_opted_out(user_id=target_user):
+        _privacy_audit("blocked_recipe_export_target_opt_out", {"recipe_id": rid, "target_user": target_user})
+        raise HTTPException(status_code=403, detail="Target user has opted out of exports")
+
     token = _google_drive_access_token()
     record = {
         "id": export_id,
@@ -1210,6 +1433,16 @@ def export_recipe_to_sheets(rid: str, sheet_name: str = "Sheet1"):
         "output_path": output_path,
         "sheet_name": sheet_name,
     }
+
+    # If the latest completed run's owner has opted out, block this export
+    try:
+        if latest and _owner_opt_out_from_run(latest):
+            _privacy_audit("blocked_recipe_export_owner_opt_out", {"recipe_id": rid, "run": latest.get("id")})
+            raise HTTPException(status_code=403, detail="Recipe run owner has opted out of exports")
+    except HTTPException:
+        raise
+    except Exception:
+        pass
 
     if not token:
         record["status"] = "pending_auth"
@@ -1460,6 +1693,11 @@ def join_preview(spec: JoinPreviewSpec):
 @app.post("/join-export")
 def join_export(spec: JoinExportSpec):
     try:
+        # If explicit target_user provided, block if they opted out
+        if spec.target_user and _is_opted_out(user_id=spec.target_user):
+            _privacy_audit("blocked_join_export_target_opt_out", {"target_user": spec.target_user})
+            raise HTTPException(status_code=403, detail="Target user has opted out of exports")
+
         left_res = resolve_source(spec.left_path)
         right_res = resolve_source(spec.right_path)
         if not left_res.exists:
@@ -1469,6 +1707,24 @@ def join_export(spec: JoinExportSpec):
 
         left_df = _read_table(left_res.materialized_path or left_res.path)
         right_df = _read_table(right_res.materialized_path or right_res.path)
+
+        # If either source has owner metadata and that owner opted out, block
+        try:
+            for src in [left_res, right_res]:
+                try:
+                    meta = Path(src.path).parent / (Path(src.path).name + ".meta.json")
+                    if meta.exists():
+                        mj = json.loads(meta.read_text(encoding="utf-8"))
+                        owner = mj.get("owner")
+                        if owner and owner.get("user_id") and _is_opted_out(user_id=owner.get("user_id")):
+                            _privacy_audit("blocked_join_export_owner_opt_out", {"owner": owner, "source": src.path})
+                            raise HTTPException(status_code=403, detail="One of the source owners has opted out of exports")
+                except HTTPException:
+                    raise
+                except Exception:
+                    pass
+        except HTTPException:
+            raise
 
         left_on = spec.left_on
         right_on = spec.right_on
@@ -1880,6 +2136,11 @@ def persist_explanations(spec: ExplanationsLogSpec):
 @app.post("/consent/export-job")
 def enqueue_export_job(user_id: Optional[str] = None):
     try:
+        # block jobs targeting opted-out users
+        if user_id and _is_opted_out(user_id=user_id):
+            _consent_audit("blocked_enqueue_export_opt_out", {"user_id": user_id})
+            raise HTTPException(status_code=403, detail="Target user has opted out of exports")
+
         job = {"type": "export_consents", "user_id": user_id, "status": "pending", "created_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}
         jid = _write_job(job)
         _consent_audit("enqueue_export", {"job_id": jid, "user_id": user_id})
@@ -1927,6 +2188,11 @@ def get_job_status(job_id: str, download: bool = False):
         job = json.loads(jf.read_text(encoding="utf-8"))
         if download:
             res = job.get("result") or {}
+            # if job targeted a specific user, block download if they opted out
+            target_user = job.get("user_id")
+            if target_user and _is_opted_out(user_id=target_user):
+                _consent_audit("blocked_job_download_opt_out", {"job_id": job_id, "user_id": target_user})
+                raise HTTPException(status_code=403, detail="Target user has opted out of exports")
             export_path = res.get("export_path")
             if export_path and Path(export_path).exists():
                 return FileResponse(export_path, filename=Path(export_path).name, media_type='application/json', headers={"Content-Disposition": f"attachment; filename=\"{Path(export_path).name}\""})
@@ -1996,6 +2262,11 @@ def export_consents(user_id: Optional[str] = None):
         out = []
         if not CONSENT_DIR.exists():
             return {"consents": []}
+        # if exporting consents for a specific user, ensure they have not opted out
+        if user_id and _is_opted_out(user_id=user_id):
+            _consent_audit("blocked_export_opt_out", {"user_id": user_id})
+            raise HTTPException(status_code=403, detail="Target user has opted out of exports")
+
         for p in sorted(CONSENT_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
             try:
                 data = json.loads(p.read_text(encoding="utf-8"))
@@ -2083,6 +2354,11 @@ def _process_export_job(job: dict):
     jid = job.get("id")
     user_id = job.get("user_id")
     try:
+        # If the job targets an opted-out user, abort and audit
+        if user_id and _is_opted_out(user_id=user_id):
+            _consent_audit("blocked_process_export_opt_out", {"job_id": jid, "user_id": user_id})
+            return {"error": "target_user_opted_out"}
+
         # gather consents matching user_id (or all)
         CONSENT_DIR = Path("data") / "consents"
         out = []
@@ -2519,6 +2795,25 @@ def _require_auth(request: Request):
     return user
 
 
+def _require_admin(request: Request):
+    # allow admin by bearer token user role or by ADMIN_TOKEN header
+    try:
+        user = None
+        try:
+            user = _require_auth(request)
+        except Exception:
+            user = None
+        if user and (user.get('role') == 'admin' or user.get('is_admin')):
+            return user
+        # fallback: allow with ADMIN_TOKEN env var or AUDIT_EXPORT_KEY header
+        hdr = request.headers.get('X-Admin-Token') or request.headers.get('X-Audit-Export-Key')
+        if hdr and (hdr == os.environ.get('ADMIN_TOKEN') or hdr == os.environ.get('AUDIT_EXPORT_KEY')):
+            return {'id': 'system', 'username': 'admin-token'}
+    except Exception:
+        pass
+    raise HTTPException(status_code=403, detail='Admin required')
+
+
 @app.post("/signup")
 def signup(spec: UserCreate):
     try:
@@ -2818,17 +3113,40 @@ def dsar_request(request: Request, payload: dict):
         dsar_dir.mkdir(parents=True, exist_ok=True)
         dsar_id = f"dsar_{uuid4().hex[:8]}"
         record = {"id": dsar_id, "user_id": user.get("id"), "action": action, "requested_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), "status": "requested"}
-        # verify identity for delete requests
+        # verification: for delete requests, allow password or email verification token
         if action == "delete":
             pwd = payload.get("password")
-            if not pwd or not _verify_password(pwd, user.get("pw_salt"), user.get("pw_hash")):
-                raise HTTPException(status_code=401, detail="Identity verification failed")
+            if pwd and _verify_password(pwd, user.get("pw_salt"), user.get("pw_hash")):
+                record["status"] = "verified"
+                record["verification_method"] = "password"
+            else:
+                # send verification email with short-lived token
+                try:
+                    token = _make_verification_token(user.get("id"), user.get("email"), expires_seconds=60*30)
+                    # decode to extract jti
+                    try:
+                        dec = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+                        record["verify_jti"] = dec.get("jti")
+                        record["verify_expires"] = dec.get("exp")
+                    except Exception:
+                        record["verify_jti"] = None
+                    link = os.environ.get("APP_URL", "http://localhost:3000") + f"/dsar/verify?token={token}"
+                    _send_email_message(user.get("email"), "Verify your DSAR deletion request", f"Click to verify deletion: {link}\nThis link expires in 30 minutes.")
+                    record["status"] = "verification_sent"
+                    record["verification_sent_at"] = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
+                except Exception:
+                    # fall back to requiring password if email fails
+                    pass
         # write request record and audit
         out = dsar_dir / f"{dsar_id}.json"
-        out.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
-        audit_dir = dsar_dir / "audit.log"
-        with open(audit_dir, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"dsar_id": dsar_id, "user_id": user.get("id"), "action": action, "ts": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}) + "\n")
+        try:
+            save_sensitive_json(out, record)
+        except Exception:
+            out.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+        try:
+            _append_audit_event(dsar_dir, "dsar_requested", {"dsar_id": dsar_id, "user_id": user.get("id"), "action": action})
+        except Exception:
+            pass
         # For exports, create an export artifact synchronously for now
         if action == "export":
             try:
@@ -2875,15 +3193,35 @@ def dsar_delete(request: Request, payload: dict):
     try:
         user = _require_auth(request)
         pwd = payload.get("password")
-        if not pwd or not _verify_password(pwd, user.get("pw_salt"), user.get("pw_hash")):
+        # allow deletion if password verified OR a prior DSAR verification was completed
+        verified = False
+        if pwd and _verify_password(pwd, user.get("pw_salt"), user.get("pw_hash")):
+            verified = True
+        else:
+            # look for a verified DSAR record for this user
+            try:
+                dsar_dir = Path("data") / "dsar"
+                for p in dsar_dir.glob("dsar_*.json"):
+                    try:
+                        r = json.loads(p.read_text(encoding="utf-8"))
+                        if r.get("user_id") == user.get("id") and r.get("action") == "delete" and r.get("status") == "verified":
+                            verified = True
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        if not verified:
             raise HTTPException(status_code=401, detail="Identity verification failed")
-        # perform deletion: user file, sessions, uploads owned by user (best-effort), consents
+        # perform deletion: user file, sessions, uploads owned by user, outputs and history (best-effort)
         uid = user.get("id")
+        deleted = []
         # delete user file
         try:
             p = _users_dir() / f"{uid}.json"
             if p.exists():
                 p.unlink()
+                deleted.append(str(p))
         except Exception:
             pass
         # delete sessions
@@ -2893,16 +3231,777 @@ def dsar_delete(request: Request, payload: dict):
                     s = _read_session_file(p)
                     if s.get("user_id") == uid:
                         p.unlink()
+                        deleted.append(str(p))
                 except Exception:
                     continue
         except Exception:
             pass
-        # record audit
+        # delete uploads where meta.owner matches user
+        try:
+            for p in UPLOAD_DIR.iterdir():
+                try:
+                    if not p.is_file():
+                        continue
+                    meta = p.parent / (p.name + ".meta.json")
+                    owner = {}
+                    if meta.exists():
+                        try:
+                            owner = json.loads(meta.read_text(encoding="utf-8"))
+                        except Exception:
+                            owner = {}
+                    o = owner.get("owner") or {}
+                    if o.get("user_id") == uid or (o.get("email") and o.get("email").lower() == (user.get("email") or "").lower()):
+                        try:
+                            p.unlink()
+                        except Exception:
+                            pass
+                        try:
+                            if meta.exists():
+                                meta.unlink()
+                        except Exception:
+                            pass
+                        deleted.append(str(p))
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        # delete history/run records and associated outputs owned by user
+        try:
+            for p in HISTORY_DIR.glob("*.json"):
+                try:
+                    j = json.loads(p.read_text(encoding="utf-8"))
+                    owner = j.get("owner") or {}
+                    if owner.get("user_id") == uid:
+                        # delete referenced output files if present
+                        # common naming: {rid}_{run_id} or run id in filename
+                        run_id = j.get("id")
+                        rid = j.get("recipe_id")
+                        try:
+                            for outp in OUTPUTS_DIR.iterdir():
+                                try:
+                                    if run_id and run_id in outp.name:
+                                        outp.unlink()
+                                        deleted.append(str(outp))
+                                    elif rid and rid in outp.name:
+                                        # also try recipe-based outputs
+                                        outp.unlink()
+                                        deleted.append(str(outp))
+                                except Exception:
+                                    continue
+                        except Exception:
+                            pass
+                        try:
+                            p.unlink()
+                            deleted.append(str(p))
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # best-effort: delete any outputs that reference user id in filename
+        try:
+            for outp in OUTPUTS_DIR.iterdir():
+                try:
+                    if (user.get("id") and user.get("id") in outp.name) or (user.get("email") and user.get("email") in outp.name):
+                        try:
+                            outp.unlink()
+                            deleted.append(str(outp))
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        # write propagation record for third-party/manual actions
+        try:
+            dsar_dir = Path("data") / "dsar"
+            dsar_dir.mkdir(parents=True, exist_ok=True)
+            prop = dsar_dir / f"propagation_{uuid4().hex[:8]}.json"
+            try:
+                save_sensitive_json(prop, {"user_id": uid, "deleted": deleted, "ts": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')})
+            except Exception:
+                prop.write_text(json.dumps({"user_id": uid, "deleted": deleted, "ts": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')} , indent=2), encoding="utf-8")
+            # audit
+            try:
+                _append_audit_event(dsar_dir, "delete", {"user_id": uid, "deleted_count": len(deleted)})
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        return {"ok": True, "deleted_count": len(deleted)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/dsar/verify")
+def dsar_verify(payload: dict):
+    """Verify an emailed DSAR token. payload: { token: '<jwt token>' }"""
+    try:
+        token = payload.get("token")
+        if not token:
+            raise HTTPException(status_code=400, detail="Missing token")
+        try:
+            data = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid or expired token")
+        if data.get("purpose") != "verify_email":
+            raise HTTPException(status_code=400, detail="Invalid token purpose")
+        uid = data.get("sub")
+        jti = data.get("jti")
+        dsar_dir = Path("data") / "dsar"
+        found = None
+        for p in dsar_dir.glob("dsar_*.json*"):
+            try:
+                r = load_sensitive_json(p) or json.loads(p.read_text(encoding="utf-8"))
+                if r.get("user_id") == uid and r.get("action") == "delete" and r.get("status") == "verification_sent":
+                    # match jti if present
+                    if not r.get("verify_jti") or r.get("verify_jti") == jti:
+                        found = (p, r)
+                        break
+            except Exception:
+                continue
+        if not found:
+            raise HTTPException(status_code=404, detail="Pending DSAR not found")
+        p, r = found
+        r["status"] = "verified"
+        r["verified_at"] = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
+        r["verification_method"] = r.get("verification_method") or "email"
+        try:
+            save_sensitive_json(p, r)
+        except Exception:
+            p.write_text(json.dumps(r, indent=2, ensure_ascii=False), encoding="utf-8")
+        # audit
+        try:
+            _append_audit_event(dsar_dir, "dsar_verified", {"dsar_id": r.get("id"), "user_id": uid})
+        except Exception:
+            pass
+        return {"ok": True, "dsar_id": r.get("id")}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _process_propagation_file(path: Path):
+    try:
+        dsar_dir = path.parent
+        processed_dir = dsar_dir / "processed"
+        processed_dir.mkdir(parents=True, exist_ok=True)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        # attempt third-party deletions (Google Sheets, Drive). On failure, enqueue for retry.
+        results = {"processed_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), "actions": []}
+        sheets = data.get("google_sheets") or []
+        drive_ids = data.get("google_drive") or []
+        try:
+            # Lazy import of google client libs if available
+            creds_json = os.environ.get('GOOGLE_SERVICE_ACCOUNT_JSON')
+            google_available = False
+            if creds_json:
+                try:
+                    from google.oauth2.service_account import Credentials
+                    from googleapiclient.discovery import build
+                    google_available = True
+                except Exception:
+                    google_available = False
+            else:
+                google_available = False
+        except Exception:
+            google_available = False
+
+        def _enqueue_propagation_retry(item, reason):
+            qdir = Path('data') / 'queue' / 'propagation'
+            qdir.mkdir(parents=True, exist_ok=True)
+            rec = {'original_file': str(path), 'item': item, 'reason': reason, 'attempts': 0, 'next_run': datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}
+            qfile = qdir / f"prop_retry_{uuid4().hex}.json"
+            try:
+                save_sensitive_json(qfile, rec)
+            except Exception:
+                qfile.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding='utf-8')
+
+        if sheets:
+            for sid in sheets:
+                if not google_available:
+                    results['actions'].append({'service': 'google_sheets', 'id': sid, 'status': 'queued', 'reason': 'google_client_unavailable'})
+                    _enqueue_propagation_retry({'service': 'google_sheets', 'id': sid}, 'google_client_unavailable')
+                    continue
+                try:
+                    # example: delete spreadsheet file by id from Drive
+                    creds = Credentials.from_service_account_file(creds_json, scopes=["https://www.googleapis.com/auth/drive"])
+                    drive = build('drive', 'v3', credentials=creds)
+                    drive.files().delete(fileId=sid).execute()
+                    results['actions'].append({'service': 'google_sheets', 'id': sid, 'status': 'deleted'})
+                except Exception as e:
+                    results['actions'].append({'service': 'google_sheets', 'id': sid, 'status': 'error', 'error': str(e)})
+                    _enqueue_propagation_retry({'service': 'google_sheets', 'id': sid}, str(e))
+
+        if drive_ids:
+            for did in drive_ids:
+                if not google_available:
+                    results['actions'].append({'service': 'google_drive', 'id': did, 'status': 'queued', 'reason': 'google_client_unavailable'})
+                    _enqueue_propagation_retry({'service': 'google_drive', 'id': did}, 'google_client_unavailable')
+                    continue
+                try:
+                    creds = Credentials.from_service_account_file(creds_json, scopes=["https://www.googleapis.com/auth/drive"])
+                    drive = build('drive', 'v3', credentials=creds)
+                    drive.files().delete(fileId=did).execute()
+                    results['actions'].append({'service': 'google_drive', 'id': did, 'status': 'deleted'})
+                except Exception as e:
+                    results['actions'].append({'service': 'google_drive', 'id': did, 'status': 'error', 'error': str(e)})
+                    _enqueue_propagation_retry({'service': 'google_drive', 'id': did}, str(e))
+        # mark as processed and persist a processed artifact
+        out = processed_dir / f"{path.stem}_processed.json"
+        out.write_text(json.dumps({"original": str(path), "data": data, "results": results}, indent=2, ensure_ascii=False), encoding="utf-8")
+        # remove original propagation request
+        try:
+            path.unlink()
+        except Exception:
+            pass
+        # audit
+        try:
+            _append_audit_event(dsar_dir, "propagation_processed", {"file": str(out), "results": results})
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
+async def _dsar_propagation_worker():
+    import asyncio
+    while True:
+        try:
+            dsar_dir = Path("data") / "dsar"
+            if not dsar_dir.exists():
+                await asyncio.sleep(5)
+                continue
+            for p in list(dsar_dir.glob("propagation_*.json")):
+                try:
+                    await _process_propagation_file(p)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        await asyncio.sleep(15)
+
+
+@app.on_event("startup")
+def _start_background_workers():
+    try:
+        import asyncio
+        asyncio.create_task(_dsar_propagation_worker())
+    except Exception:
+        pass
+    try:
+        import asyncio
+        asyncio.create_task(_audit_export_worker())
+    except Exception:
+        pass
+    try:
+        import asyncio
+        asyncio.create_task(_retry_queue_worker())
+    except Exception:
+        pass
+
+
+def _collect_audit_logs():
+    """Collect all audit.log JSON-lines from data subdirectories into a list of records."""
+    out = []
+    try:
+        data_root = Path("data")
+        if not data_root.exists():
+            return out
+        for sub in data_root.iterdir():
+            try:
+                audit_file = sub / "audit.log"
+                if audit_file.exists():
+                    for line in audit_file.read_text(encoding='utf-8').splitlines():
+                        try:
+                            j = json.loads(line)
+                            out.append({"source": str(audit_file), "record": j})
+                        except Exception:
+                            # try to treat legacy plain entries
+                            try:
+                                out.append({"source": str(audit_file), "record": json.loads(line)})
+                            except Exception:
+                                out.append({"source": str(audit_file), "raw": line})
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def _sign_payload(payload_bytes: bytes) -> str:
+    key = os.environ.get("AUDIT_HMAC_KEY")
+    if not key:
+        return ""
+    try:
+        import hmac, hashlib
+        mac = hmac.new(key.encode('utf-8'), payload_bytes, hashlib.sha256).hexdigest()
+        return mac
+    except Exception:
+        return ""
+
+
+def _export_audit_once():
+    """Collect audits, sign, POST to AUDIT_EXPORT_URL and optionally write to AUDIT_EXPORT_DIR.
+    Returns dict with result metadata.
+    """
+    try:
+        audits = _collect_audit_logs()
+        payload = {"host": os.environ.get("HOSTNAME") or os.uname().nodename if hasattr(os, 'uname') else os.environ.get("HOSTNAME") or "local", "ts": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), "count": len(audits), "audits": audits}
+        b = json.dumps(payload, ensure_ascii=False).encode('utf-8')
+        sig = _sign_payload(b)
+        export_url = os.environ.get("AUDIT_EXPORT_URL")
+        export_dir = os.environ.get("AUDIT_EXPORT_DIR")
+        result = {"posted": False, "written": False, "url": export_url, "dir": export_dir}
+        # write to local export dir if configured
+        if export_dir:
+            try:
+                ed = Path(export_dir)
+                ed.mkdir(parents=True, exist_ok=True)
+                fname = ed / f"audit_export_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+                try:
+                    saved = save_sensitive_bytes(fname, b)
+                    result["written_path"] = str(saved)
+                except Exception:
+                    fname.write_bytes(b)
+                    result["written_path"] = str(fname)
+                # write signature file next to export
+                try:
+                    sig = _sign_payload(b)
+                    sig_path = Path(str(fname) + '.sig')
+                    try:
+                        save_sensitive_bytes(sig_path, (sig or '').encode('utf-8'))
+                        result['sig_path'] = str(sig_path) + ('.enc' if _get_fernet() else '')
+                    except Exception:
+                        sig_path.write_text(sig or '', encoding='utf-8')
+                        result['sig_path'] = str(sig_path)
+                except Exception:
+                    pass
+                result["written"] = True
+            except Exception:
+                pass
+        # post to external endpoint if configured
+        if export_url:
+            try:
+                from urllib.request import Request as URLRequest, urlopen
+                req = URLRequest(export_url, data=b, method='POST')
+                req.add_header('Content-Type', 'application/json')
+                if sig:
+                    req.add_header('X-Audit-Signature', sig)
+                # optional API key header
+                exp_key = os.environ.get('AUDIT_EXPORT_KEY')
+                if exp_key:
+                    req.add_header('X-Audit-Export-Key', exp_key)
+                with urlopen(req, timeout=30) as resp:
+                    status = getattr(resp, 'status', None) or 200
+                    result['posted'] = (200 <= status < 300)
+                    result['status'] = status
+            except Exception as e:
+                result['error'] = str(e)
+                # enqueue audit export for retry
+                try:
+                    qdir = Path('data') / 'queue' / 'audit_exports'
+                    qdir.mkdir(parents=True, exist_ok=True)
+                    qfile = qdir / f"audit_export_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{uuid4().hex}.json"
+                    qrec = {"payload": json.loads(b.decode('utf-8')), "attempts": 0, "last_error": str(e), "next_run": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}
+                    try:
+                        save_sensitive_json(qfile, qrec)
+                    except Exception:
+                        qfile.write_text(json.dumps(qrec, indent=2, ensure_ascii=False), encoding='utf-8')
+                    result['queued'] = str(qfile)
+                except Exception:
+                    pass
+        return result
+    except Exception as e:
+        return {"error": str(e)}
+
+
+async def _audit_export_worker():
+    import asyncio
+    interval = int(os.environ.get('AUDIT_EXPORT_INTERVAL', '300'))
+    while True:
+        try:
+            _export_audit_once()
+        except Exception:
+            pass
+        await asyncio.sleep(interval)
+
+
+async def _retry_queue_worker():
+    import asyncio
+    while True:
+        try:
+            qroot = Path('data') / 'queue'
+            # process audit export retries
+            adir = qroot / 'audit_exports'
+            if adir.exists():
+                for p in sorted(adir.iterdir()):
+                    try:
+                        j = load_sensitive_json(p) or json.loads(p.read_text(encoding='utf-8'))
+                        # respect next_run
+                        nr = j.get('next_run')
+                        if nr:
+                            try:
+                                nr_dt = datetime.fromisoformat(nr.replace('Z', '+00:00'))
+                            except Exception:
+                                nr_dt = None
+                            if nr_dt and nr_dt > datetime.now(timezone.utc):
+                                continue
+                        # attempt POST again
+                        targ = os.environ.get('AUDIT_EXPORT_URL')
+                        if not targ:
+                            # nothing to do
+                            continue
+                        b = json.dumps(j.get('payload')).encode('utf-8')
+                        from urllib.request import Request as URLRequest, urlopen
+                        req = URLRequest(targ, data=b, method='POST')
+                        req.add_header('Content-Type', 'application/json')
+                        sig = _sign_payload(b)
+                        if sig:
+                            req.add_header('X-Audit-Signature', sig)
+                        exp_key = os.environ.get('AUDIT_EXPORT_KEY')
+                        if exp_key:
+                            req.add_header('X-Audit-Export-Key', exp_key)
+                        try:
+                            with urlopen(req, timeout=30) as resp:
+                                status = getattr(resp, 'status', None) or 200
+                                if 200 <= status < 300:
+                                    try:
+                                        p.unlink()
+                                    except Exception:
+                                        pass
+                                    continue
+                                else:
+                                    raise Exception(f'status:{status}')
+                        except Exception as e:
+                            # exponential backoff
+                            at = j.get('attempts', 0) + 1
+                            delay = min(3600, (2 ** at) * 10)
+                            j['attempts'] = at
+                            j['last_error'] = str(e)
+                            j['next_run'] = (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat().replace('+00:00','Z')
+                            p.write_text(json.dumps(j, indent=2, ensure_ascii=False), encoding='utf-8')
+                            continue
+                    except Exception:
+                        continue
+
+            # process propagation retries
+            pdir = qroot / 'propagation'
+            if pdir.exists():
+                for p in sorted(pdir.iterdir()):
+                    try:
+                        j = load_sensitive_json(p) or json.loads(p.read_text(encoding='utf-8'))
+                        nr = j.get('next_run')
+                        if nr:
+                            try:
+                                nr_dt = datetime.fromisoformat(nr.replace('Z', '+00:00'))
+                            except Exception:
+                                nr_dt = None
+                            if nr_dt and nr_dt > datetime.now(timezone.utc):
+                                continue
+                        # attempt to process the item
+                        item = j.get('item')
+                        # create a temporary propagation file and run process
+                        tmpdir = Path('data') / 'dsar' / 'retry_tmp'
+                        tmpdir.mkdir(parents=True, exist_ok=True)
+                        tmpf = tmpdir / f"prop_{uuid4().hex}.json"
+                        tmpf.write_text(json.dumps({'google_sheets': [item.get('id')]} if item.get('service')=='google_sheets' else {'google_drive': [item.get('id')]}, ensure_ascii=False), encoding='utf-8')
+                        # call processor
+                        await _process_propagation_file(tmpf)
+                        # on success, remove queue file and tmp file
+                        try:
+                            p.unlink()
+                        except Exception:
+                            pass
+                        try:
+                            tmpf.unlink()
+                        except Exception:
+                            pass
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        await asyncio.sleep(20)
+
+
+
+@app.get("/dsar/propagation")
+def dsar_propagation_status(request: Request):
+    try:
+        # require admin
+        user = _require_admin(request)
+        try:
+            _append_audit_event(Path('data') / 'dsar', 'admin_action', {'action': 'dsar_propagation_status', 'by': user.get('id') if user else None})
+        except Exception:
+            pass
         dsar_dir = Path("data") / "dsar"
         dsar_dir.mkdir(parents=True, exist_ok=True)
-        with open(dsar_dir / "audit.log", "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"action": "delete", "user_id": uid, "ts": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}) + "\n")
-        return {"ok": True}
+        pending = []
+        for p in sorted(dsar_dir.glob("propagation_*.json*")):
+            try:
+                j = load_sensitive_json(p) or json.loads(p.read_text(encoding="utf-8"))
+                pending.append({"file": p.name, "payload": j})
+            except Exception:
+                pending.append({"file": p.name, "payload": None})
+        processed = []
+        procdir = dsar_dir / "processed"
+        if procdir.exists():
+            for p in sorted(procdir.iterdir()):
+                try:
+                    j = load_sensitive_json(p) or json.loads(p.read_text(encoding="utf-8"))
+                    processed.append({"file": p.name, "summary": j.get("results")})
+                except Exception:
+                    processed.append({"file": p.name, "summary": None})
+        return {"pending": pending, "processed": processed}
+    except Exception:
+        raise HTTPException(status_code=500, detail="Failed to list propagation status")
+
+
+@app.post("/audit/export")
+def audit_export(request: Request):
+    """Trigger an immediate audit export. Requires admin role or valid export key header."""
+    try:
+        user = None
+        try:
+            user = _require_admin(request)
+        except HTTPException:
+            # allow export via AUDIT_EXPORT_KEY header as fallback
+            hdr = request.headers.get('X-Audit-Export-Key')
+            if not hdr or hdr != os.environ.get('AUDIT_EXPORT_KEY'):
+                raise
+            user = {'id': 'system'}
+        try:
+            _append_audit_event(Path('data') / 'audit', 'admin_action', {'action': 'audit_export', 'by': user.get('id') if user else None})
+        except Exception:
+            pass
+        res = _export_audit_once()
+        return {"ok": True, "result": res}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/queue")
+def admin_queue_list(request: Request, page: Optional[int] = None, page_size: Optional[int] = None, filter: Optional[str] = None, service: Optional[str] = 'all'):
+    """List queued retry items. Supports optional server-side pagination and filtering:
+    - `page` (1-based) and `page_size` for pagination
+    - `filter` substring to match name/path/meta
+    - `service` one of `all`, `audit`, `prop` to filter item types
+    If pagination params are omitted, returns full lists in `audit_exports` and `propagation` for compatibility.
+    """
+    try:
+        user = _require_admin(request)
+        qroot = Path('data') / 'queue'
+        audit_list = []
+        prop_list = []
+        adir = qroot / 'audit_exports'
+        if adir.exists():
+            for p in sorted(adir.iterdir()):
+                try:
+                    j = load_sensitive_json(p) or json.loads(p.read_text(encoding='utf-8'))
+                except Exception:
+                    j = None
+                audit_list.append({"name": p.name, "path": str(p), "meta": j, "_type": 'audit'})
+        pdir = qroot / 'propagation'
+        if pdir.exists():
+            for p in sorted(pdir.iterdir()):
+                try:
+                    j = load_sensitive_json(p) or json.loads(p.read_text(encoding='utf-8'))
+                except Exception:
+                    j = None
+                prop_list.append({"name": p.name, "path": str(p), "meta": j, "_type": 'propagation'})
+
+        # Combined list for filtering/pagination
+        combined = audit_list + prop_list
+        # apply simple filter if requested
+        ftxt = (filter or '').lower().strip()
+        if ftxt:
+            def match_item(it):
+                if ftxt in (it.get('name') or '').lower():
+                    return True
+                if ftxt in (it.get('path') or '').lower():
+                    return True
+                try:
+                    if ftxt in json.dumps(it.get('meta') or {}).lower():
+                        return True
+                except Exception:
+                    pass
+                return False
+            combined = [it for it in combined if match_item(it)]
+
+        # apply service filter if requested
+        if service and service != 'all':
+            if service == 'audit':
+                combined = [it for it in combined if it.get('_type') == 'audit']
+            elif service == 'prop':
+                combined = [it for it in combined if it.get('_type') == 'propagation']
+
+        # if pagination requested, slice and return a paginated response
+        if page is not None and page_size is not None:
+            try:
+                page_i = max(1, int(page))
+                psize = max(1, int(page_size))
+            except Exception:
+                raise HTTPException(status_code=400, detail='Invalid page or page_size')
+            total = len(combined)
+            pages = max(1, (total + psize - 1) // psize)
+            page_i = min(page_i, pages)
+            start = (page_i - 1) * psize
+            end = start + psize
+            slice_items = combined[start:end]
+            try:
+                _append_audit_event(Path('data') / 'audit', 'admin_action', {'action': 'admin_queue_list', 'by': user.get('id') if user else None, 'page': page_i, 'page_size': psize, 'filter': filter, 'service': service})
+            except Exception:
+                pass
+            return {
+                'queue': {
+                    'items': slice_items,
+                    'total': total,
+                    'page': page_i,
+                    'pages': pages,
+                    'page_size': psize,
+                }
+            }
+
+        # default behavior: return full lists for compatibility
+        try:
+            _append_audit_event(Path('data') / 'audit', 'admin_action', {'action': 'admin_queue_list', 'by': user.get('id') if user else None})
+        except Exception:
+            pass
+        return {"audit_exports": audit_list, "propagation": prop_list}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/admin/queue/run')
+def admin_queue_run(request: Request, payload: dict):
+    try:
+        user = _require_admin(request)
+        path_str = payload.get('path')
+        if not path_str:
+            raise HTTPException(status_code=400, detail='Missing path')
+        # ensure path is under data/queue
+        qroot = Path('data') / 'queue'
+        target = Path(path_str)
+        try:
+            target = target if target.is_absolute() else Path(str(target))
+            # canonicalize relative to workspace
+            resolved = (Path.cwd() / target).resolve()
+        except Exception:
+            resolved = target
+        if str(resolved).find(str((Path.cwd() / qroot).resolve())) != 0:
+            raise HTTPException(status_code=400, detail='Invalid path')
+        if not resolved.exists():
+            raise HTTPException(status_code=404, detail='Queue item not found')
+        # read item (supports encrypted queue files)
+        try:
+            j = load_sensitive_json(resolved) or json.loads(resolved.read_text(encoding='utf-8'))
+        except Exception as e:
+            raise HTTPException(status_code=400, detail='Invalid queue item')
+        # audit
+        try:
+            _append_audit_event(Path('data') / 'audit', 'admin_action', {'action': 'admin_queue_run', 'file': str(resolved), 'by': user.get('id') if user else None})
+        except Exception:
+            pass
+        # dispatch based on content
+        if j.get('payload') is not None:
+            # audit export retry
+            targ = os.environ.get('AUDIT_EXPORT_URL')
+            if not targ:
+                raise HTTPException(status_code=400, detail='No AUDIT_EXPORT_URL configured')
+            b = json.dumps(j.get('payload')).encode('utf-8')
+            try:
+                from urllib.request import Request as URLRequest, urlopen
+                req = URLRequest(targ, data=b, method='POST')
+                req.add_header('Content-Type', 'application/json')
+                sig = _sign_payload(b)
+                if sig:
+                    req.add_header('X-Audit-Signature', sig)
+                exp_key = os.environ.get('AUDIT_EXPORT_KEY')
+                if exp_key:
+                    req.add_header('X-Audit-Export-Key', exp_key)
+                with urlopen(req, timeout=30) as resp:
+                    status = getattr(resp, 'status', None) or 200
+                    ok = (200 <= status < 300)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f'Post failed: {e}')
+            if ok:
+                try:
+                    resolved.unlink()
+                except Exception:
+                    pass
+                return {'ok': True, 'status': 'posted'}
+            raise HTTPException(status_code=500, detail='Failed to post')
+        elif j.get('item') is not None:
+            # propagation retry
+            item = j.get('item')
+            tmpdir = Path('data') / 'dsar' / 'retry_tmp'
+            tmpdir.mkdir(parents=True, exist_ok=True)
+            tmpf = tmpdir / f"prop_admin_{uuid4().hex}.json"
+            try:
+                if item.get('service') == 'google_sheets':
+                    tmpf.write_text(json.dumps({'google_sheets': [item.get('id')]}, ensure_ascii=False), encoding='utf-8')
+                else:
+                    tmpf.write_text(json.dumps({'google_drive': [item.get('id')]}, ensure_ascii=False), encoding='utf-8')
+                import asyncio
+                ok = asyncio.run(_process_propagation_file(tmpf))
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+            try:
+                if ok:
+                    resolved.unlink()
+                    try:
+                        tmpf.unlink()
+                    except Exception:
+                        pass
+                    return {'ok': True, 'status': 'processed'}
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail='Processing failed')
+        else:
+            raise HTTPException(status_code=400, detail='Unknown queue item')
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete('/admin/queue')
+def admin_queue_delete(request: Request, payload: dict):
+    try:
+        user = _require_admin(request)
+        path_str = payload.get('path')
+        if not path_str:
+            raise HTTPException(status_code=400, detail='Missing path')
+        target = Path(path_str)
+        try:
+            resolved = (Path.cwd() / target).resolve()
+        except Exception:
+            resolved = target
+        qroot = Path('data') / 'queue'
+        if str(resolved).find(str((Path.cwd() / qroot).resolve())) != 0:
+            raise HTTPException(status_code=400, detail='Invalid path')
+        if resolved.exists():
+            try:
+                resolved.unlink()
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+        try:
+            _append_audit_event(Path('data') / 'audit', 'admin_action', {'action': 'admin_queue_delete', 'file': str(resolved), 'by': user.get('id') if user else None})
+        except Exception:
+            pass
+        return {'ok': True}
     except HTTPException:
         raise
     except Exception as e:
@@ -3007,6 +4106,11 @@ def share_upload(name: str, payload: dict, request: Request):
         upath = UPLOAD_DIR / name
         if not upath.exists():
             raise HTTPException(status_code=404, detail="Upload not found")
+        # enforce opt-out: do not allow sharing if user opted-out of sale/targeting
+        if _is_opted_out(user.get('id'), user.get('email')) and shared:
+            _privacy_audit("prevent_share_opt_out", {"user": user.get('id'), "email": user.get('email'), "file": str(upath)})
+            raise HTTPException(status_code=403, detail="User has opted out of sharing/sale/targeting")
+
         meta = {
             "shared_with_team": shared,
             "shared_by": user.get("id"),
@@ -3025,6 +4129,7 @@ def share_upload(name: str, payload: dict, request: Request):
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
         _consent_audit("upload_share", {"user": user.get("id"), "file": str(upath), "shared": shared})
+        _privacy_audit("upload_share", {"user": user.get("id"), "file": str(upath), "shared": shared})
         try:
             import asyncio
             asyncio.create_task(_broadcast_shared_update_message({"type": "shared_changed", "file": str(upath), "shared": shared}))
@@ -3057,6 +4162,176 @@ def list_shared_uploads():
     except Exception:
         pass
     return {"uploads": sorted(out, key=lambda r: r.get("shared_at") or "", reverse=True)}
+
+
+@app.post("/privacy/optout")
+def privacy_optout(payload: dict, request: Request):
+    try:
+        # allow anonymous opt-out by email or authenticated user
+        user = None
+        try:
+            user = _require_auth(request)
+        except Exception:
+            user = None
+        email = payload.get("email") or (user and user.get("email"))
+        user_id = payload.get("user_id") or (user and user.get("id"))
+        reason = payload.get("reason") or payload.get("note")
+        if not email and not user_id:
+            raise HTTPException(status_code=400, detail="Provide email or user_id to opt out")
+        outs = _load_privacy_json("opt_outs.json", []) or []
+        rec = {"id": f"opt_{uuid4().hex[:8]}", "timestamp": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), "user_id": user_id, "email": email, "reason": reason}
+        outs.insert(0, rec)
+        _save_privacy_json("opt_outs.json", outs[:1000])
+        _privacy_audit("opt_out", rec)
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/privacy/optin")
+def privacy_optin(payload: dict, request: Request):
+    try:
+        user = None
+        try:
+            user = _require_auth(request)
+        except Exception:
+            user = None
+        email = payload.get("email") or (user and user.get("email"))
+        user_id = payload.get("user_id") or (user and user.get("id"))
+        if not email and not user_id:
+            raise HTTPException(status_code=400, detail="Provide email or user_id to opt in")
+        outs = _load_privacy_json("opt_outs.json", []) or []
+        next_outs = [o for o in outs if not ((user_id and str(o.get("user_id")) == str(user_id)) or (email and o.get("email") and str(o.get("email")).lower() == str(email).lower()))]
+        _save_privacy_json("opt_outs.json", next_outs[:1000])
+        _privacy_audit("opt_in", {"user_id": user_id, "email": email})
+        return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/privacy/inventory")
+def privacy_inventory_list():
+    inv = _load_privacy_json("inventory.json", []) or []
+    return {"inventory": inv}
+
+
+@app.post("/privacy/inventory")
+def privacy_inventory_add(payload: dict):
+    try:
+        inv = _load_privacy_json("inventory.json", []) or []
+        entry = payload or {}
+        entry.setdefault("id", f"inv_{uuid4().hex[:8]}")
+        entry.setdefault("created_at", datetime.now(timezone.utc).isoformat().replace('+00:00','Z'))
+        inv.insert(0, entry)
+        _save_privacy_json("inventory.json", inv[:2000])
+        _privacy_audit("inventory_add", entry)
+        return {"ok": True, "entry": entry}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/privacy/inventory/{inv_id}")
+def privacy_inventory_delete(inv_id: str):
+    try:
+        inv = _load_privacy_json("inventory.json", []) or []
+        next_inv = [i for i in inv if str(i.get("id")) != str(inv_id)]
+        _save_privacy_json("inventory.json", next_inv[:2000])
+        _privacy_audit("inventory_delete", {"id": inv_id})
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/privacy/inventory/{inv_id}")
+def privacy_inventory_update(inv_id: str, payload: dict):
+    try:
+        inv = _load_privacy_json("inventory.json", []) or []
+        updated = False
+        for i, it in enumerate(inv):
+            if str(it.get("id")) == str(inv_id):
+                new = {**it, **(payload or {})}
+                new.setdefault("id", it.get("id"))
+                inv[i] = new
+                updated = True
+                break
+        if not updated:
+            raise HTTPException(status_code=404, detail="Inventory item not found")
+        _save_privacy_json("inventory.json", inv[:2000])
+        _privacy_audit("inventory_update", {"id": inv_id, "payload": payload})
+        return {"ok": True, "entry": new}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/privacy/dpias")
+def privacy_dpias():
+    items = _load_privacy_json("dpias.json", []) or []
+    return {"dpias": items}
+
+
+@app.post("/privacy/dpias")
+def privacy_add_dpia(payload: dict):
+    try:
+        items = _load_privacy_json("dpias.json", []) or []
+        item = payload or {}
+        item.setdefault("id", f"dpia_{uuid4().hex[:8]}")
+        item.setdefault("created_at", datetime.now(timezone.utc).isoformat().replace('+00:00','Z'))
+        items.insert(0, item)
+        _save_privacy_json("dpias.json", items[:500])
+        _privacy_audit("dpia_add", item)
+        return {"ok": True, "dpia": item}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/privacy/dpias/{dpia_id}")
+def privacy_delete_dpia(dpia_id: str):
+    try:
+        items = _load_privacy_json("dpias.json", []) or []
+        next_items = [i for i in items if str(i.get("id")) != str(dpia_id)]
+        _save_privacy_json("dpias.json", next_items[:500])
+        _privacy_audit("dpia_delete", {"id": dpia_id})
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/privacy/dpias/{dpia_id}")
+def privacy_update_dpia(dpia_id: str, payload: dict):
+    try:
+        items = _load_privacy_json("dpias.json", []) or []
+        updated = False
+        for idx, it in enumerate(items):
+            if str(it.get("id")) == str(dpia_id):
+                new = {**it, **(payload or {})}
+                new.setdefault("id", it.get("id"))
+                items[idx] = new
+                updated = True
+                break
+        if not updated:
+            raise HTTPException(status_code=404, detail="DPIA not found")
+        _save_privacy_json("dpias.json", items[:500])
+        _privacy_audit("dpia_update", {"id": dpia_id, "payload": payload})
+        return {"ok": True, "dpia": new}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/privacy/record")
+def privacy_record(payload: dict):
+    try:
+        _privacy_audit("record", payload or {})
+        return {"ok": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.websocket("/ws/shared")

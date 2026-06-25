@@ -1,9 +1,0 @@
-{
-  "id": "run_4db92f8b",
-  "recipe_id": "recipe_1781931713217_0434a03e",
-  "started_at": "2026-06-20T05:04:13.415884Z",
-  "status": "completed",
-  "export_format": "csv",
-  "finished_at": "2026-06-20T05:04:14.535656Z",
-  "output_path": "data\\outputs\\recipe_1781931713217_0434a03e_run_4db92f8b_output_from_text.csv"
-}

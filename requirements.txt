@@ -23,6 +23,7 @@ httpx2>=0.1
 
 # Optional: encryption helpers for session file encryption
 cryptography>=41.0
+pytest>=7.0
 
 # Recommended pip invocation when using Python 3.14 (tries pre-releases
 # and prefers binary wheels when available):

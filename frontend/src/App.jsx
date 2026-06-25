@@ -1,6 +1,7 @@
 import React, {useMemo, useRef, useState, useEffect} from "react"
 import { BACKEND } from './config'
 import authFetch from './utils/authFetch'
+import PrivacyAdmin from './PrivacyAdmin'
 const NAV_ITEMS = [
   { section: "Start", id: "source", label: "Source", detail: "Profile and prompt to recipe", icon: "⟡" },
   { section: "Start", id: "uploads", label: "Uploads", detail: "Saved uploads", icon: "⇪" },
@@ -79,6 +80,8 @@ export default function App() {
   const [joinExporting, setJoinExporting] = useState(false)
   const [exportFormat, setExportFormat] = useState('csv')
   const [exportFilename, setExportFilename] = useState('joined')
+  const [joinTargetUser, setJoinTargetUser] = useState('')
+  const [exportTargetUser, setExportTargetUser] = useState('')
   const [joinLeftOn, setJoinLeftOn] = useState('')
   const [joinRightOn, setJoinRightOn] = useState('')
   const [joinType, setJoinType] = useState('inner')
@@ -162,6 +165,7 @@ export default function App() {
   })
   const [authToken, setAuthToken] = useState(() => { try { return window.localStorage.getItem('falconbroom_access_token') || '' } catch { return '' } })
   const [accountUser, setAccountUser] = useState(null)
+  const [showPrivacyAdmin, setShowPrivacyAdmin] = useState(false)
   const [signupUsername, setSignupUsername] = useState('')
   const [signupEmail, setSignupEmail] = useState('')
   const [signupPassword, setSignupPassword] = useState('')
@@ -172,6 +176,21 @@ export default function App() {
   const [teamMemberObjects, setTeamMemberObjects] = useState([])
   const [pendingInvites, setPendingInvites] = useState([])
   const [sharedUploads, setSharedUploads] = useState([])
+  useEffect(()=>{
+    if (accountUser) loadDsarPropagation()
+  }, [accountUser])
+
+  // show a welcome-back banner after login if the user had manually signed out earlier
+  useEffect(() => {
+    try {
+      const flagged = window.localStorage.getItem('fb_manual_signed_out')
+      if (flagged && accountUser) {
+        setShowWelcomeBack(true)
+        // clear the flag so we only show once
+        window.localStorage.removeItem('fb_manual_signed_out')
+      }
+    } catch (e) {}
+  }, [accountUser])
   const [wsConnected, setWsConnected] = useState(false)
   const [inviteToken, setInviteToken] = useState('')
   const [acceptUsername, setAcceptUsername] = useState('')
@@ -179,6 +198,22 @@ export default function App() {
   const [newMemberEmail, setNewMemberEmail] = useState('')
   const [deletePassword, setDeletePassword] = useState('')
   const [deleteConfirmTextLocal, setDeleteConfirmTextLocal] = useState('')
+  const [dsarAction, setDsarAction] = useState('export')
+  const [dsarPassword, setDsarPassword] = useState('')
+  const [dsarToken, setDsarToken] = useState('')
+  const [dsarStatus, setDsarStatus] = useState({ pending: [], processed: [] })
+  const [showAdminAudit, setShowAdminAudit] = useState(false)
+  const [adminExports, setAdminExports] = useState([])
+  const [adminLogs, setAdminLogs] = useState([])
+  const [selectedLog, setSelectedLog] = useState('')
+  const [verifyResults, setVerifyResults] = useState(null)
+  const [adminQueue, setAdminQueue] = useState({audit_exports: [], propagation: []})
+  const [queuePage, setQueuePage] = useState(1)
+  const [queuePageSize, setQueuePageSize] = useState(8)
+  const [queueFilterText, setQueueFilterText] = useState('')
+  const [queueServiceFilter, setQueueServiceFilter] = useState('all')
+  const [selectedQueueItem, setSelectedQueueItem] = useState(null)
+  const [showWelcomeBack, setShowWelcomeBack] = useState(false)
   const [inspectionLoading, setInspectionLoading] = useState(false)
   const [inspectingPath, setInspectingPath] = useState(null)
   const [profileLoading, setProfileLoading] = useState(false)
@@ -229,6 +264,48 @@ export default function App() {
       return 0
     }
   }, [recipeText])
+
+  const queueDerived = useMemo(() => {
+    // If server returned a paged response, use that directly
+    if (adminQueue && adminQueue.queue) {
+      const q = adminQueue.queue
+      return {
+        all: q.items || [],
+        filtered: q.items || [],
+        page: q.page || 1,
+        pageSize: q.page_size || q.pageSize || 10,
+        total: q.total || (q.items || []).length,
+        pages: q.pages || 1,
+        items: q.items || [],
+      }
+    }
+
+    const a = (adminQueue?.audit_exports || []).map((q) => ({...q, _type: 'audit'}))
+    const b = (adminQueue?.propagation || []).map((q) => ({...q, _type: 'propagation'}))
+    const all = [...a, ...b]
+    const ft = (queueFilterText || '').toLowerCase().trim()
+    let filtered = all.filter((it) => {
+      if (queueServiceFilter && queueServiceFilter !== 'all') {
+        if (queueServiceFilter === 'audit' && it._type !== 'audit') return false
+        if (queueServiceFilter === 'prop' && it._type !== 'propagation') return false
+      }
+      if (!ft) return true
+      if ((it.name || '').toLowerCase().includes(ft)) return true
+      if ((it.path || '').toLowerCase().includes(ft)) return true
+      try {
+        const s = JSON.stringify(it.meta || {})
+        if (s.toLowerCase().includes(ft)) return true
+      } catch (e) {}
+      return false
+    })
+    const page = Math.max(1, queuePage || 1)
+    const pageSize = Math.max(1, queuePageSize || 10)
+    const total = filtered.length
+    const pages = Math.max(1, Math.ceil(total / pageSize))
+    const idx = Math.min(page - 1, pages - 1)
+    const slice = filtered.slice(idx * pageSize, idx * pageSize + pageSize)
+    return { all: all, filtered, page, pageSize, total, pages, items: slice }
+  }, [adminQueue, queueFilterText, queueServiceFilter, queuePage, queuePageSize])
 
   const backgroundBusy = uploadsLoading || inspectionLoading || profileLoading || previewLoading || applyLoading
 
@@ -611,6 +688,7 @@ export default function App() {
     } catch (e) { /* ignore */ }
     setAccountUser(null); setAuthToken(''); try { window.localStorage.removeItem('falconbroom_access_token') } catch {}
     // refresh cookie cleared by server during logout
+    try { window.localStorage.setItem('fb_manual_signed_out', '1') } catch (e) {}
     addToast('Logged out', 'info')
   }
 
@@ -638,6 +716,24 @@ export default function App() {
     } catch (e) { addToast('Export error: ' + e.message, 'error') }
   }
 
+  async function doOptOut() {
+    try {
+      const payload = { user_id: accountUser?.id || undefined, email: accountUser?.email || undefined, reason: 'user_requested' }
+      const res = await authFetch(`${BACKEND}/privacy/optout`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+      if (!res.ok) { const t = await res.text(); addToast('Opt-out failed: ' + t, 'error'); return }
+      addToast('You have opted out of sale/targeted sharing', 'info')
+    } catch (e) { addToast('Opt-out error: ' + e.message, 'error') }
+  }
+
+  async function doOptIn() {
+    try {
+      const payload = { user_id: accountUser?.id || undefined, email: accountUser?.email || undefined }
+      const res = await authFetch(`${BACKEND}/privacy/optin`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+      if (!res.ok) { const t = await res.text(); addToast('Opt-in failed: ' + t, 'error'); return }
+      addToast('You have revoked opt-out and opted in', 'success')
+    } catch (e) { addToast('Opt-in error: ' + e.message, 'error') }
+  }
+
   async function doAccountDelete() {
     try {
       const token = authToken || window.localStorage.getItem('falconbroom_access_token')
@@ -649,9 +745,119 @@ export default function App() {
     } catch (e) { addToast('Delete error: ' + e.message, 'error') }
   }
 
+  async function doDsarRequest(action) {
+    try {
+      const token = authToken || window.localStorage.getItem('falconbroom_access_token')
+      if (!token) { addToast('Not authenticated', 'error'); return }
+      const payload = { action }
+      if (action === 'delete' && dsarPassword) payload.password = dsarPassword
+      const res = await authFetch(`${BACKEND}/dsar/request`, { method: 'POST', headers: { 'Content-Type':'application/json' }, body: JSON.stringify(payload) })
+      if (!res.ok) { const t = await res.text(); addToast('DSAR request failed: ' + t, 'error'); return }
+      const j = await res.json()
+      addToast('DSAR requested: ' + j.dsar_id + ' status=' + (j.status||''), 'info')
+      loadDsarPropagation()
+    } catch (e) { addToast('DSAR request error: ' + e.message, 'error') }
+  }
+
+  async function doDsarVerify() {
+    try {
+      if (!dsarToken) { addToast('Enter verification token', 'error'); return }
+      const res = await fetch(`${BACKEND}/dsar/verify`, { method: 'POST', headers: { 'Content-Type':'application/json' }, body: JSON.stringify({ token: dsarToken }) })
+      if (!res.ok) { const t = await res.text(); addToast('Verify failed: ' + t, 'error'); return }
+      const j = await res.json()
+      addToast('DSAR verified: ' + j.dsar_id, 'success')
+      setDsarToken('')
+      loadDsarPropagation()
+    } catch (e) { addToast('Verify error: ' + e.message, 'error') }
+  }
+
+  async function loadDsarPropagation() {
+    try {
+      const res = await authFetch(`${BACKEND}/dsar/propagation`)
+      if (!res.ok) { return }
+      const j = await res.json()
+      setDsarStatus(j)
+    } catch (e) { /* ignore */ }
+  }
+
+  async function loadAdminExports() {
+    try {
+      const res = await authFetch(`${BACKEND}/admin/audit/exports`)
+      if (!res.ok) return
+      const j = await res.json()
+      setAdminExports(j.exports || [])
+    } catch (e) { }
+  }
+
+  async function loadAdminLogs() {
+    try {
+      const res = await authFetch(`${BACKEND}/admin/audit/logs`)
+      if (!res.ok) return
+      const j = await res.json()
+      setAdminLogs(j.logs || [])
+    } catch (e) { }
+  }
+
+  async function loadAdminQueue() {
+    try {
+      const params = new URLSearchParams()
+      // request server-side pagination
+      params.set('page', String(queuePage || 1))
+      params.set('page_size', String(queuePageSize || 8))
+      if (queueFilterText) params.set('filter', queueFilterText)
+      if (queueServiceFilter) params.set('service', queueServiceFilter)
+      const res = await authFetch(`${BACKEND}/admin/queue?${params.toString()}`)
+      if (!res.ok) return
+      const j = await res.json()
+      // normalize into adminQueue; if server returned {queue:...} keep it
+      setAdminQueue(j)
+    } catch (e) { }
+  }
+
+  async function runQueueItem(path) {
+    try {
+      const res = await authFetch(`${BACKEND}/admin/queue/run`, { method: 'POST', headers: { 'Content-Type':'application/json' }, body: JSON.stringify({ path }) })
+      if (!res.ok) { const t = await res.text(); addToast('Run failed: ' + t, 'error'); return }
+      const j = await res.json()
+      addToast('Run result: ' + (j.status || 'ok'), 'success')
+      await loadAdminQueue()
+    } catch (e) { addToast('Run error: ' + e.message, 'error') }
+  }
+
+  async function deleteQueueItem(path) {
+    try {
+      const res = await authFetch(`${BACKEND}/admin/queue`, { method: 'DELETE', headers: { 'Content-Type':'application/json' }, body: JSON.stringify({ path }) })
+      if (!res.ok) { const t = await res.text(); addToast('Delete failed: ' + t, 'error'); return }
+      addToast('Deleted', 'success')
+      await loadAdminQueue()
+    } catch (e) { addToast('Delete error: ' + e.message, 'error') }
+  }
+
+  async function verifyChain(path) {
+    try {
+      setVerifyResults(null)
+      const res = await authFetch(`${BACKEND}/admin/audit/verify_chain`, { method: 'POST', headers: { 'Content-Type':'application/json' }, body: JSON.stringify({ file: path }) })
+      if (!res.ok) { const t = await res.text(); addToast('Verify failed: ' + t, 'error'); return }
+      const j = await res.json()
+      setVerifyResults(j.results || j)
+    } catch (e) { addToast('Verify error: ' + e.message, 'error') }
+  }
+
   async function doProfile() {
     await doProfileForPath(path)
   }
+
+  // reload admin queue when pagination/filter state changes while admin panel is visible
+  useEffect(() => {
+    let mounted = true
+    async function reload() {
+      if (showAdminAudit) {
+        await loadAdminQueue()
+      }
+    }
+    reload()
+    return () => { mounted = false }
+  }, [queuePage, queuePageSize, queueFilterText, queueServiceFilter, showAdminAudit])
 
   async function uploadSelectedFile(file) {
     if (!file) return
@@ -1415,6 +1621,7 @@ export default function App() {
       })
       const conflict = { suffix_left: suffixLeft, suffix_right: suffixRight, prefer: preferResolve, rename_map: mappings }
       const payload = { left_path: leftPath, right_path: rightPath, left_on, right_on, join_type: joinType, export_format: exportFormat, filename: exportFilename, conflict_resolution: conflict }
+      if (joinTargetUser) payload.target_user = joinTargetUser
       const res = await fetch(`${BACKEND}/join-export`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
       })
@@ -1964,7 +2171,8 @@ export default function App() {
       return
     }
     try {
-      const res = await fetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}/export_sheets`, { method: "POST" })
+      const body = exportTargetUser ? JSON.stringify({ target_user: exportTargetUser }) : undefined
+      const res = await fetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}/export_sheets`, { method: "POST", headers: body ? { 'Content-Type': 'application/json' } : undefined, body })
       if (res.ok) {
         const j = await res.json()
         addToast(`Export queued: ${j.export_id || 'queued'}`, "info")
@@ -2541,6 +2749,7 @@ export default function App() {
                 <option value="sql">SQLite</option>
               </select>
               <input value={exportFilename} onChange={(e)=>setExportFilename(e.target.value)} placeholder="filename" style={{marginLeft:8}} />
+              <input placeholder="target user id or email" value={joinTargetUser} onChange={(e)=>setJoinTargetUser(e.target.value)} style={{marginLeft:8,width:220}} />
               <button className="primary" onClick={doJoinExport} disabled={joinExporting}>{joinExporting ? 'Exporting…' : 'Export Join'}</button>
             </div>
             {applyRes && applyRes.last_export ? (
@@ -2883,6 +3092,10 @@ export default function App() {
                         <button className="primary" onClick={saveAccountUpdates}>Save account</button>
                         <button style={{marginLeft:8}} onClick={doAccountExport}>Export data</button>
                         <button style={{marginLeft:8}} onClick={doLogout}>Logout</button>
+                        <div style={{display:'inline-block',marginLeft:12}}>
+                          <button onClick={doOptOut} title="Opt out of sale/targeted sharing">Opt-out of sale/targeting</button>
+                          <button style={{marginLeft:8}} onClick={doOptIn} title="Revoke opt-out and opt back in">Revoke opt-out</button>
+                        </div>
                       </div>
                       <div style={{marginTop:12,borderTop:'1px dashed rgba(255,255,255,0.04)',paddingTop:12}}>
                         <h5 style={{margin:0}}>Danger zone</h5>
@@ -2897,10 +3110,165 @@ export default function App() {
                           </label>
                           <div style={{marginTop:8}}>
                             <button onClick={doAccountDelete} style={{background:'#a33',color:'#fff'}}>Delete account</button>
+                            <div style={{marginTop:12}}>
+                              <h6 style={{margin: '6px 0'}}>Data Subject Access Request (DSAR)</h6>
+                              <label style={{display:'inline-flex',alignItems:'center',gap:8}}>
+                                <select value={dsarAction} onChange={(e)=>setDsarAction(e.target.value)}>
+                                  <option value="export">Export my data</option>
+                                  <option value="delete">Delete my data</option>
+                                </select>
+                              </label>
+                              {dsarAction === 'delete' && (
+                                <label style={{display:'flex',flexDirection:'column',gap:6,marginTop:8}}>
+                                  <span style={{fontSize:12,color:'var(--muted)'}}>Confirm password (optional — will trigger email verification if omitted)</span>
+                                  <input type="password" value={dsarPassword} onChange={(e)=>setDsarPassword(e.target.value)} />
+                                </label>
+                              )}
+                              <div style={{marginTop:8}}>
+                                <button onClick={()=>doDsarRequest(dsarAction)}>Request DSAR</button>
+                              </div>
+                              <div style={{marginTop:8}}>
+                                <label style={{display:'flex',flexDirection:'column',gap:6}}>
+                                  <span style={{fontSize:12,color:'var(--muted)'}}>Verification token (from email)</span>
+                                  <input value={dsarToken} onChange={(e)=>setDsarToken(e.target.value)} placeholder="paste token here" />
+                                </label>
+                                <div style={{marginTop:6}}>
+                                  <button onClick={doDsarVerify}>Verify token</button>
+                                  <button style={{marginLeft:8}} onClick={loadDsarPropagation}>Refresh propagation status</button>
+                                </div>
+                              </div>
+                              <div style={{marginTop:8}}>
+                                <strong>Propagation status</strong>
+                                <div style={{maxHeight:160,overflow:'auto',marginTop:6}}>
+                                  <div style={{fontSize:12,color:'var(--muted)'}}>Pending:</div>
+                                  {dsarStatus.pending && dsarStatus.pending.length>0 ? dsarStatus.pending.map(p=> (
+                                    <div key={p.file} style={{fontSize:12}}>{p.file}</div>
+                                  )) : <div style={{fontSize:12,color:'var(--muted)'}}>None</div>}
+                                  <div style={{height:6}} />
+                                  <div style={{fontSize:12,color:'var(--muted)'}}>Processed:</div>
+                                  {dsarStatus.processed && dsarStatus.processed.length>0 ? dsarStatus.processed.map(p=> (
+                                    <div key={p.file} style={{fontSize:12}}>{p.file}</div>
+                                  )) : <div style={{fontSize:12,color:'var(--muted)'}}>None</div>}
+                                </div>
+                              </div>
+                            </div>
                           </div>
                         </div>
                       </div>
                     </div>
+                  </div>
+                )}
+
+                <div style={{marginTop:12}}>
+                  <button onClick={() => setShowPrivacyAdmin(s => !s)}>{showPrivacyAdmin ? 'Hide' : 'Manage'} privacy inventory & DPIAs</button>
+                </div>
+                {showPrivacyAdmin && <PrivacyAdmin addToast={addToast} />}
+
+                {accountUser && (accountUser.role === 'admin' || accountUser.is_admin) && (
+                  <div style={{marginTop:18}}>
+                    <h5>Audit Admin</h5>
+                    <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                      <button onClick={async ()=>{ setShowAdminAudit(s=>!s); if(!showAdminAudit) { await loadAdminExports(); await loadAdminLogs(); await loadAdminQueue(); } }}>{showAdminAudit ? 'Hide' : 'Show'} audit admin</button>
+                      <button onClick={async ()=>{ await loadAdminExports(); await loadAdminLogs(); }}>Refresh</button>
+                    </div>
+                    {showAdminAudit && (
+                      <div style={{marginTop:8,border:'1px solid rgba(255,255,255,0.04)',padding:8}}>
+                        <div style={{display:'flex',gap:12}}>
+                          <div style={{flex:1}}>
+                            <strong>Exports</strong>
+                            <div style={{maxHeight:160,overflow:'auto',marginTop:6}}>
+                              {adminExports.length===0 ? <div className="empty-state">No exports</div> : adminExports.map(e=> (
+                                <div key={e.path} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'4px 0'}}>
+                                  <div style={{fontSize:12}}>{e.name}</div>
+                                  <div><button onClick={()=>{ window.open(`${BACKEND}/admin/audit/download?path=${encodeURIComponent(e.path)}`) }}>Download</button></div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                          <div style={{flex:1}}>
+                            <strong>Logs</strong>
+                            <div style={{maxHeight:160,overflow:'auto',marginTop:6}}>
+                              {adminLogs.length===0 ? <div className="empty-state">No logs</div> : adminLogs.map(l=> (
+                                <div key={l.path} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'4px 0'}}>
+                                  <div style={{fontSize:12}} onClick={()=>setSelectedLog(l.path)}>{l.dir}/{l.name}</div>
+                                  <div style={{display:'flex',gap:6}}>
+                                    <button onClick={()=>{ setSelectedLog(l.path); verifyChain(l.path); }}>Verify</button>
+                                    <button onClick={()=>{ window.open(`${BACKEND}/admin/audit/download?path=${encodeURIComponent(l.path)}`) }}>Download</button>
+                                  </div>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                          <div style={{flex:1}}>
+                            <strong>Retry Queue</strong>
+                            <div style={{marginTop:6,display:'flex',gap:8,alignItems:'center'}}>
+                              <input placeholder="filter by name, path or metadata" style={{flex:1}} value={queueFilterText} onChange={(e)=>{ setQueueFilterText(e.target.value); setQueuePage(1) }} />
+                              <select value={queueServiceFilter} onChange={(e)=>{ setQueueServiceFilter(e.target.value); setQueuePage(1) }}>
+                                <option value="all">All</option>
+                                <option value="audit">Audit exports</option>
+                                <option value="prop">Propagation</option>
+                              </select>
+                              <select value={queuePageSize} onChange={(e)=>{ setQueuePageSize(parseInt(e.target.value||8)); setQueuePage(1) }}>
+                                <option value={5}>5</option>
+                                <option value={8}>8</option>
+                                <option value={15}>15</option>
+                                <option value={50}>50</option>
+                              </select>
+                            </div>
+                            <div style={{maxHeight:160,overflow:'auto',marginTop:6}}>
+                              {(!queueDerived || queueDerived.total===0) ? <div className="empty-state">No queued items</div> : (
+                                <div>
+                                  {queueDerived.items.map(q=> (
+                                    <div key={q.path} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'4px 0'}}>
+                                      <div style={{fontSize:12,cursor:'pointer'}} onClick={()=>setSelectedQueueItem(q)}>
+                                        {q.name} <small style={{color:'var(--muted)'}}>({q._type})</small>
+                                      </div>
+                                      <div style={{display:'flex',gap:6}}>
+                                        <button onClick={()=>runQueueItem(q.path)}>Run</button>
+                                        <button onClick={()=>deleteQueueItem(q.path)}>Delete</button>
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginTop:8}}>
+                              <div style={{fontSize:12,color:'var(--muted)'}}>Showing {(queueDerived?.filtered?.length||0)} items — page {queueDerived?.page||1} / {queueDerived?.pages||1}</div>
+                              <div style={{display:'flex',gap:6,alignItems:'center'}}>
+                                <button onClick={()=>{ setQueuePage(p=>Math.max(1,p-1)) }} disabled={(queueDerived?.page||1) <= 1}>Prev</button>
+                                <button onClick={()=>{ setQueuePage(p=>Math.min((queueDerived?.pages||1),p+1)) }} disabled={(queueDerived?.page||1) >= (queueDerived?.pages||1)}>Next</button>
+                              </div>
+                            </div>
+                            {selectedQueueItem && (
+                              <div style={{marginTop:8,background:'rgba(0,0,0,0.04)',padding:8,maxHeight:220,overflow:'auto'}}>
+                                <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                                  <strong style={{fontSize:13}}>{selectedQueueItem.name}</strong>
+                                  <div style={{display:'flex',gap:6}}>
+                                    <button onClick={()=>runQueueItem(selectedQueueItem.path)}>Run</button>
+                                    <button onClick={()=>deleteQueueItem(selectedQueueItem.path)}>Delete</button>
+                                    <button onClick={()=>setSelectedQueueItem(null)}>Close</button>
+                                  </div>
+                                </div>
+                                <div style={{marginTop:8,fontSize:12}}>
+                                  <pre style={{whiteSpace:'pre-wrap',fontSize:11}}>{JSON.stringify(selectedQueueItem.meta || selectedQueueItem, null, 2)}</pre>
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        
+                        
+                        </div>
+                        <div style={{marginTop:8}}>
+                          <strong>Selected log:</strong> <span style={{fontSize:12}}>{selectedLog||'None'}</span>
+                          {verifyResults && (
+                            <div style={{marginTop:8,maxHeight:240,overflow:'auto',background:'rgba(0,0,0,0.04)',padding:8}}>
+                              <pre style={{whiteSpace:'pre-wrap',fontSize:12}}>{JSON.stringify(verifyResults, null, 2)}</pre>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -3011,6 +3379,20 @@ export default function App() {
       )}
       
       {/* header styles moved to styles.css */}
+      {/* If the user manually signed out previously, show a small welcome-back banner first after they log back in */}
+      {showWelcomeBack && (
+        <div style={{padding:12}}>
+          <div className="card">
+            <div className="card-header"><h2>Welcome back</h2><p>Thanks for signing in again.</p></div>
+            <div style={{padding:12,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+              <div style={{color:'var(--muted)'}}>We've saved your team and uploads — welcome back.</div>
+              <div style={{display:'flex',gap:8}}>
+                <button onClick={()=>setShowWelcomeBack(false)}>Dismiss</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
       {unauthView}
       {/* Toasts container */}
       <div className="toasts-root" aria-live="polite">
@@ -3526,6 +3908,7 @@ export default function App() {
                 <button onClick={() => runAndDownloadSavedRecipe(runFormatRef.current?.value || 'csv')} disabled={!recipeId || recipeStatus !== 'approved'}>{runDownloadLoading ? 'Running…' : 'Run & Download'}</button>
                 <button title="Debug: show logs and attempt run+download" onClick={() => debugRunDownload(runFormatRef.current?.value || 'csv')}>Debug Run & Download</button>
                 <button onClick={exportToSheets} disabled={!recipeId}>Export to Google Sheets</button>
+                <input placeholder="target user id or email" value={exportTargetUser} onChange={(e)=>setExportTargetUser(e.target.value)} style={{marginLeft:8,width:220}} />
                 <button onClick={() => downloadPreviewCsv()} disabled={!generatedPreview}>Download CSV</button>
               </div>
             </div>
