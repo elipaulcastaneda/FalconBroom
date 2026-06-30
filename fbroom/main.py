@@ -131,13 +131,52 @@ JWT_SECRET = os.environ.get("JWT_SECRET") or uuid4().hex
 JWT_ALGO = os.environ.get("JWT_ALGO") or "HS256"
 
 # Allow the Vite dev server and Tauri webview during local development.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"^(https?://(localhost|127\.0\.0\.1)(:\d+)?)$|^(tauri://localhost)$",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Configure CORS: in production use explicit origins via `CORS_ALLOW_ORIGINS` env (comma-separated).
+if os.environ.get('ENV') == 'production':
+    origins = []
+    ao = os.environ.get('CORS_ALLOW_ORIGINS')
+    if ao:
+        origins = [o.strip() for o in ao.split(',') if o.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+else:
+    # Development: allow localhost and tauri schemes
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"^(https?://(localhost|127\.0\.0\.1)(:\d+)?)$|^(tauri://localhost)$",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+
+@app.middleware("http")
+async def _secure_headers_middleware(request: Request, call_next):
+    # Enforce TLS in production
+    if os.environ.get('ENV') == 'production':
+        try:
+            if request.url.scheme != 'https':
+                return Response(status_code=400, content="HTTPS required")
+        except Exception:
+            pass
+    resp = await call_next(request)
+    # Standard security headers
+    try:
+        resp.headers['Strict-Transport-Security'] = 'max-age=63072000; includeSubDomains; preload'
+        resp.headers['X-Frame-Options'] = 'DENY'
+        resp.headers['X-Content-Type-Options'] = 'nosniff'
+        resp.headers['Referrer-Policy'] = 'no-referrer-when-downgrade'
+        resp.headers['Permissions-Policy'] = 'interest-cohort=()'
+        # Conservative CSP; adjust for your frontend origins if needed
+        resp.headers['Content-Security-Policy'] = "default-src 'self'; connect-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'"
+    except Exception:
+        pass
+    return resp
 
 cleaner = Cleaner()
 UPLOAD_DIR = Path("data") / "uploads"
@@ -2877,7 +2916,8 @@ def login(spec: UserLogin, request: Request, response: Response):
         cookie_name = os.environ.get("REFRESH_COOKIE_NAME") or "falconbroom_refresh"
         secure_flag = True if os.environ.get("ENV") == "production" else False
         try:
-            response.set_cookie(cookie_name, tokens.get("refresh_token"), httponly=True, samesite="lax", secure=secure_flag)
+            # Use Strict for refresh cookie to reduce CSRF risk; secure only in production
+            response.set_cookie(cookie_name, tokens.get("refresh_token"), httponly=True, samesite="strict", secure=secure_flag)
         except Exception:
             pass
         _consent_audit("login", {"user_id": user.get("id")})
@@ -3042,7 +3082,7 @@ def refresh_token(request: Request, response: Response):
         # set rotated refresh cookie
         secure_flag = True if os.environ.get("ENV") == "production" else False
         try:
-            response.set_cookie(cookie_name, new_refresh_token, httponly=True, samesite="lax", secure=secure_flag)
+            response.set_cookie(cookie_name, new_refresh_token, httponly=True, samesite="strict", secure=secure_flag)
         except Exception:
             pass
 
@@ -3093,6 +3133,31 @@ def revoke_session(request: Request, payload: dict):
             pass
         p.unlink()
         return {"ok": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/sessions/revoke_all")
+def revoke_all_sessions(request: Request):
+    """Revoke all refresh sessions for the authenticated user."""
+    try:
+        user = _require_auth(request)
+        d = _sessions_dir()
+        count = 0
+        for p in d.glob("session_*.json"):
+            try:
+                s = _read_session_file(p)
+                if s.get("user_id") == user.get("id"):
+                    try:
+                        p.unlink()
+                        count += 1
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+        return {"ok": True, "revoked": count}
     except HTTPException:
         raise
     except Exception as e:
