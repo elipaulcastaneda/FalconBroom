@@ -1,4 +1,4 @@
-﻿# Ignore runtime data and generated artifacts
+# Ignore runtime data and generated artifacts
 data/*
 !data/.gitignore
 
