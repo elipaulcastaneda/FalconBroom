@@ -34,5 +34,10 @@ __pycache__/
 *.sqlite
 *.db
 
+# Local debug artifacts
+run_uvicorn*.log
+run_uvicorn_deepdebug.log
+scripts/*.txt
+scripts/py_spy_*
 # Keep tests and source tracked
 !/tests/
