@@ -1,0 +1,8 @@
+{
+  "id": "recipe_demo_1",
+  "name": "Sample aggregation",
+  "steps": [
+    {"action":"select","columns":["city","price"]},
+    {"action":"groupby","columns":["city"],"aggregations":[{"column":"price","op":"mean","as":"avg_price"}]}
+  ]
+}

@@ -42,3 +42,7 @@ scripts/*.txt
 scripts/py_spy_*
 # Keep tests and source tracked
 !/tests/
+ 
+# Ignore large sanitized output; allow synthetic demo folder
+samples/sanitized/
+!samples/demo_custom/

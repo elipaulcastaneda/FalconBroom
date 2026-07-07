@@ -1,0 +1,5 @@
+[
+  {"id":"user_demo_1","email":"alice@example.com","name":"Alice Demo","role":"admin"},
+  {"id":"user_demo_2","email":"bob@example.com","name":"Bob Demo","role":"analyst"},
+  {"id":"user_demo_3","email":"carol@example.com","name":"Carol Demo","role":"viewer"}
+]
