@@ -1,1 +1,0 @@
-{"id": "test_explain_ea7b2b", "name": "test_explain_ea7b2b", "created_at": "now", "status": "draft", "expected_columns": ["name", "age"], "recipe": {"sources": [{"path": "data\\demo\\explain_src_21d962.csv"}], "cleaning_steps": [{"action": "normalize", "column": "name", "params": {"case": "lower"}}], "joins": [], "outputs": [{"path": "out.csv"}]}}
