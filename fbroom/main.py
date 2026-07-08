@@ -5,6 +5,7 @@ from datetime import datetime, timezone, timedelta
 import shutil
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, Request, Response, WebSocket, WebSocketDisconnect
+import logging
 import os
 from celery import Celery
 import threading
@@ -48,6 +49,7 @@ import traceback
 # pydantic models used below
 
 app = FastAPI(title="FalconBroom Prototype API")
+app.state.ready = False
 
 
 # -- Sensitive file encryption helpers -------------------------------------------------
@@ -366,6 +368,15 @@ class SnapshotRollbackSpec(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready():
+    """Readiness endpoint: true when essential startup completed."""
+    try:
+        return {"ready": bool(getattr(app.state, 'ready', False))}
+    except Exception:
+        return {"ready": False}
 
 
 @app.post("/upload")
@@ -3556,22 +3567,50 @@ async def _dsar_propagation_worker():
 
 
 @app.on_event("startup")
-def _start_background_workers():
+async def _startup_event():
+    """Essential non-blocking startup: perform quick writable checks then schedule background workers.
+    Fail-fast on essential errors so the process won't accept traffic unsafely.
+    """
+    import asyncio
+    logger = logging.getLogger('fbroom.startup')
+    logger.info('Startup: running lightweight checks')
+
+    def _check_dirs():
+        for d in (UPLOAD_DIR, RECIPES_DIR, HISTORY_DIR, OUTPUTS_DIR, INSPECTIONS_DIR, JOBS_DIR, PRIVACY_DIR):
+            d.mkdir(parents=True, exist_ok=True)
+            # quick write test
+            try:
+                tf = d / '.startup_write_test'
+                tf.write_text('', encoding='utf-8')
+                tf.unlink()
+            except Exception as e:
+                raise
+
     try:
-        import asyncio
+        await asyncio.to_thread(_check_dirs)
+        # validate secrets and config (may raise in production)
+        await asyncio.to_thread(_validate_essential_config)
+        # ensure audit subsystem initialized and write a startup audit record
+        await asyncio.to_thread(_ensure_audit_initialized)
+        # validate consents/policies
+        await asyncio.to_thread(_ensure_consents)
+        # perform lightweight data migrations or validation
+        await asyncio.to_thread(_perform_data_migrations)
+    except Exception as e:
+        logger.exception('Essential startup checks failed')
+        # Fail-fast: re-raise to stop server from being marked ready
+        raise
+
+    # schedule background workers (their blocking IO is offloaded inside the worker implementations)
+    try:
         asyncio.create_task(_dsar_propagation_worker())
-    except Exception:
-        pass
-    try:
-        import asyncio
         asyncio.create_task(_audit_export_worker())
-    except Exception:
-        pass
-    try:
-        import asyncio
         asyncio.create_task(_retry_queue_worker())
     except Exception:
-        pass
+        logger.exception('Failed to schedule background workers')
+
+    app.state.ready = True
+    logger.info('Startup complete; app is ready')
 
 
 def _collect_audit_logs():
@@ -3612,6 +3651,118 @@ def _sign_payload(payload_bytes: bytes) -> str:
         return mac
     except Exception:
         return ""
+
+
+def _sync_urlopen_post(url: str, data: bytes, headers: dict = None, timeout: int = 30):
+    """Synchronous helper to POST bytes to a URL and return status code.
+    Intended to be called via `asyncio.to_thread` from async workers so blocking IO
+    does not block the event loop.
+    """
+    from urllib.request import Request as URLRequest, urlopen
+    req = URLRequest(url, data=data, method='POST')
+    if headers:
+        for k, v in (headers.items() if isinstance(headers, dict) else []):
+            req.add_header(k, v)
+    with urlopen(req, timeout=timeout) as resp:
+        status = getattr(resp, 'status', None)
+        if status is None:
+            try:
+                status = resp.getcode()
+            except Exception:
+                status = 200
+        return status
+
+
+def _validate_essential_config():
+    """Validate that essential secrets and configuration are present.
+    In `production` mode this will raise on missing or invalid secrets.
+    Returns True on success.
+    """
+    env = os.environ.get('ENV')
+    prod = env == 'production'
+    logger = logging.getLogger('fbroom.startup.validate')
+
+    # DATA_ENC_KEY required in production if any encrypted files will be used
+    enc_key = os.environ.get('DATA_ENC_KEY') or os.environ.get('DATA_ENC_KEY_FILE')
+    if prod and not enc_key:
+        raise Exception('Missing DATA_ENC_KEY or DATA_ENC_KEY_FILE in production')
+    # if provided, ensure fernet can be constructed
+    if enc_key:
+        f = _get_fernet()
+        if not f:
+            raise Exception('DATA_ENC_KEY provided but failed to initialize Fernet')
+
+    # AUDIT_HMAC_KEY is required in production for tamper-evident audits
+    if prod and not os.environ.get('AUDIT_HMAC_KEY'):
+        raise Exception('Missing AUDIT_HMAC_KEY in production')
+
+    # JWT secret should be explicitly set in production
+    if prod and not os.environ.get('JWT_SECRET'):
+        raise Exception('Missing JWT_SECRET in production')
+
+    # Key rotation hint: if old key file present, log informational note
+    old_key = os.environ.get('DATA_ENC_KEY_FILE_OLD')
+    if old_key:
+        logger.info('Detected legacy/rotation key file: DATA_ENC_KEY_FILE_OLD present')
+
+    return True
+
+
+def _ensure_audit_initialized():
+    """Ensure audit directory exists and append a startup audit record.
+    Returns True on success.
+    """
+    try:
+        ad = Path('data') / 'audit'
+        ad.mkdir(parents=True, exist_ok=True)
+        # append a small startup event; _append_audit_event handles HMAC fallback
+        try:
+            _append_audit_event(ad, 'startup', {'ts': datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), 'env': os.environ.get('ENV')})
+        except Exception:
+            # if appending fails, make this visible
+            raise
+        return True
+    except Exception as e:
+        raise
+
+
+def _ensure_consents():
+    """Validate that consent templates/policies are present or warn.
+    In production, missing consents are a hard failure.
+    """
+    try:
+        cons = Path('data') / 'consents'
+        if not cons.exists() or not any(cons.glob('consent_*.json')):
+            if os.environ.get('ENV') == 'production':
+                raise Exception('No consent templates found in data/consents for production')
+            else:
+                logging.getLogger('fbroom.startup').warning('No consent templates found (dev only)')
+        return True
+    except Exception:
+        raise
+
+
+def _perform_data_migrations():
+    """Perform or validate lightweight data migrations.
+    Creates a marker file `data/.migrated_v1` after checks. If heavy migrations are required,
+    this function should raise so ops can run separate maintenance.
+    """
+    try:
+        marker = Path('data') / '.migrated_v1'
+        if marker.exists():
+            return True
+        # Ensure queue and dsar directories exist
+        for d in ('queue', 'dsar', 'audit'):
+            p = Path('data') / d
+            p.mkdir(parents=True, exist_ok=True)
+        # write marker to indicate migrations validated
+        try:
+            marker.write_text(datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), encoding='utf-8')
+        except Exception:
+            pass
+        return True
+    except Exception:
+        raise
 
 
 def _export_audit_once():
@@ -3656,19 +3807,20 @@ def _export_audit_once():
         # post to external endpoint if configured
         if export_url:
             try:
-                from urllib.request import Request as URLRequest, urlopen
-                req = URLRequest(export_url, data=b, method='POST')
-                req.add_header('Content-Type', 'application/json')
+                headers = {'Content-Type': 'application/json'}
                 if sig:
-                    req.add_header('X-Audit-Signature', sig)
+                    headers['X-Audit-Signature'] = sig
                 # optional API key header
                 exp_key = os.environ.get('AUDIT_EXPORT_KEY')
                 if exp_key:
-                    req.add_header('X-Audit-Export-Key', exp_key)
-                with urlopen(req, timeout=30) as resp:
-                    status = getattr(resp, 'status', None) or 200
+                    headers['X-Audit-Export-Key'] = exp_key
+                try:
+                    status = _sync_urlopen_post(export_url, b, headers, timeout=30)
                     result['posted'] = (200 <= status < 300)
                     result['status'] = status
+                except Exception as e:
+                    result['error'] = str(e)
+                    # enqueue audit export for retry
             except Exception as e:
                 result['error'] = str(e)
                 # enqueue audit export for retry
@@ -3694,7 +3846,8 @@ async def _audit_export_worker():
     interval = int(os.environ.get('AUDIT_EXPORT_INTERVAL', '300'))
     while True:
         try:
-            _export_audit_once()
+            # Offload blocking export work to a thread so the event loop is not blocked
+            await asyncio.to_thread(_export_audit_once)
         except Exception:
             pass
         await asyncio.sleep(interval)
@@ -3726,26 +3879,23 @@ async def _retry_queue_worker():
                             # nothing to do
                             continue
                         b = json.dumps(j.get('payload')).encode('utf-8')
-                        from urllib.request import Request as URLRequest, urlopen
-                        req = URLRequest(targ, data=b, method='POST')
-                        req.add_header('Content-Type', 'application/json')
                         sig = _sign_payload(b)
+                        headers = {'Content-Type': 'application/json'}
                         if sig:
-                            req.add_header('X-Audit-Signature', sig)
+                            headers['X-Audit-Signature'] = sig
                         exp_key = os.environ.get('AUDIT_EXPORT_KEY')
                         if exp_key:
-                            req.add_header('X-Audit-Export-Key', exp_key)
+                            headers['X-Audit-Export-Key'] = exp_key
                         try:
-                            with urlopen(req, timeout=30) as resp:
-                                status = getattr(resp, 'status', None) or 200
-                                if 200 <= status < 300:
-                                    try:
-                                        p.unlink()
-                                    except Exception:
-                                        pass
-                                    continue
-                                else:
-                                    raise Exception(f'status:{status}')
+                            status = await asyncio.to_thread(_sync_urlopen_post, targ, b, headers, 30)
+                            if 200 <= status < 300:
+                                try:
+                                    p.unlink()
+                                except Exception:
+                                    pass
+                                continue
+                            else:
+                                raise Exception(f'status:{status}')
                         except Exception as e:
                             # exponential backoff
                             at = j.get('attempts', 0) + 1
@@ -3986,19 +4136,16 @@ def admin_queue_run(request: Request, payload: dict):
             if not targ:
                 raise HTTPException(status_code=400, detail='No AUDIT_EXPORT_URL configured')
             b = json.dumps(j.get('payload')).encode('utf-8')
+            sig = _sign_payload(b)
+            headers = {'Content-Type': 'application/json'}
+            if sig:
+                headers['X-Audit-Signature'] = sig
+            exp_key = os.environ.get('AUDIT_EXPORT_KEY')
+            if exp_key:
+                headers['X-Audit-Export-Key'] = exp_key
             try:
-                from urllib.request import Request as URLRequest, urlopen
-                req = URLRequest(targ, data=b, method='POST')
-                req.add_header('Content-Type', 'application/json')
-                sig = _sign_payload(b)
-                if sig:
-                    req.add_header('X-Audit-Signature', sig)
-                exp_key = os.environ.get('AUDIT_EXPORT_KEY')
-                if exp_key:
-                    req.add_header('X-Audit-Export-Key', exp_key)
-                with urlopen(req, timeout=30) as resp:
-                    status = getattr(resp, 'status', None) or 200
-                    ok = (200 <= status < 300)
+                status = _sync_urlopen_post(targ, b, headers, timeout=30)
+                ok = (200 <= status < 300)
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f'Post failed: {e}')
             if ok:

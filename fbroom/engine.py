@@ -1417,11 +1417,66 @@ def _cast_column(df, col, to_type: str, fmt: str = None, errors: str = "coerce")
                         info = {"step": "cast", "column": col, "to_type": to_type, "rows_changed": rows_changed}
                         try:
                             new_vals = df2[col].tolist()
+                            # If datetime/date cast with an explicit format, render as formatted strings
+                            if to_type in ("datetime", "date", "ts") and fmt:
+                                try:
+                                    formatted = []
+                                    for v in new_vals:
+                                        try:
+                                            if _pd.isna(v):
+                                                formatted.append(None)
+                                                continue
+                                        except Exception:
+                                            if v is None:
+                                                formatted.append(None)
+                                                continue
+                                        try:
+                                            formatted.append(v.strftime(fmt))
+                                        except Exception:
+                                            try:
+                                                formatted.append(v.isoformat())
+                                            except Exception:
+                                                formatted.append(str(v))
+                                    new_vals = formatted
+                                except Exception:
+                                    pass
                             df_new = df.with_columns(pl.Series(col, new_vals).alias(col))
                             return df_new, info
                         except Exception:
                             return df, info
                     except Exception:
+                        # Pandas not available or failed: try best-effort fallback using dateutil when parsing datetimes
+                        try:
+                            if to_type in ("datetime", "date", "ts") and _dateutil_parser is not None:
+                                try:
+                                    # get original values
+                                    try:
+                                        orig_vals = df.select(pl.col(col)).to_series().to_list()
+                                    except Exception:
+                                        orig_vals = df[col].to_list() if col in df.columns else []
+                                    parsed_vals = []
+                                    for v in orig_vals:
+                                        if v is None:
+                                            parsed_vals.append(None)
+                                            continue
+                                        s = str(v).strip()
+                                        if s == "":
+                                            parsed_vals.append(None)
+                                            continue
+                                        try:
+                                            dt = _dateutil_parser.parse(s, dayfirst=False)
+                                            if fmt:
+                                                parsed_vals.append(dt.strftime(fmt))
+                                            else:
+                                                parsed_vals.append(dt.isoformat())
+                                        except Exception:
+                                            parsed_vals.append(None)
+                                    df_new = df.with_columns(pl.Series(col, parsed_vals).alias(col))
+                                    return df_new, {"step": "cast", "column": col, "to_type": to_type, "rows_changed": None}
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
                         info = {"step": "cast", "column": col, "to_type": to_type, "rows_changed": None}
                         return df, info
         else:
@@ -2635,232 +2690,256 @@ class Cleaner:
         except Exception:
             pass
         diagnostics = []
+        def _step_cols(step):
+            c = getattr(step, "column", None)
+            if c is None:
+                return [None]
+            if isinstance(c, (list, tuple)):
+                return list(c)
+            return [c]
+
         for step in recipe.cleaning_steps:
-            # Skip steps that reference missing columns to avoid runtime errors
-            col = getattr(step, "column", None)
-            # Never apply transformations to metadata columns
-            if col and col in self.META_KEYS:
-                continue
-            if col and col not in df.columns:
-                # skip silently in runner; caller may validate schema separately
-                continue
-
-            if step.action == "drop_column" and col:
-                df = _drop_column(df, col)
-            elif step.action == "impute" and col:
-                params = step.params or {}
-                res = _impute_missing(df, col, params)
-                if isinstance(res, tuple):
-                    df = res[0]
-                    info = res[1]
-                    if info:
-                        diagnostics.append(info)
-                else:
-                    df = res
-            elif step.action == "normalize" and col:
-                try:
-                    case = (step.params or {}).get("case", "lower")
-                    # support unicode normalization via params
-                    if (step.params or {}).get("unicode"):
-                        form = (step.params or {}).get("form", "NFKC")
-                        remove_diacritics = bool((step.params or {}).get("remove_diacritics", False))
-                        df = _unicode_normalize_column(df, col, form=form, remove_diacritics=remove_diacritics)
-                    df = _string_transform_column(df, col, case=case)
-                except Exception:
-                    pass
-            elif step.action == "deduplicate":
-                subset = [col] if col else None
+            cols = _step_cols(step)
+            # Deduplicate step that operates on a set of columns (e.g. deduplicate)
+            if step.action == "deduplicate":
+                subset = [c for c in cols if c]
+                subset = subset if subset else None
                 df = _unique_df(df, subset=subset)
-            elif step.action == "unicode_normalize" and col:
-                params = step.params or {}
-                form = params.get("form", "NFKC")
-                remove_diacritics = bool(params.get("remove_diacritics", False))
-                df = _unicode_normalize_column(df, col, form=form, remove_diacritics=remove_diacritics)
-            elif step.action == "map" and col:
-                mapping = (step.params or {}).get("mapping") or {}
-                if mapping:
-                    df = _map_values(df, col, mapping)
-            elif step.action == "regex_replace" and col:
-                pat = (step.params or {}).get("pattern")
-                repl = (step.params or {}).get("replace")
-                if pat is not None:
-                    flags = (step.params or {}).get("flags")
-                    df = _regex_replace(df, col, pat, repl or "", flags=flags)
-            elif step.action == "bucketize" and col:
-                buckets = (step.params or {}).get("buckets", [])
-                if buckets:
-                    df = _bucketize(df, col, buckets)
-            elif step.action == "replace" and col:
-                old = (step.params or {}).get("old")
-                new = (step.params or {}).get("new")
-                if old is not None:
-                    df = _replace_values(df, col, old, new)
-            elif step.action == "remove_by_type" and col:
-                params = step.params or {}
-                res = _remove_by_type(df, col, params)
-                if isinstance(res, tuple):
-                    df = res[0]
-                    info = res[1]
-                    if info:
-                        diagnostics.append(info)
-                else:
-                    df = res
-            elif step.action == "move_by_type" or step.action == "swap_by_types":
-                params = step.params or {}
-                if step.action == "move_by_type":
-                    moves = [params]
-                else:
-                    moves = params.get("moves") or []
-                res = _swap_by_types(df, moves, replacement=params.get("replacement", ""))
-                if isinstance(res, tuple):
-                    df = res[0]
-                    info = res[1]
-                    if info:
-                        diagnostics.append(info)
-                else:
-                    df = res
-            elif step.action == "rename" and col:
-                new_name = (step.params or {}).get("new_name")
-                if new_name:
-                    df = _rename_column(df, col, new_name)
-            elif step.action == "fuzzy_dedupe":
-                params = step.params or {}
-                subset = params.get("subset")
-                threshold = float(params.get("threshold", 0.85))
-                method = params.get("method", 'difflib')
-                res = _fuzzy_dedupe(df, subset=subset, threshold=threshold, method=method)
-                if isinstance(res, tuple):
-                    df = res[0]
-                    info = res[1]
-                    if info:
-                        diagnostics.append(info)
-                else:
-                    df = res
-            elif step.action == "cast" and col:
-                params = step.params or {}
-                to_type = params.get("to_type") or params.get("type")
-                fmt = params.get("format")
-                res = _cast_column(df, col, to_type, fmt)
-                if isinstance(res, tuple):
-                    df = res[0]
-                    info = res[1]
-                    if info:
-                        diagnostics.append(info)
-                else:
-                    df = res
-            elif step.action == "conditional" and col:
-                params = step.params or {}
-                val = params.get("value")
-                cond = params.get("condition")
-                if cond is not None:
-                    df = _conditional_transform(df, col, val, cond)
-            elif step.action == "join":
-                params = step.params or {}
-                left_path = params.get("left")
-                right_path = params.get("right")
-                keys = params.get("keys") or []
-                fuzzy = params.get("fuzzy", False)
-                # only support single-key joins for fuzzy matching
-                if right_path and keys:
+                continue
+
+            # For other steps, apply per-column
+            for col in cols:
+                # Skip steps that reference missing columns to avoid runtime errors
+                # Never apply transformations to metadata columns
+                if col and col in self.META_KEYS:
+                    continue
+                if col and col not in df.columns:
+                    # skip silently in runner; caller may validate schema separately
+                    continue
+
+                if step.action == "drop_column" and col:
+                    df = _drop_column(df, col)
+                elif step.action == "impute" and col:
+                    params = step.params or {}
+                    res = _impute_missing(df, col, params)
+                    if isinstance(res, tuple):
+                        df = res[0]
+                        info = res[1]
+                        if info:
+                            diagnostics.append(info)
+                    else:
+                        df = res
+                elif step.action == "normalize" and col:
                     try:
-                        right_df = _read_table(right_path)
-                        join_key = keys[0]
-                        if not fuzzy:
-                            # standard left join
-                            if _is_polars_df(df) and _is_polars_df(right_df):
-                                df = df.join(right_df, on=join_key, how="left")
-                            else:
-                                # pandas fallback
-                                import pandas as _pd
-                                left_pd = df.to_pandas() if _is_polars_df(df) else df
-                                right_pd = right_df.to_pandas() if _is_polars_df(right_df) else right_df
-                                df = left_pd.merge(right_pd, left_on=join_key, right_on=join_key, how="left")
-                        else:
-                            # fuzzy join: match closest right key for each left key value
-                            # build list of candidate keys from right
-                            if _is_polars_df(right_df):
-                                try:
-                                    right_keys = [str(x) for x in right_df.select(pl.col(join_key)).to_series().to_list()]
-                                except Exception:
-                                    # fallback: try direct column access on polars DataFrame
-                                    try:
-                                        right_keys = [str(x) for x in right_df[join_key].to_list()] if join_key in right_df.columns else []
-                                    except Exception:
-                                        right_keys = []
-                            else:
-                                right_keys = [str(x) for x in right_df[join_key].astype(str).unique().tolist()]
-
-                            # threshold for matching and algorithm choice
-                            cutoff = float(params.get("threshold", 0.8))
-                            algorithm = (params.get("algorithm") or params.get("method") or "difflib").lower()
-                            for rk in right_keys:
-                                pass
-
-                            # build matching function: support 'difflib' and optional 'minhash' (if datasketch installed)
-                            find_best = None
-                            if algorithm == 'minhash':
-                                try:
-                                    from datasketch import MinHash, MinHashLSH
-                                    num_perm = int(params.get('num_perm', 128))
-                                    lsh = MinHashLSH(threshold=cutoff, num_perm=num_perm)
-                                    for idx, rk in enumerate(right_keys):
-                                        mh = MinHash(num_perm=num_perm)
-                                        for sh in str(rk).split():
-                                            mh.update(sh.encode('utf8'))
-                                        lsh.insert(str(idx), mh)
-
-                                    def _find_best_minhash(v):
-                                        if v is None:
-                                            return None
-                                        mh = MinHash(num_perm=num_perm)
-                                        for sh in str(v).split():
-                                            mh.update(sh.encode('utf8'))
-                                        res = lsh.query(mh)
-                                        if res:
-                                            try:
-                                                return right_keys[int(res[0])]
-                                            except Exception:
-                                                return right_keys[0] if right_keys else None
-                                        return None
-
-                                    find_best = _find_best_minhash
-                                except Exception:
-                                    # fall back to difflib below
-                                    find_best = None
-
-                            if find_best is None:
-                                def find_best(v):
-                                    if v is None:
-                                        return None
-                                    s = str(v)
-                                    matches = difflib.get_close_matches(s, right_keys, n=1, cutoff=cutoff)
-                                    return matches[0] if matches else None
-
-                            if _is_polars_df(df):
-                                try:
-                                    # create helper mapped column
-                                    mapped = df.select(pl.col(join_key)).to_series().to_list()
-                                    mapped_vals = [find_best(x) for x in mapped]
-                                    df = df.with_columns(pl.Series("__fuzzy_key__", mapped_vals))
-                                    # rename right side columns to avoid collisions
-                                    right_pref = right_df.rename({c: f"right__{c}" for c in right_df.columns})
-                                    df = df.join(right_pref, left_on="__fuzzy_key__", right_on=f"right__{join_key}", how="left")
-                                    # drop helper key
-                                    try:
-                                        df = df.drop("__fuzzy_key__")
-                                    except Exception:
-                                        pass
-                                except Exception:
-                                    pass
-                            else:
-                                import pandas as _pd
-                                left_pd = df.to_pandas() if _is_polars_df(df) else df.copy()
-                                right_pd = right_df.to_pandas() if _is_polars_df(right_df) else right_df.copy()
-                                left_pd["__fuzzy_key__"] = left_pd[join_key].apply(find_best)
-                                right_pd = right_pd.rename(columns={join_key: "__right_key__"})
-                                df = left_pd.merge(right_pd, left_on="__fuzzy_key__", right_on="__right_key__", how="left")
+                        case = (step.params or {}).get("case", "lower")
+                        # support unicode normalization via params
+                        if (step.params or {}).get("unicode"):
+                            form = (step.params or {}).get("form", "NFKC")
+                            remove_diacritics = bool((step.params or {}).get("remove_diacritics", False))
+                            df = _unicode_normalize_column(df, col, form=form, remove_diacritics=remove_diacritics)
+                        df = _string_transform_column(df, col, case=case)
                     except Exception:
                         pass
+                elif step.action == "unicode_normalize" and col:
+                    params = step.params or {}
+                    form = params.get("form", "NFKC")
+                    remove_diacritics = bool(params.get("remove_diacritics", False))
+                    df = _unicode_normalize_column(df, col, form=form, remove_diacritics=remove_diacritics)
+                elif step.action == "map" and col:
+                    mapping = (step.params or {}).get("mapping") or {}
+                    if mapping:
+                        df = _map_values(df, col, mapping)
+                elif step.action == "regex_replace" and col:
+                    pat = (step.params or {}).get("pattern")
+                    repl = (step.params or {}).get("replace")
+                    if pat is not None:
+                        flags = (step.params or {}).get("flags")
+                        df = _regex_replace(df, col, pat, repl or "", flags=flags)
+                elif step.action == "bucketize" and col:
+                    buckets = (step.params or {}).get("buckets", [])
+                    if buckets:
+                        df = _bucketize(df, col, buckets)
+                elif step.action == "replace" and col:
+                    old = (step.params or {}).get("old")
+                    new = (step.params or {}).get("new")
+                    if old is not None:
+                        df = _replace_values(df, col, old, new)
+                elif step.action == "remove_by_type" and col:
+                    params = step.params or {}
+                    res = _remove_by_type(df, col, params)
+                    if isinstance(res, tuple):
+                        df = res[0]
+                        info = res[1]
+                        if info:
+                            diagnostics.append(info)
+                    else:
+                        df = res
+                elif step.action == "move_by_type" or step.action == "swap_by_types":
+                    params = step.params or {}
+                    if step.action == "move_by_type":
+                        moves = [params]
+                    else:
+                        moves = params.get("moves") or []
+                    res = _swap_by_types(df, moves, replacement=params.get("replacement", ""))
+                    if isinstance(res, tuple):
+                        df = res[0]
+                        info = res[1]
+                        if info:
+                            diagnostics.append(info)
+                    else:
+                        df = res
+                elif step.action == "rename" and col:
+                    new_name = (step.params or {}).get("new_name")
+                    if new_name:
+                        # if multiple columns provided and new_name is a list, map pairwise
+                        if isinstance(step.column, (list, tuple)) and isinstance(new_name, (list, tuple)) and len(new_name) == len(step.column):
+                            # find index
+                            try:
+                                idx = list(step.column).index(col)
+                                df = _rename_column(df, col, new_name[idx])
+                            except Exception:
+                                pass
+                        else:
+                            # single new_name supplied: apply same rename (caller should ensure no collisions)
+                            df = _rename_column(df, col, new_name)
+                elif step.action == "fuzzy_dedupe":
+                    params = step.params or {}
+                    subset = params.get("subset")
+                    threshold = float(params.get("threshold", 0.85))
+                    method = params.get("method", 'difflib')
+                    res = _fuzzy_dedupe(df, subset=subset, threshold=threshold, method=method)
+                    if isinstance(res, tuple):
+                        df = res[0]
+                        info = res[1]
+                        if info:
+                            diagnostics.append(info)
+                    else:
+                        df = res
+                elif step.action == "cast" and col:
+                    params = step.params or {}
+                    to_type = params.get("to_type") or params.get("type")
+                    fmt = params.get("format")
+                    res = _cast_column(df, col, to_type, fmt)
+                    if isinstance(res, tuple):
+                        df = res[0]
+                        info = res[1]
+                        if info:
+                            diagnostics.append(info)
+                    else:
+                        df = res
+                elif step.action == "conditional" and col:
+                    params = step.params or {}
+                    val = params.get("value")
+                    cond = params.get("condition")
+                    if cond is not None:
+                        df = _conditional_transform(df, col, val, cond)
+                elif step.action == "join":
+                    params = step.params or {}
+                    left_path = params.get("left")
+                    right_path = params.get("right")
+                    keys = params.get("keys") or []
+                    fuzzy = params.get("fuzzy", False)
+                    # only support single-key joins for fuzzy matching
+                    if right_path and keys:
+                        try:
+                            right_df = _read_table(right_path)
+                            join_key = keys[0]
+                            if not fuzzy:
+                                # standard left join
+                                if _is_polars_df(df) and _is_polars_df(right_df):
+                                    df = df.join(right_df, on=join_key, how="left")
+                                else:
+                                    # pandas fallback
+                                    import pandas as _pd
+                                    left_pd = df.to_pandas() if _is_polars_df(df) else df
+                                    right_pd = right_df.to_pandas() if _is_polars_df(right_df) else right_df
+                                    df = left_pd.merge(right_pd, left_on=join_key, right_on=join_key, how="left")
+                            else:
+                                # fuzzy join: match closest right key for each left key value
+                                # build list of candidate keys from right
+                                if _is_polars_df(right_df):
+                                    try:
+                                        right_keys = [str(x) for x in right_df.select(pl.col(join_key)).to_series().to_list()]
+                                    except Exception:
+                                        # fallback: try direct column access on polars DataFrame
+                                        try:
+                                            right_keys = [str(x) for x in right_df[join_key].to_list()] if join_key in right_df.columns else []
+                                        except Exception:
+                                            right_keys = []
+                                else:
+                                    right_keys = [str(x) for x in right_df[join_key].astype(str).unique().tolist()]
+
+                                # threshold for matching and algorithm choice
+                                cutoff = float(params.get("threshold", 0.8))
+                                algorithm = (params.get("algorithm") or params.get("method") or "difflib").lower()
+                                for rk in right_keys:
+                                    pass
+
+                                # build matching function: support 'difflib' and optional 'minhash' (if datasketch installed)
+                                find_best = None
+                                if algorithm == 'minhash':
+                                    try:
+                                        from datasketch import MinHash, MinHashLSH
+                                        num_perm = int(params.get('num_perm', 128))
+                                        lsh = MinHashLSH(threshold=cutoff, num_perm=num_perm)
+                                        for idx, rk in enumerate(right_keys):
+                                            mh = MinHash(num_perm=num_perm)
+                                            for sh in str(rk).split():
+                                                mh.update(sh.encode('utf8'))
+                                            lsh.insert(str(idx), mh)
+
+                                        def _find_best_minhash(v):
+                                            if v is None:
+                                                return None
+                                            mh = MinHash(num_perm=num_perm)
+                                            for sh in str(v).split():
+                                                mh.update(sh.encode('utf8'))
+                                            res = lsh.query(mh)
+                                            if res:
+                                                try:
+                                                    return right_keys[int(res[0])]
+                                                except Exception:
+                                                    return right_keys[0] if right_keys else None
+                                            return None
+
+                                        find_best = _find_best_minhash
+                                    except Exception:
+                                        # fall back to difflib below
+                                        find_best = None
+
+                                if find_best is None:
+                                    def find_best(v):
+                                        if v is None:
+                                            return None
+                                        s = str(v)
+                                        matches = difflib.get_close_matches(s, right_keys, n=1, cutoff=cutoff)
+                                        return matches[0] if matches else None
+
+                                if _is_polars_df(df):
+                                    try:
+                                        # create helper mapped column
+                                        mapped = df.select(pl.col(join_key)).to_series().to_list()
+                                        mapped_vals = [find_best(x) for x in mapped]
+                                        df = df.with_columns(pl.Series("__fuzzy_key__", mapped_vals))
+                                        # rename right side columns to avoid collisions
+                                        right_pref = right_df.rename({c: f"right__{c}" for c in right_df.columns})
+                                        df = df.join(right_pref, left_on="__fuzzy_key__", right_on=f"right__{join_key}", how="left")
+                                        # drop helper key
+                                        try:
+                                            df = df.drop("__fuzzy_key__")
+                                        except Exception:
+                                            pass
+                                    except Exception:
+                                        pass
+                                else:
+                                    import pandas as _pd
+                                    left_pd = df.to_pandas() if _is_polars_df(df) else df.copy()
+                                    right_pd = right_df.to_pandas() if _is_polars_df(right_df) else right_df.copy()
+                                    left_pd["__fuzzy_key__"] = left_pd[join_key].apply(find_best)
+                                    right_pd = right_pd.rename(columns={join_key: "__right_key__"})
+                                    df = left_pd.merge(right_pd, left_on="__fuzzy_key__", right_on="__right_key__", how="left")
+                        except Exception:
+                            pass
         out_path = recipe.outputs[0]["path"] if recipe.outputs else "output.csv"
 
         # Ensure target directory exists
@@ -2961,234 +3040,250 @@ class Cleaner:
         before = _strip_meta_rows(before)
         df_after = df_for_ops
         warnings = []
+        def _step_cols(step):
+            c = getattr(step, "column", None)
+            if c is None:
+                return [None]
+            if isinstance(c, (list, tuple)):
+                return list(c)
+            return [c]
+
         for step in recipe.cleaning_steps:
-            col = getattr(step, "column", None)
-            if col and col not in (df_after.columns if _is_polars_df(df_after) else list(df_after.columns)):
-                warnings.append({"step": step.action, "column": col, "reason": "column_missing"})
+            cols = _step_cols(step)
+            # warn for any missing columns, but still apply the step to present columns
+            missing = [c for c in cols if c and c not in (df_after.columns if _is_polars_df(df_after) else list(df_after.columns))]
+            for m in missing:
+                warnings.append({"step": step.action, "column": m, "reason": "column_missing"})
+
+            if step.action == "deduplicate":
+                subset = [c for c in cols if c]
+                subset = subset if subset else None
+                df_after = _unique_df(df_after, subset=subset)
                 continue
 
-            if step.action == "drop_column" and col:
-                df_after = _drop_column(df_after, col)
-            elif step.action == "impute" and col:
-                params = step.params or {}
-                res = _impute_missing(df_after, col, params)
-                info = None
-                if isinstance(res, tuple):
-                    df_after = res[0]
-                    info = res[1]
-                else:
-                    df_after = res
-                if info:
-                    # add human-readable warning for preview
-                    try:
-                        method = info.get('method') or info.get('strategy') or ''
-                        rows_changed = int(info.get('rows_changed') or 0)
-                        colname = info.get('column')
-                        source = info.get('source')
-                        group_by = info.get('group_by')
-                        msg = f"Imputed {colname}: {rows_changed} rows filled"
-                        details = []
-                        if method:
-                            details.append(method)
-                        if source:
-                            details.append('from ' + (source if isinstance(source, str) else json.dumps(source)))
-                        if group_by:
-                            details.append('grouped by ' + group_by)
-                        if details:
-                            msg = msg + ' (' + ', '.join(details) + ')'
-                        warnings.append({"step": "impute", "column": colname, "message": msg, "rows_changed": rows_changed, "sample_positions": info.get('sample_positions', [])})
-                    except Exception:
-                        warnings.append({"step": "impute", "column": col, "message": "Imputation applied", "rows_changed": 0})
-            elif step.action == "normalize" and col:
-                try:
-                    case = (step.params or {}).get("case", "lower")
-                    df_after = _string_transform_column(df_after, col, case=case)
-                except Exception:
-                    pass
-            elif step.action == "deduplicate":
-                subset = [col] if col else None
-                df_after = _unique_df(df_after, subset=subset)
-            elif step.action == "map" and col:
-                mapping = (step.params or {}).get("mapping") or {}
-                if mapping:
-                    df_after = _map_values(df_after, col, mapping)
-            elif step.action == "regex_replace" and col:
-                pat = (step.params or {}).get("pattern")
-                repl = (step.params or {}).get("replace")
-                if pat is not None:
-                    flags = (step.params or {}).get("flags")
-                    df_after = _regex_replace(df_after, col, pat, repl or "", flags=flags)
-            elif step.action == "bucketize" and col:
-                buckets = (step.params or {}).get("buckets", [])
-                if buckets:
-                    df_after = _bucketize(df_after, col, buckets)
-            elif step.action == "replace" and col:
-                old = (step.params or {}).get("old")
-                new = (step.params or {}).get("new")
-                if old is not None:
-                    df_after = _replace_values(df_after, col, old, new)
-            elif step.action == "remove_by_type" and col:
-                params = step.params or {}
-                res = _remove_by_type(df_after, col, params)
-                info = None
-                if isinstance(res, tuple):
-                    df_after = res[0]
-                    info = res[1]
-                else:
-                    df_after = res
-                if info:
-                    # add human-readable warning for preview
-                    try:
-                        rows_changed = int(info.get('rows_changed') or 0)
-                        colname = info.get('column')
-                        ttype = info.get('target_type')
-                        msg = f"Removed {ttype} entries from {colname}: {rows_changed} rows changed"
-                        warnings.append({"step": "remove_by_type", "column": colname, "message": msg, "rows_changed": rows_changed, "sample_positions": info.get('sample_positions', [])})
-                    except Exception:
-                        warnings.append({"step": "remove_by_type", "column": col, "message": "Removed values by type", "rows_changed": 0})
-            elif step.action == "rename" and col:
-                new_name = (step.params or {}).get("new_name")
-                if new_name:
-                    df_after = _rename_column(df_after, col, new_name)
-            elif step.action == "fuzzy_dedupe":
-                try:
+            for col in cols:
+                # skip individual missing columns so other columns in the same step still run
+                if col and col not in (df_after.columns if _is_polars_df(df_after) else list(df_after.columns)):
+                    continue
+                if step.action == "drop_column" and col:
+                    df_after = _drop_column(df_after, col)
+                elif step.action == "impute" and col:
                     params = step.params or {}
-                    subset = params.get("subset")
-                    threshold = float(params.get("threshold", 0.85))
-                    method = params.get("method", 'difflib')
-                    res = _fuzzy_dedupe(df_after, subset=subset, threshold=threshold, method=method)
+                    res = _impute_missing(df_after, col, params)
+                    info = None
                     if isinstance(res, tuple):
                         df_after = res[0]
                         info = res[1]
-                        if info:
-                            warnings.append({"step": "fuzzy_dedupe", "message": f"Removed {info.get('rows_removed',0)} rows via fuzzy dedupe", "details": info})
                     else:
                         df_after = res
-                except Exception:
-                    pass
-            elif step.action == "cast" and col:
-                params = step.params or {}
-                to_type = params.get("to_type") or params.get("type")
-                fmt = params.get("format")
-                res = _cast_column(df_after, col, to_type, fmt)
-                info = None
-                if isinstance(res, tuple):
-                    df_after = res[0]
-                    info = res[1]
-                else:
-                    df_after = res
-                if info:
-                    warnings.append({"step": "cast", "column": info.get('column'), "message": f"Cast to {info.get('to_type')}", "rows_changed": info.get('rows_changed')})
-            elif step.action == "move_by_type" or step.action == "swap_by_types":
-                params = step.params or {}
-                if step.action == "move_by_type":
-                    moves = [params]
-                else:
-                    moves = params.get("moves") or []
-                res = _swap_by_types(df_after, moves, replacement=params.get("replacement", ""))
-                info = None
-                if isinstance(res, tuple):
-                    df_after = res[0]
-                    info = res[1]
-                else:
-                    df_after = res
-                if info:
-                    warnings.append({"step": step.action, "message": f"Moved/swapped values: {info.get('rows_changed', 0)} rows changed", "details": info})
-            elif step.action == "conditional" and col:
-                params = step.params or {}
-                val = params.get("value")
-                cond = params.get("condition")
-                if cond is not None:
-                    df_after = _conditional_transform(df_after, col, val, cond)
-            elif step.action == "join":
-                params = step.params or {}
-                left_path = params.get("left")
-                right_path = params.get("right")
-                keys = params.get("keys") or []
-                fuzzy = params.get("fuzzy", False)
-                if right_path and keys:
+                    if info:
+                        # add human-readable warning for preview
+                        try:
+                            method = info.get('method') or info.get('strategy') or ''
+                            rows_changed = int(info.get('rows_changed') or 0)
+                            colname = info.get('column')
+                            source = info.get('source')
+                            group_by = info.get('group_by')
+                            msg = f"Imputed {colname}: {rows_changed} rows filled"
+                            details = []
+                            if method:
+                                details.append(method)
+                            if source:
+                                details.append('from ' + (source if isinstance(source, str) else json.dumps(source)))
+                            if group_by:
+                                details.append('grouped by ' + group_by)
+                            if details:
+                                msg = msg + ' (' + ', '.join(details) + ')'
+                            warnings.append({"step": "impute", "column": colname, "message": msg, "rows_changed": rows_changed, "sample_positions": info.get('sample_positions', [])})
+                        except Exception:
+                            warnings.append({"step": "impute", "column": col, "message": "Imputation applied", "rows_changed": 0})
+                elif step.action == "normalize" and col:
                     try:
-                        right_df = _read_table(right_path)
-                        join_key = keys[0]
-                        if not fuzzy:
-                            if _is_polars_df(df_after) and _is_polars_df(right_df):
-                                df_after = df_after.join(right_df, on=join_key, how="left")
-                            else:
-                                import pandas as _pd
-                                left_pd = df_after.to_pandas() if _is_polars_df(df_after) else df_after
-                                right_pd = right_df.to_pandas() if _is_polars_df(right_df) else right_df
-                                df_after = left_pd.merge(right_pd, left_on=join_key, right_on=join_key, how="left")
-                        else:
-                            if _is_polars_df(right_df):
-                                try:
-                                    right_keys = [str(x) for x in right_df.select(pl.col(join_key)).to_series().to_list()]
-                                except Exception:
-                                    right_keys = [str(x) for x in right_df[join_key].to_list()] if join_key in right_df.columns else []
-                            else:
-                                right_keys = [str(x) for x in right_df[join_key].astype(str).unique().tolist()]
-
-                            cutoff = float(params.get("threshold", 0.8))
-                            algorithm = (params.get("algorithm") or params.get("method") or "difflib").lower()
-
-                            find_best = None
-                            if algorithm == 'minhash':
-                                try:
-                                    from datasketch import MinHash, MinHashLSH
-                                    num_perm = int(params.get('num_perm', 128))
-                                    lsh = MinHashLSH(threshold=cutoff, num_perm=num_perm)
-                                    for idx, rk in enumerate(right_keys):
-                                        mh = MinHash(num_perm=num_perm)
-                                        for sh in str(rk).split():
-                                            mh.update(sh.encode('utf8'))
-                                        lsh.insert(str(idx), mh)
-
-                                    def _find_best_minhash(v):
-                                        if v is None:
-                                            return None
-                                        mh = MinHash(num_perm=num_perm)
-                                        for sh in str(v).split():
-                                            mh.update(sh.encode('utf8'))
-                                        res = lsh.query(mh)
-                                        if res:
-                                            try:
-                                                return right_keys[int(res[0])]
-                                            except Exception:
-                                                return right_keys[0] if right_keys else None
-                                        return None
-
-                                    find_best = _find_best_minhash
-                                except Exception:
-                                    find_best = None
-
-                            if find_best is None:
-                                def find_best(v):
-                                    if v is None:
-                                        return None
-                                    s = str(v)
-                                    matches = difflib.get_close_matches(s, right_keys, n=1, cutoff=cutoff)
-                                    return matches[0] if matches else None
-
-                            if _is_polars_df(df_after):
-                                try:
-                                    mapped = df_after.select(pl.col(join_key)).to_series().to_list()
-                                    mapped_vals = [find_best(x) for x in mapped]
-                                    df_after = df_after.with_columns(pl.Series("__fuzzy_key__", mapped_vals))
-                                    right_pref = right_df.rename({c: f"right__{c}" for c in right_df.columns})
-                                    df_after = df_after.join(right_pref, left_on="__fuzzy_key__", right_on=f"right__{join_key}", how="left")
-                                    try:
-                                        df_after = df_after.drop("__fuzzy_key__")
-                                    except Exception:
-                                        pass
-                                except Exception:
-                                    pass
-                            else:
-                                import pandas as _pd
-                                left_pd = df_after.to_pandas() if _is_polars_df(df_after) else df_after.copy()
-                                right_pd = right_df.to_pandas() if _is_polars_df(right_df) else right_df.copy()
-                                left_pd["__fuzzy_key__"] = left_pd[join_key].apply(find_best)
-                                right_pd = right_pd.rename(columns={join_key: "__right_key__"})
-                                df_after = left_pd.merge(right_pd, left_on="__fuzzy_key__", right_on="__right_key__", how="left")
+                        case = (step.params or {}).get("case", "lower")
+                        df_after = _string_transform_column(df_after, col, case=case)
                     except Exception:
                         pass
+                elif step.action == "map" and col:
+                    mapping = (step.params or {}).get("mapping") or {}
+                    if mapping:
+                        df_after = _map_values(df_after, col, mapping)
+                elif step.action == "regex_replace" and col:
+                    pat = (step.params or {}).get("pattern")
+                    repl = (step.params or {}).get("replace")
+                    if pat is not None:
+                        flags = (step.params or {}).get("flags")
+                        df_after = _regex_replace(df_after, col, pat, repl or "", flags=flags)
+                elif step.action == "bucketize" and col:
+                    buckets = (step.params or {}).get("buckets", [])
+                    if buckets:
+                        df_after = _bucketize(df_after, col, buckets)
+                elif step.action == "replace" and col:
+                    old = (step.params or {}).get("old")
+                    new = (step.params or {}).get("new")
+                    if old is not None:
+                        df_after = _replace_values(df_after, col, old, new)
+                elif step.action == "remove_by_type" and col:
+                    params = step.params or {}
+                    res = _remove_by_type(df_after, col, params)
+                    info = None
+                    if isinstance(res, tuple):
+                        df_after = res[0]
+                        info = res[1]
+                    else:
+                        df_after = res
+                    if info:
+                        # add human-readable warning for preview
+                        try:
+                            rows_changed = int(info.get('rows_changed') or 0)
+                            colname = info.get('column')
+                            ttype = info.get('target_type')
+                            msg = f"Removed {ttype} entries from {colname}: {rows_changed} rows changed"
+                            warnings.append({"step": "remove_by_type", "column": colname, "message": msg, "rows_changed": rows_changed, "sample_positions": info.get('sample_positions', [])})
+                        except Exception:
+                            warnings.append({"step": "remove_by_type", "column": col, "message": "Removed values by type", "rows_changed": 0})
+                elif step.action == "rename" and col:
+                    new_name = (step.params or {}).get("new_name")
+                    if new_name:
+                        df_after = _rename_column(df_after, col, new_name)
+                elif step.action == "fuzzy_dedupe":
+                    try:
+                        params = step.params or {}
+                        subset = params.get("subset")
+                        threshold = float(params.get("threshold", 0.85))
+                        method = params.get("method", 'difflib')
+                        res = _fuzzy_dedupe(df_after, subset=subset, threshold=threshold, method=method)
+                        if isinstance(res, tuple):
+                            df_after = res[0]
+                            info = res[1]
+                            if info:
+                                warnings.append({"step": "fuzzy_dedupe", "message": f"Removed {info.get('rows_removed',0)} rows via fuzzy dedupe", "details": info})
+                        else:
+                            df_after = res
+                    except Exception:
+                        pass
+                elif step.action == "cast" and col:
+                    params = step.params or {}
+                    to_type = params.get("to_type") or params.get("type")
+                    fmt = params.get("format")
+                    res = _cast_column(df_after, col, to_type, fmt)
+                    info = None
+                    if isinstance(res, tuple):
+                        df_after = res[0]
+                        info = res[1]
+                    else:
+                        df_after = res
+                    if info:
+                        warnings.append({"step": "cast", "column": info.get('column'), "message": f"Cast to {info.get('to_type')}", "rows_changed": info.get('rows_changed')})
+                elif step.action == "move_by_type" or step.action == "swap_by_types":
+                    params = step.params or {}
+                    if step.action == "move_by_type":
+                        moves = [params]
+                    else:
+                        moves = params.get("moves") or []
+                    res = _swap_by_types(df_after, moves, replacement=params.get("replacement", ""))
+                    info = None
+                    if isinstance(res, tuple):
+                        df_after = res[0]
+                        info = res[1]
+                    else:
+                        df_after = res
+                    if info:
+                        warnings.append({"step": step.action, "message": f"Moved/swapped values: {info.get('rows_changed', 0)} rows changed", "details": info})
+                elif step.action == "conditional" and col:
+                    params = step.params or {}
+                    val = params.get("value")
+                    cond = params.get("condition")
+                    if cond is not None:
+                        df_after = _conditional_transform(df_after, col, val, cond)
+                elif step.action == "join":
+                    params = step.params or {}
+                    left_path = params.get("left")
+                    right_path = params.get("right")
+                    keys = params.get("keys") or []
+                    fuzzy = params.get("fuzzy", False)
+                    if right_path and keys:
+                        try:
+                            right_df = _read_table(right_path)
+                            join_key = keys[0]
+                            if not fuzzy:
+                                if _is_polars_df(df_after) and _is_polars_df(right_df):
+                                    df_after = df_after.join(right_df, on=join_key, how="left")
+                                else:
+                                    import pandas as _pd
+                                    left_pd = df_after.to_pandas() if _is_polars_df(df_after) else df_after
+                                    right_pd = right_df.to_pandas() if _is_polars_df(right_df) else right_df
+                                    df_after = left_pd.merge(right_pd, left_on=join_key, right_on=join_key, how="left")
+                            else:
+                                if _is_polars_df(right_df):
+                                    try:
+                                        right_keys = [str(x) for x in right_df.select(pl.col(join_key)).to_series().to_list()]
+                                    except Exception:
+                                        right_keys = [str(x) for x in right_df[join_key].to_list()] if join_key in right_df.columns else []
+                                else:
+                                    right_keys = [str(x) for x in right_df[join_key].astype(str).unique().tolist()]
+
+                                cutoff = float(params.get("threshold", 0.8))
+                                algorithm = (params.get("algorithm") or params.get("method") or "difflib").lower()
+
+                                find_best = None
+                                if algorithm == 'minhash':
+                                    try:
+                                        from datasketch import MinHash, MinHashLSH
+                                        num_perm = int(params.get('num_perm', 128))
+                                        lsh = MinHashLSH(threshold=cutoff, num_perm=num_perm)
+                                        for idx, rk in enumerate(right_keys):
+                                            mh = MinHash(num_perm=num_perm)
+                                            for sh in str(rk).split():
+                                                mh.update(sh.encode('utf8'))
+                                            lsh.insert(str(idx), mh)
+
+                                        def _find_best_minhash(v):
+                                            if v is None:
+                                                return None
+                                            mh = MinHash(num_perm=num_perm)
+                                            for sh in str(v).split():
+                                                mh.update(sh.encode('utf8'))
+                                            res = lsh.query(mh)
+                                            if res:
+                                                try:
+                                                    return right_keys[int(res[0])]
+                                                except Exception:
+                                                    return right_keys[0] if right_keys else None
+                                            return None
+
+                                        find_best = _find_best_minhash
+                                    except Exception:
+                                        find_best = None
+
+                                if find_best is None:
+                                    def find_best(v):
+                                        if v is None:
+                                            return None
+                                        s = str(v)
+                                        matches = difflib.get_close_matches(s, right_keys, n=1, cutoff=cutoff)
+                                        return matches[0] if matches else None
+
+                                if _is_polars_df(df_after):
+                                    try:
+                                        mapped = df_after.select(pl.col(join_key)).to_series().to_list()
+                                        mapped_vals = [find_best(x) for x in mapped]
+                                        df_after = df_after.with_columns(pl.Series("__fuzzy_key__", mapped_vals))
+                                        right_pref = right_df.rename({c: f"right__{c}" for c in right_df.columns})
+                                        df_after = df_after.join(right_pref, left_on="__fuzzy_key__", right_on=f"right__{join_key}", how="left")
+                                        try:
+                                            df_after = df_after.drop("__fuzzy_key__")
+                                        except Exception:
+                                            pass
+                                    except Exception:
+                                        pass
+                                else:
+                                    import pandas as _pd
+                                    left_pd = df_after.to_pandas() if _is_polars_df(df_after) else df_after.copy()
+                                    right_pd = right_df.to_pandas() if _is_polars_df(right_df) else right_df.copy()
+                                    left_pd["__fuzzy_key__"] = left_pd[join_key].apply(find_best)
+                                    right_pd = right_pd.rename(columns={join_key: "__right_key__"})
+                                    df_after = left_pd.merge(right_pd, left_on="__fuzzy_key__", right_on="__right_key__", how="left")
+                        except Exception:
+                            pass
         after = _df_head_records(df_after, n)
         return {"before": before, "after": after, "warnings": warnings}

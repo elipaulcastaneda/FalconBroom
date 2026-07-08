@@ -1,0 +1,301 @@
+feedback_id,user,comment
+F8000,Frank,Needs improvement
+F8001,Bob,See\nnote
+F8002,Diana,See\nnote
+F8003,Mallory,Great product!
+F8004,Rupert,bad\nservice
+F8005,Trent,👍👍
+F8006,Olivia,ありがとう
+F8007,Rupert,<b>Broken</b>
+F8008,Eve,ありがとう
+F8009,Heidi,ありがとう
+F8010,Quentin,ありがとう
+F8011,Heidi,ありがとう
+F8012,Bob,Great product!
+F8013,Sybil,Très bien
+F8014,Sybil,<script>alert(1)</script>
+F8015,Olivia,Très bien
+F8016,Peggy,See\nnote
+F8017,Bob,bad\nservice
+F8018,Olivia,Needs improvement
+F8019,Victor,<b>Broken</b>
+F8020,Rupert,<b>Broken</b>
+F8021,Grace,ありがとう
+F8022,Rupert,bad\nservice
+F8023,Victor,Très bien
+F8024,Uma,See\nnote
+F8025,Frank,👍👍
+F8026,Rupert,Needs improvement
+F8027,Victor,<b>Broken</b>
+F8028,Uma,Needs improvement
+F8029,Diana,<b>Broken</b>
+F8030,Niaj,ありがとう
+F8031,Eve,Needs improvement
+F8032,Heidi,No funciona
+F8033,Charlie,<b>Broken</b>
+F8034,Grace,Needs improvement
+F8035,Quentin,<script>alert(1)</script>
+F8036,Mallory,No funciona
+F8037,Ivan,bad\nservice
+F8038,Grace,bad\nservice
+F8039,Grace,Great product!
+F8040,Peggy,<script>alert(1)</script>
+F8041,Bob,Needs improvement
+F8042,Rupert,No funciona
+F8043,Bob,<script>alert(1)</script>
+F8044,Victor,<b>Broken</b>
+F8045,Bob,Très bien
+F8046,Heidi,Needs improvement
+F8047,Peggy,No funciona
+F8048,Quentin,Great product!
+F8049,Niaj,Great product!
+F8050,Niaj,ありがとう
+F8051,Trent,<b>Broken</b>
+F8052,Uma,Great product!
+F8053,Eve,Needs improvement
+F8054,Niaj,See\nnote
+F8055,Victor,See\nnote
+F8056,Judy,ありがとう
+F8057,Charlie,bad\nservice
+F8058,Alice,<b>Broken</b>
+F8059,Olivia,Needs improvement
+F8060,Alice,<b>Broken</b>
+F8061,Charlie,ありがとう
+F8062,Heidi,Needs improvement
+F8063,Mallory,Très bien
+F8064,Grace,<b>Broken</b>
+F8065,Frank,ありがとう
+F8066,Ivan,👍👍
+F8067,Eve,Needs improvement
+F8068,Diana,<b>Broken</b>
+F8069,Diana,See\nnote
+F8070,Charlie,No funciona
+F8071,Peggy,Très bien
+F8072,Eve,Great product!
+F8073,Judy,ありがとう
+F8074,Peggy,See\nnote
+F8075,Charlie,ありがとう
+F8076,Bob,<b>Broken</b>
+F8077,Niaj,bad\nservice
+F8078,Quentin,See\nnote
+F8079,Heidi,No funciona
+F8080,Bob,See\nnote
+F8081,Judy,No funciona
+F8082,Diana,<b>Broken</b>
+F8083,Grace,<script>alert(1)</script>
+F8084,Bob,No funciona
+F8085,Charlie,No funciona
+F8086,Uma,See\nnote
+F8087,Rupert,bad\nservice
+F8088,Olivia,Great product!
+F8089,Judy,ありがとう
+F8090,Grace,Très bien
+F8091,Alice,Needs improvement
+F8092,Rupert,👍👍
+F8093,Victor,Needs improvement
+F8094,Eve,See\nnote
+F8095,Ivan,Très bien
+F8096,Peggy,<script>alert(1)</script>
+F8097,Uma,See\nnote
+F8098,Niaj,See\nnote
+F8099,Grace,Great product!
+F8100,Charlie,See\nnote
+F8101,Ivan,<b>Broken</b>
+F8102,Olivia,See\nnote
+F8103,Olivia,ありがとう
+F8104,Mallory,No funciona
+F8105,Frank,👍👍
+F8106,Victor,bad\nservice
+F8107,Ivan,Très bien
+F8108,Alice,Needs improvement
+F8109,Niaj,<b>Broken</b>
+F8110,Mallory,bad\nservice
+F8111,Heidi,<script>alert(1)</script>
+F8112,Victor,See\nnote
+F8113,Alice,Great product!
+F8114,Olivia,👍👍
+F8115,Niaj,👍👍
+F8116,Charlie,Great product!
+F8117,Alice,See\nnote
+F8118,Frank,👍👍
+F8119,Rupert,See\nnote
+F8120,Trent,Très bien
+F8121,Rupert,<b>Broken</b>
+F8122,Alice,👍👍
+F8123,Charlie,Great product!
+F8124,Grace,👍👍
+F8125,Ivan,See\nnote
+F8126,Frank,No funciona
+F8127,Quentin,bad\nservice
+F8128,Quentin,See\nnote
+F8129,Heidi,See\nnote
+F8130,Heidi,Great product!
+F8131,Victor,Très bien
+F8132,Bob,See\nnote
+F8133,Alice,<script>alert(1)</script>
+F8134,Grace,See\nnote
+F8135,Frank,👍👍
+F8136,Grace,ありがとう
+F8137,Victor,No funciona
+F8138,Olivia,Très bien
+F8139,Rupert,Needs improvement
+F8140,Niaj,No funciona
+F8141,Grace,Très bien
+F8142,Heidi,See\nnote
+F8143,Eve,bad\nservice
+F8144,Niaj,ありがとう
+F8145,Niaj,👍👍
+F8146,Judy,<script>alert(1)</script>
+F8147,Heidi,<b>Broken</b>
+F8148,Victor,Great product!
+F8149,Frank,bad\nservice
+F8150,Victor,👍👍
+F8151,Rupert,bad\nservice
+F8152,Frank,👍👍
+F8153,Mallory,bad\nservice
+F8154,Bob,bad\nservice
+F8155,Sybil,<b>Broken</b>
+F8156,Charlie,ありがとう
+F8157,Niaj,Très bien
+F8158,Victor,<b>Broken</b>
+F8159,Olivia,No funciona
+F8160,Niaj,👍👍
+F8161,Alice,👍👍
+F8162,Eve,Très bien
+F8163,Olivia,ありがとう
+F8164,Eve,<script>alert(1)</script>
+F8165,Peggy,Needs improvement
+F8166,Ivan,No funciona
+F8167,Uma,Très bien
+F8168,Quentin,<b>Broken</b>
+F8169,Judy,Great product!
+F8170,Niaj,👍👍
+F8171,Grace,Great product!
+F8172,Peggy,Très bien
+F8173,Uma,bad\nservice
+F8174,Frank,Needs improvement
+F8175,Judy,See\nnote
+F8176,Charlie,No funciona
+F8177,Trent,Needs improvement
+F8178,Quentin,Great product!
+F8179,Frank,<b>Broken</b>
+F8180,Bob,See\nnote
+F8181,Eve,<script>alert(1)</script>
+F8182,Sybil,<b>Broken</b>
+F8183,Niaj,bad\nservice
+F8184,Niaj,bad\nservice
+F8185,Trent,ありがとう
+F8186,Quentin,ありがとう
+F8187,Peggy,<b>Broken</b>
+F8188,Rupert,Great product!
+F8189,Uma,Needs improvement
+F8190,Trent,ありがとう
+F8191,Trent,<b>Broken</b>
+F8192,Eve,Très bien
+F8193,Sybil,<b>Broken</b>
+F8194,Peggy,Great product!
+F8195,Trent,<b>Broken</b>
+F8196,Uma,ありがとう
+F8197,Eve,Needs improvement
+F8198,Peggy,Great product!
+F8199,Mallory,bad\nservice
+F8200,Eve,No funciona
+F8201,Uma,Needs improvement
+F8202,Quentin,See\nnote
+F8203,Ivan,Needs improvement
+F8204,Quentin,👍👍
+F8205,Bob,<b>Broken</b>
+F8206,Trent,<b>Broken</b>
+F8207,Victor,ありがとう
+F8208,Frank,Needs improvement
+F8209,Niaj,bad\nservice
+F8210,Niaj,Great product!
+F8211,Quentin,bad\nservice
+F8212,Grace,bad\nservice
+F8213,Niaj,<b>Broken</b>
+F8214,Uma,👍👍
+F8215,Alice,See\nnote
+F8216,Diana,Needs improvement
+F8217,Alice,<script>alert(1)</script>
+F8218,Uma,Très bien
+F8219,Alice,No funciona
+F8220,Mallory,bad\nservice
+F8221,Mallory,Great product!
+F8222,Grace,👍👍
+F8223,Mallory,No funciona
+F8224,Alice,bad\nservice
+F8225,Grace,Needs improvement
+F8226,Mallory,No funciona
+F8227,Victor,<b>Broken</b>
+F8228,Peggy,See\nnote
+F8229,Charlie,bad\nservice
+F8230,Grace,Great product!
+F8231,Quentin,Needs improvement
+F8232,Frank,bad\nservice
+F8233,Ivan,Needs improvement
+F8234,Ivan,<b>Broken</b>
+F8235,Trent,<b>Broken</b>
+F8236,Alice,No funciona
+F8237,Eve,No funciona
+F8238,Uma,<script>alert(1)</script>
+F8239,Olivia,Great product!
+F8240,Diana,bad\nservice
+F8241,Peggy,ありがとう
+F8242,Heidi,Great product!
+F8243,Uma,Great product!
+F8244,Mallory,No funciona
+F8245,Rupert,See\nnote
+F8246,Eve,No funciona
+F8247,Rupert,bad\nservice
+F8248,Grace,Needs improvement
+F8249,Uma,👍👍
+F8250,Sybil,ありがとう
+F8251,Rupert,bad\nservice
+F8252,Frank,See\nnote
+F8253,Eve,Needs improvement
+F8254,Heidi,No funciona
+F8255,Bob,No funciona
+F8256,Rupert,Très bien
+F8257,Uma,<script>alert(1)</script>
+F8258,Ivan,No funciona
+F8259,Olivia,👍👍
+F8260,Olivia,See\nnote
+F8261,Charlie,Très bien
+F8262,Eve,No funciona
+F8263,Peggy,ありがとう
+F8264,Frank,ありがとう
+F8265,Bob,Great product!
+F8266,Niaj,Needs improvement
+F8267,Eve,bad\nservice
+F8268,Victor,Needs improvement
+F8269,Niaj,👍👍
+F8270,Niaj,No funciona
+F8271,Grace,👍👍
+F8272,Frank,<script>alert(1)</script>
+F8273,Niaj,<b>Broken</b>
+F8274,Sybil,bad\nservice
+F8275,Diana,bad\nservice
+F8276,Sybil,<b>Broken</b>
+F8277,Judy,<script>alert(1)</script>
+F8278,Niaj,No funciona
+F8279,Bob,<script>alert(1)</script>
+F8280,Rupert,Great product!
+F8281,Charlie,See\nnote
+F8282,Bob,See\nnote
+F8283,Heidi,Needs improvement
+F8284,Quentin,Needs improvement
+F8285,Frank,ありがとう
+F8286,Judy,ありがとう
+F8287,Quentin,Needs improvement
+F8288,Frank,bad\nservice
+F8289,Judy,See\nnote
+F8290,Sybil,<script>alert(1)</script>
+F8291,Victor,Très bien
+F8292,Victor,See\nnote
+F8293,Heidi,Great product!
+F8294,Diana,👍👍
+F8295,Rupert,Très bien
+F8296,Rupert,bad\nservice
+F8297,Frank,No funciona
+F8298,Charlie,See\nnote
+F8299,Trent,Great product!

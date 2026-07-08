@@ -1,0 +1,1 @@
+Run `scripts/run_uvicorn_direct.ps1` (Windows) or `scripts/run_uvicorn_direct.sh` (Unix) to quickly start uvicorn; use `-LifespanOff` (or pass `1` to the shell script) to disable ASGI lifespan for faster binding.

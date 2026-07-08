@@ -1,10 +1,11 @@
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Union
 
 
 class CleaningStep(BaseModel):
     action: str
-    column: Optional[str]
+    # allow a single column or a list of columns to apply the same step
+    column: Optional[Union[str, List[str]]]
     params: Optional[dict] = {}
 
 

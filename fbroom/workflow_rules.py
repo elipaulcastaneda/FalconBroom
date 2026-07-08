@@ -207,6 +207,85 @@ def recipe_from_plain_english(text: str, profile: Dict[str, Dict[str, Any]], sou
 
     steps: List[CleaningStep] = []
     t = _norm(text)
+    # Detect explicit date-normalization requests like:
+    # "Convert the order_date column to YYYY-MM-DD" or
+    # "Make all the values in the order_date column year-month-day"
+    try:
+        # Look for explicit format mentions in the instruction
+        if any(k in t for k in ['yyyy', 'yyyy-mm-dd', 'year-month-day', 'iso', 'mm/dd/yyyy', 'dd/mm/yyyy']):
+            # Prefer exact column mentions from the profile (whole-word match)
+            # Allow multiple explicit mentions (e.g., 'order_date and delivery_date')
+            target_cols: List[str] = []
+            for c in profile.keys():
+                try:
+                    if re.search(rf"\b{re.escape(c)}\b", text, flags=re.IGNORECASE):
+                        target_cols.append(c)
+                except Exception:
+                    continue
+
+            # If no explicit mentions, prefer columns that contain 'date'
+            if not target_cols:
+                date_cols = [c for c in profile.keys() if 'date' in c.lower()]
+                if len(date_cols) == 1:
+                    target_cols = [date_cols[0]]
+                elif len(date_cols) > 1:
+                    # try to infer a prefix like 'order' from the instruction
+                    m = re.search(r'([a-zA-Z0-9_]+)[\s`_]?date', text, flags=re.IGNORECASE)
+                    if m:
+                        candidate = m.group(1).strip().lower()
+                        for dc in date_cols:
+                            if candidate in dc.lower():
+                                target_cols = [dc]
+                                break
+                    if not target_cols:
+                        # default to all date-like columns when ambiguous
+                        target_cols = date_cols
+
+            # fallback to fuzzy inference for a single target when still empty
+            if not target_cols:
+                inferred = infer_columns_from_text(text, profile, top_n=1)
+                if inferred:
+                    target_cols = [inferred[0][0]]
+
+            if target_cols:
+                # determine requested output format
+                fmt_raw = ''
+                mfmt = re.search(r'(yyyy[-/ ]?mm[-/ ]?dd|year[- ]month[- ]?day|iso|mm[/-]?dd[/-]?yyyy|dd[/-]?mm[/-]?yyyy)', text, flags=re.IGNORECASE)
+                if mfmt:
+                    fmt_raw = mfmt.group(1).lower()
+                else:
+                    fmt_raw = 'yyyy-mm-dd'
+
+                if 'year-month-day' in fmt_raw or 'yyyy-mm-dd' in fmt_raw or 'iso' in fmt_raw or 'yyyy' in fmt_raw:
+                    fmt = '%Y-%m-%d'
+                elif 'mm/dd' in fmt_raw or re.search(r'mm\W?dd\W?yyyy', fmt_raw):
+                    fmt = '%m/%d/%Y'
+                elif 'dd/mm' in fmt_raw or re.search(r'dd\W?mm\W?yyyy', fmt_raw):
+                    fmt = '%d/%m/%Y'
+                else:
+                    fmt = '%Y-%m-%d'
+
+                params = {'to_type': 'datetime', 'format': fmt}
+                if any(k in t for k in ['set null', 'set to null', 'null for invalid', 'invalid to null', 'set to none']):
+                    params['invalid_action'] = 'set_null'
+                # detect explicit parse-error column requested
+                em = re.search(r'([a-zA-Z0-9_]+_parse_error)', text, flags=re.IGNORECASE)
+                if em:
+                    err_col = em.group(1)
+                    params['on_invalid'] = {'add_column': err_col, 'value': 'unparseable'}
+                else:
+                    # only add a parse-error column if user asked for parse/error handling
+                    if any(k in t for k in ['parse error', 'parse_error', 'parse-error', 'parse error column', 'parse_error column']):
+                        # only auto-add parse_error column when a single target column is specified
+                        if len(target_cols) == 1:
+                            params['on_invalid'] = {'add_column': f"{target_cols[0]}_parse_error", 'value': 'unparseable'}
+
+                # attach step: if multiple target columns, set column to list to apply to each
+                step_column = target_cols if len(target_cols) > 1 else target_cols[0]
+                steps.append(CleaningStep(action='cast', column=step_column, params=params))
+                return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
+    except Exception:
+        pass
     # Precedence: detect explicit regex/map/bucketize patterns before generic 'replace' detection
     # regex replace pattern
     rex = re.findall(r"(?:replace\s+)?(?:regex|regular expression)\s+[\'\"](.+?)[\'\"]\s+with\s+[\'\"](.+?)[\'\"]\s+(?:in|on)\s+([a-zA-Z0-9_ ]+)", t)
@@ -662,7 +741,12 @@ def recipe_from_plain_english(text: str, profile: Dict[str, Dict[str, Any]], sou
                     strategy = "forward_fill"
                 steps.append(CleaningStep(action="impute", column=column, params={"strategy": strategy}))
     elif action == "normalize":
-        for column in suggested_columns[:3]:
+        # If the user explicitly mentioned columns, only normalize those.
+        if mentioned:
+            targets = mentioned
+        else:
+            targets = suggested_columns[:3]
+        for column in targets:
             steps.append(CleaningStep(action="normalize", column=column, params={"case": "lower" if any(k in t for k in ["lower", "lowercase"]) else "preserve"}))
     elif action == "deduplicate":
         # Comprehensive impute phrase handling used by data analysts
@@ -890,44 +974,55 @@ def explain_recipe(recipe: Recipe, profile: Optional[Dict[str, Dict[str, Any]]] 
     profile = profile or {}
 
     for step in recipe.cleaning_steps:
-        reason = ""
-        confidence = 0.5
-        if step.column and step.column in profile:
-            meta = profile[step.column]
-            nulls = int(meta.get("nulls", 0) or 0)
-            dtype = _norm(str(meta.get("dtype", "")))
-            if step.action == "impute":
-                strategy = step.params.get("strategy") if step.params else None
-                if not strategy:
-                    strategy = _default_strategy_for_column(meta)
-                    step.params = dict(step.params or {}, strategy=strategy)
-                reason = f"{step.column} has {nulls} missing values; use {strategy} for {dtype or 'unknown'} data."
-                confidence = 0.8 if nulls > 0 else 0.6
-            elif step.action == "normalize":
-                reason = f"{step.column} appears to be a text column, so normalization is safe and deterministic."
-                confidence = 0.75 if any(token in dtype for token in ["str", "utf", "object"]) else 0.6
-            elif step.action == "drop_column":
-                reason = f"{step.column} is explicit in the recipe and will be removed exactly."
-                confidence = 0.95
+        # allow multi-column steps: produce one explanation per referenced column
+        cols = step.column if isinstance(step.column, (list, tuple)) else ([step.column] if step.column is not None else [None])
+        for col in cols:
+            reason = ""
+            confidence = 0.5
+            if col and col in profile:
+                meta = profile[col]
+                nulls = int(meta.get("nulls", 0) or 0)
+                dtype = _norm(str(meta.get("dtype", "")))
+                if step.action == "impute":
+                    strategy = step.params.get("strategy") if step.params else None
+                    if not strategy:
+                        strategy = _default_strategy_for_column(meta)
+                        step.params = dict(step.params or {}, strategy=strategy)
+                    reason = f"{col} has {nulls} missing values; use {strategy} for {dtype or 'unknown'} data."
+                    confidence = 0.8 if nulls > 0 else 0.6
+                elif step.action == "normalize":
+                    reason = f"{col} appears to be a text column, so normalization is safe and deterministic."
+                    confidence = 0.75 if any(token in dtype for token in ["str", "utf", "object"]) else 0.6
+                elif step.action == "drop_column":
+                    reason = f"{col} is explicit in the recipe and will be removed exactly."
+                    confidence = 0.95
+                else:
+                    reason = f"{step.action} on {col} is applied literally as specified."
+                    confidence = 0.7
             else:
-                reason = f"{step.action} on {step.column} is applied literally as specified."
-                confidence = 0.7
-        else:
-            if step.action == "impute":
-                step.params = dict(step.params or {}, strategy=step.params.get("strategy") if step.params else "median")
-                reason = "No column profile match found; defaulting to the first plausible imputation strategy."
-                confidence = 0.35
-            elif step.action == "normalize":
-                reason = "No matching column profile found; normalization is applied only if the column exists."
-                confidence = 0.4
-            elif step.action == "drop_column":
-                reason = "No profile match found; drop is only safe when the column name is exact."
-                confidence = 0.35
-            else:
-                reason = "This step is underspecified and only a deterministic literal execution is possible."
-                confidence = 0.3
+                if step.action == "impute":
+                    step.params = dict(step.params or {}, strategy=step.params.get("strategy") if step.params else "median")
+                    reason = "No column profile match found; defaulting to the first plausible imputation strategy."
+                    confidence = 0.35
+                elif step.action == "normalize":
+                    reason = "No matching column profile found; normalization is applied only if the column exists."
+                    confidence = 0.4
+                elif step.action == "drop_column":
+                    reason = "No profile match found; drop is only safe when the column name is exact."
+                    confidence = 0.35
+                else:
+                    reason = "This step is underspecified and only a deterministic literal execution is possible."
+                    confidence = 0.3
 
-        explanations.append(ExplainedStep(step=step, reason=reason, confidence=confidence))
+            # attach explanation; include column information in the step for clarity
+            s_copy = step
+            if col is not None:
+                # ensure the explained step references the specific column
+                try:
+                    s_copy = CleaningStep(action=step.action, column=col, params=step.params)
+                except Exception:
+                    s_copy = step
+            explanations.append(ExplainedStep(step=s_copy, reason=reason, confidence=confidence))
 
     return explanations
 

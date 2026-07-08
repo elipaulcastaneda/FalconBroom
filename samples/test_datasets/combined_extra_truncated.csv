@@ -1,0 +1,361 @@
+rec_id,field_a,field_b
+R4000,Quentin,Houston
+R4001,Frank,Chicago
+R4002,Eve,New York,EXTRA_COL,ANOTHER
+R4003,Grace,Phoenix,EXTRA_COL,ANOTHER
+R4004,Olivia,New York
+R4005,Olivia,San Diego
+R4006,Judy,San Antonio
+R4007,Diana,San Diego
+R4008,Olivia,Phoenix
+R4009,Victor,San Diego
+R4010,Quentin
+R4011,Rupert,San Diego
+R4012,Sybil,Chicago
+R4013,Mallory,Chicago
+R4014,Heidi,San Diego,EXTRA_COL,ANOTHER
+R4015,Grace,Phoenix
+R4016,Mallory,Chicago
+R4017,Sybil,New York
+R4018,Rupert
+R4019,Sybil,Houston,EXTRA_COL,ANOTHER
+R4020,Trent,Houston
+R4021,Judy,Chicago
+R4022,Victor,Chicago
+R4023,Niaj,Philadelphia
+R4024,Trent,Houston
+R4025,Heidi,Houston
+R4026,Bob
+R4027,Alice,Chicago
+R4028,Quentin,Houston
+R4029,Grace,New York
+R4030,Judy,San Antonio
+R4031,Eve,Phoenix
+R4032,Heidi,Los Angeles
+R4033,Ivan,Chicago,EXTRA_COL,ANOTHER
+R4034,Diana,San Antonio
+R4035,Rupert,San Diego
+R4036,Heidi,San Diego
+R4037,Olivia,Los Angeles,EXTRA_COL,ANOTHER
+R4038,Eve,Philadelphia
+R4039,Uma,Philadelphia
+R4040,Alice,San Antonio
+R4041,Quentin,Phoenix
+R4042,Rupert,Los Angeles
+R4043,Frank,Philadelphia
+R4044,Alice,Phoenix
+R4045,Charlie
+R4046,Mallory,Phoenix,EXTRA_COL,ANOTHER
+R4047,Uma,San Diego
+R4048,Frank,Houston
+R4049,Olivia,New York,EXTRA_COL,ANOTHER
+R4050,Niaj
+R4051,Charlie,Philadelphia
+R4052,Peggy,Philadelphia,EXTRA_COL,ANOTHER
+R4053,Niaj,Los Angeles
+R4054,Olivia,Houston
+R4055,Sybil,San Diego
+R4056,Heidi,Los Angeles
+R4057,Peggy,San Diego
+R4058,Ivan,San Diego
+R4059,Alice,San Antonio
+R4060,Diana,San Diego
+R4061,Heidi,San Diego
+R4062,Charlie,Phoenix
+R4063,Ivan,San Diego
+R4064,Diana,Los Angeles
+R4065,Grace
+R4066,Trent,Los Angeles
+R4067,Rupert,New York
+R4068,Niaj,Philadelphia
+R4069,Judy,Houston
+R4070,Frank
+R4071,Heidi,Houston
+R4072,Niaj,Houston
+R4073,Trent,Phoenix
+R4074,Mallory,San Antonio
+R4075,Frank,New York
+R4076,Ivan,Chicago
+R4077,Bob,San Antonio
+R4078,Frank,Los Angeles
+R4079,Quentin,San Diego
+R4080,Judy
+R4081,Niaj,New York
+R4082,Frank,San Antonio
+R4083,Rupert,San Antonio
+R4084,Bob,San Antonio
+R4085,Ivan,Philadelphia
+R4086,Uma,San Antonio
+R4087,Charlie,New York
+R4088,Trent,Phoenix
+R4089,Charlie,New York
+R4090,Uma,Houston
+R4091,Sybil,Houston
+R4092,Ivan,San Antonio
+R4093,Frank,San Antonio
+R4094,Grace,Los Angeles
+R4095,Mallory,Phoenix
+R4096,Eve,Los Angeles
+R4097,Trent,Los Angeles,EXTRA_COL,ANOTHER
+R4098,Heidi,Philadelphia
+R4099,Peggy,Chicago,EXTRA_COL,ANOTHER
+R4100,Victor,Chicago
+R4101,Frank
+R4102,Victor,San Antonio
+R4103,Sybil,Houston
+R4104,Mallory,San Diego
+R4105,Eve,Philadelphia
+R4106,Heidi,Los Angeles
+R4107,Bob
+R4108,Heidi,San Diego
+R4109,Mallory,Los Angeles
+R4110,Quentin,Los Angeles,EXTRA_COL,ANOTHER
+R4111,Sybil,Los Angeles
+R4112,Diana,San Antonio
+R4113,Bob,Phoenix
+R4114,Quentin,Phoenix
+R4115,Charlie,San Antonio
+R4116,Ivan,Houston,EXTRA_COL,ANOTHER
+R4117,Diana
+R4118,Grace,Philadelphia
+R4119,Frank,Philadelphia
+R4120,Diana,San Diego
+R4121,Heidi,Philadelphia
+R4122,Peggy
+R4123,Grace,San Diego
+R4124,Charlie,San Antonio
+R4125,Victor,New York
+R4126,Mallory,San Antonio
+R4127,Uma,Philadelphia
+R4128,Peggy,Chicago,EXTRA_COL,ANOTHER
+R4129,Charlie,Philadelphia
+R4130,Rupert,San Diego
+R4131,Victor,New York
+R4132,Uma,San Diego
+R4133,Eve,New York
+R4134,Rupert,Los Angeles
+R4135,Uma,San Antonio
+R4136,Trent,Philadelphia
+R4137,Eve,New York
+R4138,Diana
+R4139,Heidi,Phoenix
+R4140,Trent,Chicago
+R4141,Victor,Philadelphia
+R4142,Diana,New York,EXTRA_COL,ANOTHER
+R4143,Trent,Houston
+R4144,Trent,San Antonio
+R4145,Bob,Phoenix
+R4146,Olivia,Chicago
+R4147,Olivia,New York
+R4148,Mallory,Chicago
+R4149,Uma,Chicago
+R4150,Quentin
+R4151,Grace
+R4152,Mallory,San Diego,EXTRA_COL,ANOTHER
+R4153,Sybil,Phoenix
+R4154,Judy,Houston,EXTRA_COL,ANOTHER
+R4155,Eve,San Antonio
+R4156,Judy,San Diego
+R4157,Alice,Chicago,EXTRA_COL,ANOTHER
+R4158,Ivan,New York
+R4159,Diana,San Diego
+R4160,Olivia,San Diego
+R4161,Diana,Phoenix,EXTRA_COL,ANOTHER
+R4162,Rupert,Philadelphia
+R4163,Victor,New York,EXTRA_COL,ANOTHER
+R4164,Charlie,Philadelphia
+R4165,Charlie,Houston
+R4166,Heidi,Los Angeles
+R4167,Judy,Phoenix
+R4168,Quentin,San Diego
+R4169,Judy,San Antonio
+R4170,Diana,Phoenix
+R4171,Uma,New York
+R4172,Sybil,Houston
+R4173,Quentin,San Diego
+R4174,Diana
+R4175,Uma,New York
+R4176,Niaj,San Antonio
+R4177,Ivan,Phoenix
+R4178,Alice,New York
+R4179,Grace,Philadelphia
+R4180,Frank,Houston
+R4181,Heidi,Chicago,EXTRA_COL,ANOTHER
+R4182,Peggy,San Antonio
+R4183,Mallory
+R4184,Olivia,San Diego
+R4185,Victor,New York
+R4186,Grace,Philadelphia
+R4187,Alice,Los Angeles,EXTRA_COL,ANOTHER
+R4188,Uma
+R4189,Judy,Phoenix
+R4190,Rupert,San Diego
+R4191,Mallory
+R4192,Sybil,New York
+R4193,Charlie,Philadelphia
+R4194,Olivia,San Diego,EXTRA_COL,ANOTHER
+R4195,Judy,Houston
+R4196,Victor,San Diego
+R4197,Grace,New York
+R4198,Alice,Houston
+R4199,Ivan,Los Angeles
+R4200,Sybil,New York
+R4201,Trent,San Diego
+R4202,Alice,San Diego
+R4203,Grace,Chicago
+R4204,Diana,Philadelphia
+R4205,Bob,San Antonio,EXTRA_COL,ANOTHER
+R4206,Quentin,Philadelphia
+R4207,Olivia,New York
+R4208,Mallory,Chicago
+R4209,Grace,New York
+R4210,Niaj,Phoenix
+R4211,Sybil,New York
+R4212,Rupert,San Antonio
+R4213,Olivia,Phoenix
+R4214,Alice,Houston,EXTRA_COL,ANOTHER
+R4215,Grace
+R4216,Mallory,Philadelphia
+R4217,Olivia,Phoenix
+R4218,Sybil
+R4219,Mallory,New York,EXTRA_COL,ANOTHER
+R4220,Rupert,Houston
+R4221,Heidi,Phoenix,EXTRA_COL,ANOTHER
+R4222,Rupert,New York
+R4223,Victor,San Antonio
+R4224,Heidi,Los Angeles
+R4225,Rupert,San Diego
+R4226,Olivia
+R4227,Uma,Phoenix
+R4228,Victor,Los Angeles
+R4229,Quentin,Houston
+R4230,Uma,Houston
+R4231,Rupert,Houston
+R4232,Frank,Phoenix
+R4233,Peggy,San Diego
+R4234,Ivan,Chicago
+R4235,Victor,San Diego
+R4236,Charlie,New York
+R4237,Rupert,San Diego
+R4238,Trent,Los Angeles
+R4239,Olivia,San Diego
+R4240,Uma
+R4241,Mallory,San Antonio
+R4242,Niaj,Los Angeles,EXTRA_COL,ANOTHER
+R4243,Mallory,Phoenix
+R4244,Peggy,Chicago,EXTRA_COL,ANOTHER
+R4245,Uma,Philadelphia
+R4246,Frank,Houston
+R4247,Uma,Houston
+R4248,Mallory,Chicago
+R4249,Frank,Phoenix
+R4250,Grace,Philadelphia
+R4251,Ivan,Houston
+R4252,Bob,Phoenix,EXTRA_COL,ANOTHER
+R4253,Rupert,San Antonio
+R4254,Eve,San Antonio
+R4255,Niaj,Chicago
+R4256,Quentin
+R4257,Uma,Chicago
+R4258,Quentin,Houston
+R4259,Grace,San Diego
+R4260,Bob
+R4261,Rupert,New York
+R4262,Trent,Chicago
+R4263,Olivia,Phoenix
+R4264,Ivan,Los Angeles
+R4265,Peggy,Chicago
+R4266,Peggy,Chicago
+R4267,Heidi,San Diego
+R4268,Niaj,San Diego
+R4269,Ivan,Los Angeles
+R4270,Frank,Phoenix
+R4271,Mallory,Los Angeles
+R4272,Trent,Houston
+R4273,Diana,San Diego
+R4274,Quentin,Chicago
+R4275,Niaj,San Diego
+R4276,Bob,New York
+R4277,Ivan,Los Angeles,EXTRA_COL,ANOTHER
+R4278,Bob,San Antonio
+R4279,Quentin,Phoenix
+R4280,Alice,Philadelphia
+R4281,Judy,Houston
+R4282,Eve
+R4283,Trent,Chicago
+R4284,Rupert,San Diego
+R4285,Victor,Philadelphia,EXTRA_COL,ANOTHER
+R4286,Frank,Phoenix
+R4287,Sybil,Chicago
+R4288,Mallory,New York
+R4289,Victor,Philadelphia,EXTRA_COL,ANOTHER
+R4290,Niaj,Phoenix
+R4291,Eve,San Diego,EXTRA_COL,ANOTHER
+R4292,Heidi,Chicago
+R4293,Eve,Chicago
+R4294,Mallory
+R4295,Trent,Phoenix
+R4296,Rupert,New York
+R4297,Trent,Los Angeles,EXTRA_COL,ANOTHER
+R4298,Uma,Los Angeles
+R4299,Rupert,Houston
+R4300,Heidi,San Antonio
+R4301,Bob,Los Angeles
+R4302,Olivia,Phoenix
+R4303,Victor,New York
+R4304,Niaj,San Antonio
+R4305,Bob,San Diego
+R4306,Diana,San Diego
+R4307,Heidi,New York
+R4308,Rupert
+R4309,Charlie,San Antonio
+R4310,Mallory,Los Angeles
+R4311,Victor,Chicago
+R4312,Judy,Phoenix
+R4313,Mallory,San Antonio
+R4314,Peggy,New York
+R4315,Peggy,San Antonio
+R4316,Heidi,New York
+R4317,Bob,Phoenix
+R4318,Victor,Philadelphia
+R4319,Peggy,San Antonio,EXTRA_COL,ANOTHER
+R4320,Mallory,Chicago
+R4321,Peggy,Los Angeles,EXTRA_COL,ANOTHER
+R4322,Olivia,San Antonio
+R4323,Quentin,San Diego,EXTRA_COL,ANOTHER
+R4324,Alice,Los Angeles
+R4325,Eve,Philadelphia
+R4326,Diana
+R4327,Diana,Phoenix
+R4328,Victor,Philadelphia
+R4329,Eve,Los Angeles,EXTRA_COL,ANOTHER
+R4330,Trent,San Antonio
+R4331,Mallory,New York
+R4332,Rupert,New York
+R4333,Ivan,Los Angeles
+R4334,Quentin,San Diego
+R4335,Diana,San Diego
+R4336,Alice,Chicago
+R4337,Bob,Los Angeles
+R4338,Mallory,Phoenix
+R4339,Niaj,San Diego
+R4340,Mallory,San Antonio
+R4341,Olivia,Houston
+R4342,Alice,Philadelphia
+R4343,Alice,San Diego
+R4344,Olivia,New York
+R4345,Judy,Chicago
+R4346,Heidi,Houston
+R4347,Mallory,Phoenix
+R4348,Olivia,Los Angeles,EXTRA_COL,ANOTHER
+R4349,Quentin,Los Angeles
+R4350,Rupert,Los Angeles
+R4351,Heidi,Los Angeles
+R4352,Peggy,Phoenix
+R4353,Heidi,San Diego,EXTRA_COL,ANOTHER
+R4354,Heidi,Chicago
+R4355,Ivan,New York
+R4356,Heidi,New York
+R4357,Frank,Philadelphia
+R4358,Judy,San Antonio
+R4359,Grace,Houston
