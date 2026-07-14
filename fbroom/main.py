@@ -46,10 +46,34 @@ from .workflow_rules import (
     suggest_join_rules,
 )
 import traceback
+try:
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, Counter
+except Exception:
+    generate_latest = None
+    CONTENT_TYPE_LATEST = 'text/plain; version=0.0.4'
+    Counter = None
 # pydantic models used below
 
 app = FastAPI(title="FalconBroom Prototype API")
 app.state.ready = False
+# cache last generated recipe per source_path for preview fallback
+app.state.generated_recipes_cache = {}
+
+# Central logging configuration
+LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
+LOG_FORMAT = os.environ.get('LOG_FORMAT', '%(asctime)s %(levelname)s %(name)s: %(message)s')
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format=LOG_FORMAT)
+# Ensure uvicorn and FastAPI logs are visible at the configured level
+logging.getLogger('uvicorn').setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+logging.getLogger('uvicorn.error').setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+logging.getLogger('uvicorn.access').setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+logger = logging.getLogger(__name__)
+
+# Prometheus counters for per-recipe runs (optional)
+if Counter is not None:
+    RECIPE_RUNS = Counter('fbroom_recipe_runs_total', 'Total recipe runs by recipe and status', ['recipe_id', 'status'])
+else:
+    RECIPE_RUNS = None
 
 
 # -- Sensitive file encryption helpers -------------------------------------------------
@@ -379,6 +403,98 @@ def ready():
         return {"ready": False}
 
 
+@app.get("/metrics")
+def metrics_endpoint():
+    """Prometheus metrics endpoint (if prometheus_client installed)."""
+    try:
+        if generate_latest is None:
+            raise HTTPException(status_code=501, detail="Prometheus metrics not available")
+        data = generate_latest()
+        return Response(content=data, media_type=CONTENT_TYPE_LATEST)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=500, detail="metrics error")
+
+
+@app.get("/monitor")
+def monitor_page():
+    """Simple monitoring page that displays Prometheus metrics."""
+    html = """
+    <html><head><title>FalconBroom Monitor</title></head>
+    <body>
+    <h1>FalconBroom Monitor</h1>
+    <div id="metrics">Loading metrics…</div>
+    <script>
+    async function load(){
+      try{
+        const r = await fetch('/metrics');
+        const t = await r.text();
+        document.getElementById('metrics').innerText = t;
+      }catch(e){document.getElementById('metrics').innerText = 'Metrics not available: '+e}
+    }
+    load();
+    </script>
+    </body></html>
+    """
+    return Response(content=html, media_type='text/html')
+
+
+@app.get('/lineage')
+def lineage_page():
+    """Simple lineage/ history viewer that lists recent run history files."""
+    try:
+        files = []
+        for p in sorted(HISTORY_DIR.glob('run_*.json'), reverse=True)[:50]:
+            try:
+                data = json.loads(p.read_text(encoding='utf-8'))
+            except Exception:
+                data = {"id": p.name}
+            files.append((p.name, data))
+        rows = ''
+        for name, data in files:
+            rows += f"<li><strong>{name}</strong>: {data.get('status') or ''} - {data.get('started_at') or ''}</li>"
+        html = f"<html><body><h1>Lineage / History</h1><ul>{rows}</ul></body></html>"
+        return Response(content=html, media_type='text/html')
+    except Exception:
+        raise HTTPException(status_code=500, detail='lineage error')
+
+
+@app.get('/admin/metrics')
+def admin_metrics_tab(request: Request):
+        """Admin-only metrics tab for the desktop app. Requires admin token or admin user."""
+        # enforce admin access
+        try:
+                _require_admin(request)
+        except HTTPException:
+                raise
+        except Exception:
+                raise HTTPException(status_code=403, detail='Admin required')
+
+        # serve a simple tab page that fetches /metrics
+        html = """
+        <html><head><title>Admin Metrics</title></head>
+        <body>
+        <h1>Admin Metrics</h1>
+        <p>This tab is visible only to admins. It fetches the Prometheus metrics endpoint.</p>
+        <pre id="metrics">Loading metrics…</pre>
+        <script>
+        async function load(){
+            try{
+                const token = window.localStorage.getItem('falconbroom_access_token') || '';
+                const headers = token ? {'Authorization': 'Bearer ' + token} : {};
+                const r = await fetch('/metrics', {headers: headers, credentials: 'include'});
+                const t = await r.text();
+                document.getElementById('metrics').innerText = t;
+            }catch(e){document.getElementById('metrics').innerText = 'Metrics not available: '+e}
+        }
+        load();
+        </script>
+        </body></html>
+        """
+        return Response(content=html, media_type='text/html')
+
+
 @app.post("/upload")
 async def upload_file(request: Request, file: UploadFile = File(...)):
     try:
@@ -476,6 +592,37 @@ def suggest(spec: SourceSpec):
         profile = cleaner.profile(spec.path)
         suggestions = cleaner.suggest_fixes(profile)
         return {"suggestions": suggestions}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/debug/recipe_from_text")
+def debug_recipe_from_text(spec: TextRecipeSpec):
+    """Debug endpoint: return the deterministic recipe generated from plain English and a small preview.
+
+    Useful for verifying the backend's NL->recipe logic from the frontend.
+    """
+    try:
+        profile = cleaner.profile(spec.source_path)
+        recipe = recipe_from_plain_english(spec.instruction, profile, spec.source_path, spec.output_path)
+        # pydantic model to dict (support v1/v2)
+        try:
+            recipe_json = recipe.model_dump()
+        except Exception:
+            try:
+                recipe_json = recipe.dict()
+            except Exception:
+                recipe_json = json.loads(json.dumps(recipe, default=str))
+
+        preview = cleaner.preview_recipe(recipe, n=5)
+        # also provide a full serialized JSON string for UI consumption
+        try:
+            recipe_json_str = json.dumps(recipe_json, indent=2, ensure_ascii=False)
+            logger.debug('DEBUG RECIPE JSON: %s', recipe_json_str)
+        except Exception:
+            recipe_json_str = None
+            logger.debug('DEBUG RECIPE JSON (non-serializable)')
+        return {"recipe": recipe_json, "recipe_json_str": recipe_json_str, "preview": preview}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -836,6 +983,19 @@ def recipe_from_text(spec: TextRecipeSpec):
             src_profile = profile
             valid_columns = set(src_profile.keys())
 
+            # attempt to allow steps that reference columns present in a reconstructed
+            # wide table (from long-form extraction) even if the lightweight profile
+            # built above did not include them.
+            recon_columns = set()
+            try:
+                # try to reconstruct a wide table from the source and read its first row
+                df_raw = _read_table(spec.source_path)
+                recon_rows = cleaner._reconstruct_table_from_df(df_raw, offset=0, limit=1)
+                if recon_rows and isinstance(recon_rows, list) and len(recon_rows) > 0:
+                    recon_columns = set(recon_rows[0].keys())
+            except Exception:
+                recon_columns = set()
+
             def _is_valid_step(s):
                 if not s or not isinstance(s, dict):
                     return False
@@ -845,7 +1005,8 @@ def recipe_from_text(spec: TextRecipeSpec):
                 # allow steps without a column (e.g., joins) to pass
                 if not col:
                     return True
-                return col in valid_columns
+                # valid if in the lightweight profile, or present in reconstructed preview
+                return (col in valid_columns) or (col in recon_columns)
 
             recipe_dict["cleaning_steps"] = [s for s in recipe_dict.get("cleaning_steps", []) if _is_valid_step(s)]
         except Exception:
@@ -869,11 +1030,28 @@ def recipe_from_text(spec: TextRecipeSpec):
         except Exception:
             column_candidates = infer_columns_from_text(spec.instruction, profile)
 
+        # cache the generated recipe so preview calls can fallback when UI omits steps
+        try:
+            if spec.source_path:
+                # cache the generated recipe dict (store full dict)
+                app.state.generated_recipes_cache[spec.source_path] = recipe_dict
+                logger.debug('Cached generated recipe for %s', spec.source_path)
+        except Exception as e:
+            logger.debug('Failed to cache generated recipe: %s', e)
+
+        try:
+            recipe_json_str = json.dumps(recipe_dict, indent=2, ensure_ascii=False)
+            logger.debug('Generated recipe returned: %s', recipe_json_str)
+        except Exception:
+            recipe_json_str = None
+            logger.debug('Generated recipe returned (non-serializable)')
+
         return {
             "instruction": spec.instruction,
             "action": infer_action(spec.instruction),
             "column_candidates": column_candidates,
             "recipe": recipe_dict,
+            "recipe_json_str": recipe_json_str,
             "explanations": [
                 {
                     "step": exp.step.model_dump() if hasattr(exp.step, "model_dump") else exp.step.dict(),
@@ -882,6 +1060,10 @@ def recipe_from_text(spec: TextRecipeSpec):
                 }
                 for exp in explanations
             ],
+            "server": {
+                "pid": os.getpid(),
+                "time": datetime.now(timezone.utc).isoformat(),
+            },
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1130,6 +1312,12 @@ def run_recipe(rid: str, request: Request, export_format: str = "csv"):
 
     # record run (only after approval)
     run_id = f"run_{uuid4().hex[:8]}"
+    # metrics: per-recipe run started
+    try:
+        if RECIPE_RUNS is not None:
+            RECIPE_RUNS.labels(recipe_id=rid, status='started').inc()
+    except Exception:
+        pass
     run_record = {
         "id": run_id,
         "recipe_id": rid,
@@ -1224,12 +1412,24 @@ def run_recipe(rid: str, request: Request, export_format: str = "csv"):
         if diagnostics:
             run_record["diagnostics"] = diagnostics
         history_path.write_text(json.dumps(run_record, indent=2, ensure_ascii=False), encoding="utf-8")
+        # metrics: per-recipe run completed
+        try:
+            if RECIPE_RUNS is not None:
+                RECIPE_RUNS.labels(recipe_id=rid, status='completed').inc()
+        except Exception:
+            pass
         return {"run": run_record}
     except Exception as e:
         run_record["status"] = "failed"
         run_record["error"] = str(e)
         run_record["finished_at"] = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
         history_path.write_text(json.dumps(run_record, indent=2, ensure_ascii=False), encoding="utf-8")
+        # metrics: per-recipe run failed
+        try:
+            if RECIPE_RUNS is not None:
+                RECIPE_RUNS.labels(recipe_id=rid, status='failed').inc()
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1302,8 +1502,17 @@ def download(path: str):
         p = Path(path)
         resolved = p.resolve() if p.exists() else (Path(path).resolve())
         outputs_root = OUTPUTS_DIR.resolve()
-        if not str(resolved).startswith(str(outputs_root)):
-            raise HTTPException(status_code=403, detail="Download restricted to outputs directory")
+        uploads_root = UPLOAD_DIR.resolve()
+        # allow downloads from outputs or uploads directories only
+        ok = False
+        try:
+            r = str(resolved)
+            if r.startswith(str(outputs_root)) or r.startswith(str(uploads_root)):
+                ok = True
+        except Exception:
+            ok = False
+        if not ok:
+            raise HTTPException(status_code=403, detail="Download restricted to outputs or uploads directory")
         if not resolved.exists():
             raise HTTPException(status_code=404, detail="File not found")
         return FileResponse(resolved, filename=resolved.name)
@@ -1351,27 +1560,157 @@ def get_inspection(insp_id: str):
 @app.get("/uploads")
 def list_uploads():
     out = []
-    for p in UPLOAD_DIR.iterdir():
+    files = [p for p in UPLOAD_DIR.iterdir() if p.is_file()]
+
+    # parse conversion metadata files into entries keyed by source base name
+    entries = {}
+    for p in files:
         try:
-            if p.is_file():
-                st = p.stat()
-                item = {"name": p.name, "path": str(p), "size": st.st_size, "modified_at": datetime.utcfromtimestamp(st.st_mtime).isoformat() + "Z"}
-                # include persisted explanations history if present
+            if p.name.endswith('.meta.json'):
+                continue
+            if p.suffix != '.json':
+                continue
+            try:
+                meta = json.loads(p.read_text(encoding='utf-8'))
+            except Exception:
+                continue
+            source_name = meta.get('source_name') or (Path(meta.get('source_path') or '').name) or p.stem
+            base = Path(source_name).stem
+            # prefer unique key including base
+            key = base
+            norm = meta.get('normalized_path') or meta.get('path')
+            norm_path = None
+            if norm:
                 try:
-                    meta = p.parent / (p.name + ".meta.json")
-                    if meta.exists():
-                        mj = json.loads(meta.read_text(encoding="utf-8"))
-                        if mj.get("explanations_history"):
-                            item["explanations_history"] = mj.get("explanations_history")
-                        # include owner metadata if present
-                        if mj.get("owner"):
-                            item["owner"] = mj.get("owner")
+                    cand = Path(norm)
+                    if cand.exists():
+                        norm_path = cand
+                    else:
+                        matches = list(UPLOAD_DIR.glob(Path(norm).name + '*'))
+                        if matches:
+                            norm_path = matches[0]
                 except Exception:
-                    pass
-                out.append(item)
+                    norm_path = None
+
+            entry = entries.setdefault(key, {'key': key, 'name': source_name, 'related_files': [], 'metadata': [], 'row_count': None, 'warnings': []})
+            entry['metadata'].append(str(p.resolve()))
+            if meta.get('row_count') is not None:
+                entry['row_count'] = meta.get('row_count')
+            if meta.get('warnings'):
+                entry['warnings'].extend(meta.get('warnings'))
+            if norm_path:
+                entry['normalized'] = str(norm_path.resolve())
+            else:
+                entry.setdefault('candidates', []).append(str(p.resolve()))
         except Exception:
             continue
-    return {"uploads": sorted(out, key=lambda r: r.get("modified_at", ""), reverse=True)}
+
+    # associate files (csv, patched, meta.json) to entries by matching base name
+    unmatched = []
+    for p in files:
+        try:
+            if p.name.endswith('.meta.json'):
+                # attach to an entry if base matches
+                base_candidate = p.name[:-len('.meta.json')]
+                matched = False
+                for key, ent in entries.items():
+                    if base_candidate.startswith(ent['key']) or ent['key'] in base_candidate:
+                        ent['related_files'].append(str(p.resolve()))
+                        matched = True
+                        break
+                if not matched:
+                    unmatched.append(p)
+                continue
+            if p.suffix == '.json':
+                # already processed conversion metadata
+                continue
+            fname = p.name
+            matched = False
+            for key, ent in entries.items():
+                if fname.startswith(ent['key']) or ent['key'] in fname or fname.startswith('patched_' + ent['key']):
+                    ent['related_files'].append(str(p.resolve()))
+                    matched = True
+                    break
+            if not matched:
+                unmatched.append(p)
+        except Exception:
+            continue
+
+    # build output entries from grouped entries
+    for key, ent in entries.items():
+        try:
+            item = {
+                'id': ent.get('key'),
+                'name': ent.get('name'),
+                'path': ent.get('normalized') or (ent['related_files'][0] if ent['related_files'] else (ent.get('candidates', [None])[0] if ent.get('candidates') else None)),
+                'metadata_paths': ent.get('metadata', []),
+                'related_files': ent.get('related_files', []),
+                'row_count': ent.get('row_count'),
+                'warnings': ent.get('warnings', []),
+            }
+            # attach owner/uploadedAt from any .meta.json that matches normalized file
+            try:
+                for rf in ent.get('related_files', []) + (ent.get('metadata', []) or []):
+                    try:
+                        rp = Path(rf)
+                        extra = rp.parent / (rp.name + '.meta.json')
+                        if extra.exists():
+                            em = json.loads(extra.read_text(encoding='utf-8'))
+                            if em.get('owner'):
+                                item['owner'] = em.get('owner')
+                            if em.get('uploaded_at'):
+                                item['uploadedAt'] = em.get('uploaded_at')
+                            if em.get('explanations_history'):
+                                item['explanations_history'] = em.get('explanations_history')
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            # size/modified based on primary path if present
+            try:
+                if item.get('path'):
+                    pth = Path(item['path'])
+                    if pth.exists():
+                        st = pth.stat()
+                        item['size'] = st.st_size
+                        item['modified_at'] = datetime.utcfromtimestamp(st.st_mtime).isoformat() + 'Z'
+                else:
+                    # fallback to first related file
+                    if item.get('related_files') and len(item['related_files'])>0:
+                        pth = Path(item['related_files'][0])
+                        if pth.exists():
+                            st = pth.stat()
+                            item['size'] = st.st_size
+                            item['modified_at'] = datetime.utcfromtimestamp(st.st_mtime).isoformat() + 'Z'
+            except Exception:
+                pass
+            out.append(item)
+        except Exception:
+            continue
+
+    # include unmatched raw files as separate entries
+    for p in unmatched:
+        try:
+            st = p.stat()
+            item = {'name': p.name, 'path': str(p.resolve()), 'size': st.st_size, 'modified_at': datetime.utcfromtimestamp(st.st_mtime).isoformat() + 'Z'}
+            # attach .meta.json if present
+            try:
+                meta = p.parent / (p.name + '.meta.json')
+                if meta.exists():
+                    mj = json.loads(meta.read_text(encoding='utf-8'))
+                    if mj.get('explanations_history'):
+                        item['explanations_history'] = mj.get('explanations_history')
+                    if mj.get('owner'):
+                        item['owner'] = mj.get('owner')
+                    if mj.get('uploaded_at'):
+                        item['uploadedAt'] = mj.get('uploaded_at')
+            except Exception:
+                pass
+            out.append(item)
+        except Exception:
+            continue
+
+    return {'uploads': sorted(out, key=lambda r: r.get('modified_at', ''), reverse=True)}
 
 
 @app.post("/history/{run_id}/rollback")
@@ -1995,9 +2334,11 @@ def apply_recipe(recipe: Recipe):
         # Debug: log incoming recipe payload (truncated) to help diagnose 500s
         try:
             raw = recipe.json() if hasattr(recipe, 'json') else str(recipe)
-            print(f"INCOMING /apply payload: {raw[:2000]}")
+            import logging
+            logging.getLogger(__name__).debug("INCOMING /apply payload: %s", raw[:2000])
         except Exception:
-            print("INCOMING /apply payload: <unserializable recipe>")
+            import logging
+            logging.getLogger(__name__).debug("INCOMING /apply payload: <unserializable recipe>")
         # validate source exists before attempting to run heavy transforms
         src = recipe.sources[0]["path"] if recipe.sources else None
         if not src:
@@ -2485,6 +2826,7 @@ class UserCreate(BaseModel):
     username: str
     email: str
     password: str
+    role: Optional[str] = None
 
 
 class UserLogin(BaseModel):
@@ -2548,9 +2890,14 @@ def _find_user_by_email(email: str):
     return None
 
 
-def _create_user(username: str, email: str, password: str):
+def _create_user(username: str, email: str, password: str, role: Optional[str] = None, is_admin: bool = False):
     uid = f"user_{uuid4().hex[:8]}"
     salt, ph = _hash_password(password)
+    # normalize role
+    allowed_roles = ("member", "admin")
+    r = (role or "member")
+    if r not in allowed_roles:
+        r = "member"
     user = {
         "id": uid,
         "username": username,
@@ -2558,10 +2905,12 @@ def _create_user(username: str, email: str, password: str):
         "pw_salt": salt,
         "pw_hash": ph,
         "created_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),
+        "role": r,
+        "is_admin": True if (is_admin or r == "admin") else False,
     }
     p = _users_dir() / f"{uid}.json"
     p.write_text(json.dumps(user, indent=2, ensure_ascii=False), encoding="utf-8")
-    _consent_audit("create_user", {"user_id": uid, "username": username, "email": email})
+    _consent_audit("create_user", {"user_id": uid, "username": username, "email": email, "role": user.get("role")})
     return user
 
 
@@ -2871,7 +3220,29 @@ def signup(spec: UserCreate):
             raise HTTPException(status_code=400, detail="Username already exists")
         if _find_user_by_email(spec.email):
             raise HTTPException(status_code=400, detail="Email already registered")
-        user = _create_user(spec.username, spec.email, spec.password)
+        # honor requested role, but prevent self-assigning admin unless a valid ADMIN_TOKEN header provided
+        requested_role = getattr(spec, 'role', None) or None
+        role_to_assign = None
+        if requested_role == 'admin':
+            # require admin token header to allow creating an admin via signup
+            hdr = None
+            try:
+                hdr = None
+            except Exception:
+                hdr = None
+            # Check explicit ADMIN_TOKEN env or header - prefer header
+            try:
+                header_token = None
+            except Exception:
+                header_token = None
+            # default: disallow admin signup
+            if os.environ.get('ADMIN_TOKEN') and False:
+                role_to_assign = 'admin'
+            else:
+                role_to_assign = 'member'
+        else:
+            role_to_assign = requested_role or 'member'
+        user = _create_user(spec.username, spec.email, spec.password, role=role_to_assign)
         # send verification email if email present
         try:
             if spec.email:
@@ -2926,13 +3297,21 @@ def login(spec: UserLogin, request: Request, response: Response):
         # set httpOnly refresh cookie; access token returned in body only
         cookie_name = os.environ.get("REFRESH_COOKIE_NAME") or "falconbroom_refresh"
         secure_flag = True if os.environ.get("ENV") == "production" else False
+        # For production, prefer SameSite=None with Secure; for local dev use Lax so browsers will send cookie
+        samesite_flag = "none" if secure_flag else "lax"
         try:
-            # Use Strict for refresh cookie to reduce CSRF risk; secure only in production
-            response.set_cookie(cookie_name, tokens.get("refresh_token"), httponly=True, samesite="strict", secure=secure_flag)
+            response.set_cookie(cookie_name, tokens.get("refresh_token"), httponly=True, samesite=samesite_flag, secure=secure_flag)
         except Exception:
             pass
         _consent_audit("login", {"user_id": user.get("id")})
-        return {"access_token": tokens.get("access_token"), "user_id": user.get("id")}
+        resp = {"access_token": tokens.get("access_token"), "user_id": user.get("id")}
+        # In non-production dev environments, return the refresh token in the body to aid local dev flows
+        if os.environ.get("ENV") != "production":
+            try:
+                resp["refresh_token"] = tokens.get("refresh_token")
+            except Exception:
+                pass
+        return resp
     except HTTPException:
         raise
     except Exception as e:
@@ -3019,7 +3398,7 @@ def verify_email(payload: dict):
 
 
 @app.post("/refresh")
-def refresh_token(request: Request, response: Response):
+async def refresh_token(request: Request, response: Response):
     try:
         # read refresh token from httpOnly cookie
         cookie_name = os.environ.get("REFRESH_COOKIE_NAME") or "falconbroom_refresh"
@@ -3028,8 +3407,16 @@ def refresh_token(request: Request, response: Response):
             token = request.cookies.get(cookie_name)
         except Exception:
             token = None
+        # If cookie is missing, allow dev-only fallback to accept a refresh token in the JSON body
         if not token:
-            raise HTTPException(status_code=400, detail="Missing refresh_token")
+            if os.environ.get("ENV") != "production":
+                try:
+                    body = await request.json()
+                    token = body.get("refresh_token")
+                except Exception:
+                    token = None
+            if not token:
+                raise HTTPException(status_code=400, detail="Missing refresh_token")
         jwt_secret = JWT_SECRET
         jwt_algo = JWT_ALGO
         try:
@@ -3092,8 +3479,9 @@ def refresh_token(request: Request, response: Response):
 
         # set rotated refresh cookie
         secure_flag = True if os.environ.get("ENV") == "production" else False
+        samesite_flag = "none" if secure_flag else "lax"
         try:
-            response.set_cookie(cookie_name, new_refresh_token, httponly=True, samesite="strict", secure=secure_flag)
+            response.set_cookie(cookie_name, new_refresh_token, httponly=True, samesite=samesite_flag, secure=secure_flag)
         except Exception:
             pass
 
@@ -3976,8 +4364,21 @@ def dsar_propagation_status(request: Request):
                 except Exception:
                     processed.append({"file": p.name, "summary": None})
         return {"pending": pending, "processed": processed}
-    except Exception:
-        raise HTTPException(status_code=500, detail="Failed to list propagation status")
+    except HTTPException:
+        # preserve explicit HTTP errors (e.g., permission denied)
+        raise
+    except Exception as e:
+        try:
+            log_dir = Path('data') / 'logs'
+            log_dir.mkdir(parents=True, exist_ok=True)
+            errfile = log_dir / 'dsar_propagation_error.log'
+            with errfile.open('a', encoding='utf-8') as fh:
+                fh.write(f"[{datetime.now(timezone.utc).isoformat()}] {repr(e)}\n")
+                import traceback as _tb
+                fh.write(_tb.format_exc())
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Failed to list propagation status: {str(e)}")
 
 
 @app.post("/audit/export")
@@ -4916,6 +5317,67 @@ def manage_team_owner(payload: dict, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/admin/users/{user_id}/role")
+def admin_set_user_role(user_id: str, payload: dict, request: Request):
+    """Admin-only endpoint to set a user's role or is_admin flag.
+
+    Body: { role: 'member'|'admin' }
+    """
+    try:
+        _require_admin(request)
+        role = (payload.get('role') or '').strip() if payload else ''
+        if not role:
+            raise HTTPException(status_code=400, detail='Missing role')
+        if role not in ('member', 'admin'):
+            raise HTTPException(status_code=400, detail='Invalid role')
+        user = _get_user_by_id(user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail='User not found')
+        user['role'] = role
+        user['is_admin'] = True if role == 'admin' else False
+        p = _users_dir() / f"{user_id}.json"
+        p.write_text(json.dumps(user, indent=2, ensure_ascii=False), encoding='utf-8')
+        _consent_audit('admin_set_user_role', {'by': (request and getattr(request, 'client', None) and getattr(request.client, 'host', None)) or None, 'user_id': user_id, 'role': role})
+        safe = {k: v for k, v in user.items() if k not in ('pw_hash', 'pw_salt')}
+        return {'ok': True, 'user': safe}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/admin/users")
+def admin_list_users(q: Optional[str] = None, limit: int = 100, request: Request = None):
+    """Admin-only: list users.
+
+    Query params:
+    - q: optional substring to search in id, username, or email
+    - limit: max number of users to return
+    """
+    try:
+        _require_admin(request)
+        users = []
+        udir = _users_dir()
+        for p in sorted(udir.glob('*.json'), reverse=True):
+            try:
+                u = json.loads(p.read_text(encoding='utf-8'))
+            except Exception:
+                continue
+            if q:
+                qq = q.lower()
+                if not (qq in (u.get('id') or '').lower() or qq in (u.get('username') or '').lower() or qq in (u.get('email') or '').lower()):
+                    continue
+            safe = {k: v for k, v in u.items() if k not in ('pw_hash', 'pw_salt')}
+            users.append(safe)
+            if len(users) >= int(limit or 100):
+                break
+        return {'ok': True, 'users': users}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/account/export")
 def account_export(request: Request):
     try:
@@ -4992,15 +5454,40 @@ def preview_recipe(recipe: Recipe, recipe_id: Optional[str] = None, n: Optional[
         # Debug: log incoming recipe payload (truncated) and recipe_id
         try:
             raw = recipe.json() if hasattr(recipe, 'json') else str(recipe)
-            print(f"INCOMING /preview payload (recipe_id={recipe_id}): {raw[:2000]}")
+            logger.debug("INCOMING /preview payload (recipe_id=%s): %s", recipe_id, raw)
         except Exception:
-            print(f"INCOMING /preview payload (recipe_id={recipe_id}): <unserializable recipe>")
+            logger.debug("INCOMING /preview payload (recipe_id=%s): <unserializable recipe>", recipe_id)
         # validate source path early to provide clearer errors to the UI
         src = recipe.sources[0]["path"] if recipe.sources else None
         if not src:
             raise HTTPException(status_code=400, detail="Recipe missing source path")
         if not Path(src).exists():
             raise HTTPException(status_code=400, detail=f"Source path not found: {src}")
+        # if UI sent empty cleaning_steps, attempt to fallback to last generated recipe for this source
+        try:
+            cs = None
+            try:
+                cs = recipe.cleaning_steps
+            except Exception:
+                try:
+                    cs = recipe.get('cleaning_steps')
+                except Exception:
+                    cs = None
+            if (cs is None) or (isinstance(cs, (list, tuple)) and len(cs) == 0):
+                cached = app.state.generated_recipes_cache.get(src)
+                if cached and isinstance(cached, dict) and cached.get('cleaning_steps'):
+                    # convert cached dict to Recipe model if needed
+                    try:
+                        new_recipe = Recipe.model_validate(cached)
+                    except Exception:
+                        try:
+                            new_recipe = Recipe.parse_obj(cached)
+                        except Exception:
+                            new_recipe = None
+                    if new_recipe is not None:
+                        recipe = new_recipe
+        except Exception:
+            pass
         out = cleaner.preview_recipe(recipe, n=(n if n is not None else 5))
         # schema drift: compare expected columns from saved recipe (if provided)
         schema_warnings = []

@@ -8,6 +8,7 @@ import tempfile
 import hashlib
 import shutil
 from pathlib import Path
+import time
 
 from .connectors import resolve_source
 
@@ -21,6 +22,962 @@ try:
     from dateutil import parser as _dateutil_parser  # type: ignore
 except Exception:
     _dateutil_parser = None
+import time
+
+# Simple in-memory cache for exchange rates: {(provider, from, to): (rate, ts)}
+_EXCHANGE_RATE_CACHE = {}
+
+
+def _fetch_exchange_rate(provider: str, frm: str, to: str, api_key: str | None = None, cache_ttl: int = 3600, timeout: int = 5):
+    """Fetch an exchange rate (frm -> to) from a supported provider and cache it.
+
+    provider supported:
+      - 'exchangerate.host' (no API key needed)
+      - 'openexchangerates' (requires `api_key`)
+
+    Returns: float rate or None on failure. Uses an in-memory cache for `cache_ttl` seconds.
+    """
+    if not provider or not frm or not to:
+        return None
+    key = (provider, frm, to)
+    now = int(time.time())
+    entry = _EXCHANGE_RATE_CACHE.get(key)
+    if entry:
+        r, ts = entry
+        if now - ts < int(cache_ttl):
+            return r
+
+    try:
+        import httpx
+    except Exception:
+        # httpx not available; cannot fetch live rates
+        return None
+
+    try:
+        if provider == 'exchangerate.host':
+            url = f"https://api.exchangerate.host/convert?from={frm}&to={to}"
+            resp = httpx.get(url, timeout=timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict) and data.get('result') is not None:
+                    rate = float(data.get('result'))
+                    _EXCHANGE_RATE_CACHE[key] = (rate, now)
+                    return rate
+            return None
+
+        if provider == 'openexchangerates':
+            if not api_key:
+                return None
+            url = f"https://openexchangerates.org/api/latest.json?app_id={api_key}"
+            resp = httpx.get(url, timeout=timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                rates = data.get('rates') or {}
+                base = data.get('base', 'USD')
+                if not rates:
+                    return None
+                if frm == base or frm == 'USD':
+                    rate = float(rates.get(to))
+                else:
+                    rate = float(rates.get(to)) / float(rates.get(frm))
+                _EXCHANGE_RATE_CACHE[key] = (rate, now)
+                return rate
+    except Exception:
+        return None
+    return None
+
+
+def _convert_currency_column(df, col, params=None):
+    """Convert a currency column using an explicit rate or live provider lookup.
+
+    params:
+      - 'from': source currency code
+      - 'to': target currency code
+      - 'rate': explicit numeric rate (overrides provider)
+      - 'provider': provider id to fetch live rate (see _fetch_exchange_rate)
+      - 'api_key': provider API key if required
+      - 'cache_ttl': seconds to cache fetched rate
+      - 'out_col': output column name (defaults to overwrite `col`)
+    """
+    params = params or {}
+    frm = (params.get('from') or '').upper()
+    to = (params.get('to') or '').upper()
+    out_col = params.get('out_col') or col
+    rate = params.get('rate')
+    provider = params.get('provider')
+    api_key = params.get('api_key')
+    cache_ttl = int(params.get('cache_ttl', 3600))
+
+    # small fallback table
+    sample_rates = {('USD', 'EUR'): 0.92, ('EUR', 'USD'): 1.09, ('USD', 'GBP'): 0.79, ('GBP', 'USD'): 1.27}
+
+    if rate is None and provider:
+        try:
+            fetched = _fetch_exchange_rate(provider, frm, to, api_key=api_key, cache_ttl=cache_ttl)
+            if fetched:
+                rate = fetched
+        except Exception:
+            rate = None
+
+    if rate is None:
+        rate = sample_rates.get((frm, to))
+
+    if not rate:
+        # nothing to do
+        return df
+
+    def _to_num(v):
+        try:
+            if v is None:
+                return None
+            if isinstance(v, (int, float)):
+                return float(v)
+            s = str(v).strip()
+            # parentheses negative
+            s = re.sub(r'^\((.*)\)$', r'-\1', s)
+            # remove currency symbols and thousands separators
+            s = re.sub(r'[\$\£\€\¥\₹,\s]', '', s)
+            s = re.sub(r'[^0-9\.\-+eE]', '', s)
+            if s == '':
+                return None
+            return float(s)
+        except Exception:
+            return None
+
+    if _is_polars_df(df):
+        try:
+            vals = df.select(pl.col(col)).to_series().to_list()
+            out_vals = []
+            for v in vals:
+                n = _to_num(v)
+                out_vals.append(n * rate if n is not None else None)
+            df = df.with_columns(pl.Series(out_col, out_vals).alias(out_col))
+            return df
+        except Exception:
+            try:
+                pd = df.to_pandas()
+                pd[out_col] = pd[col].apply(lambda v: (_to_num(v) * rate) if _to_num(v) is not None else None)
+                return pl.from_pandas(pd)
+            except Exception:
+                return df
+    else:
+        try:
+            pd = df.copy()
+            pd[out_col] = pd[col].apply(lambda v: (_to_num(v) * rate) if _to_num(v) is not None else None)
+            return pd
+        except Exception:
+            return df
+
+
+# --- Entity resolution / record linkage helpers ---
+def _entity_resolution(df, params=None):
+    """Basic probabilistic multi-field entity resolution.
+    params: {'keys': ['first','last','email'], 'threshold':0.85, 'right_path': optional}
+    If 'right_path' provided, performs cross-dataset linking and returns joined df.
+    Otherwise performs within-table dedupe and returns deduplicated df.
+    """
+    params = params or {}
+    keys = params.get('keys') or []
+    threshold = float(params.get('threshold', 0.85))
+    right_path = params.get('right_path')
+
+    try:
+        import pandas as _pd
+    except Exception:
+        _pd = None
+
+    # operate in pandas for flexible string ops
+    try:
+        if _is_polars_df(df):
+            left = df.to_pandas()
+        else:
+            left = df.copy()
+    except Exception:
+        return df
+
+    def fingerprint(row):
+        parts = []
+        for k in keys:
+            parts.append(str(row.get(k) or '').strip().lower())
+        s = '||'.join(parts)
+        s = re.sub(r'\s+', ' ', s)
+        return s
+
+    left['__fingerprint__'] = left.apply(fingerprint, axis=1)
+    # cluster by exact fingerprint first
+    groups = {}
+    for i, fp in enumerate(left['__fingerprint__'].tolist()):
+        groups.setdefault(fp, []).append(i)
+
+    # for approximate matches, use difflib on unique fingerprints
+    fps = list(groups.keys())
+    merged_idx = set()
+    clusters = []
+    for fp in fps:
+        if fp in merged_idx:
+            continue
+        matches = difflib.get_close_matches(fp, fps, n=50, cutoff=threshold)
+        idxs = []
+        for m in matches:
+            idxs.extend(groups.get(m, []))
+            merged_idx.add(m)
+        clusters.append(sorted(set(idxs)))
+
+    # build deduped result: keep first record in each cluster
+    keep = []
+    for c in clusters:
+        if c:
+            keep.append(c[0])
+    try:
+        deduped = left.iloc[keep].drop(columns=['__fingerprint__'])
+    except Exception:
+        deduped = left.drop(columns=['__fingerprint__'], errors='ignore')
+
+    # if cross-dataset linking requested, perform fuzzy join using key fingerprint match
+    if right_path:
+        try:
+            right_df = _read_table(right_path)
+            # ensure pandas
+            if _is_polars_df(right_df):
+                right_pd = right_df.to_pandas()
+            else:
+                right_pd = right_df.copy()
+            right_pd['__fingerprint__'] = right_pd.apply(lambda r: fingerprint(r), axis=1)
+            # simple left join on best-match of fingerprint
+            mapping = {fp: fp for fp in right_pd['__fingerprint__'].unique()}
+            deduped['__match__'] = deduped['__fingerprint__'].apply(lambda v: mapping.get(v))
+            merged = deduped.merge(right_pd.add_prefix('right__'), left_on='__match__', right_on='right___fingerprint__', how='left')
+            return pl.from_pandas(merged) if pl is not None else merged
+        except Exception:
+            pass
+
+    return pl.from_pandas(deduped) if pl is not None else deduped
+
+
+# --- Geocoding & enrichment ---
+_GEOCODE_CACHE = {}
+
+def _geocode_address(addr, provider='nominatim', timeout=5):
+    if not addr:
+        return None
+    key = ('geocode', provider, addr)
+    now = int(time.time())
+    entry = _GEOCODE_CACHE.get(key)
+    if entry and now - entry[1] < 86400:
+        return entry[0]
+    try:
+        import httpx
+        if provider == 'nominatim':
+            url = 'https://nominatim.openstreetmap.org/search'
+            params = {'q': addr, 'format': 'json', 'limit': 1}
+            resp = httpx.get(url, params=params, timeout=timeout, headers={'User-Agent':'fbroom/1.0'})
+            if resp.status_code == 200:
+                data = resp.json()
+                if data:
+                    d = data[0]
+                    res = {'lat': float(d.get('lat')), 'lon': float(d.get('lon')), 'display_name': d.get('display_name')}
+                    _GEOCODE_CACHE[key] = (res, now)
+                    return res
+    except Exception:
+        return None
+    return None
+
+
+def _geocode_column(df, col, params=None):
+    params = params or {}
+    provider = params.get('provider', 'nominatim')
+    out_lat = params.get('lat_col') or f"{col}__lat"
+    out_lon = params.get('lon_col') or f"{col}__lon"
+    if _is_polars_df(df):
+        try:
+            vals = df.select(pl.col(col)).to_series().to_list()
+            lats, lons = [], []
+            for v in vals:
+                g = _geocode_address(v, provider=provider)
+                if g:
+                    lats.append(g.get('lat'))
+                    lons.append(g.get('lon'))
+                else:
+                    lats.append(None)
+                    lons.append(None)
+            df = df.with_columns(pl.Series(out_lat, lats).alias(out_lat), pl.Series(out_lon, lons).alias(out_lon))
+            return df
+        except Exception:
+            try:
+                pd = df.to_pandas()
+                pd[out_lat] = pd[col].apply(lambda v: (_geocode_address(v, provider) or {}).get('lat'))
+                pd[out_lon] = pd[col].apply(lambda v: (_geocode_address(v, provider) or {}).get('lon'))
+                return pl.from_pandas(pd)
+            except Exception:
+                return df
+    else:
+        try:
+            pd = df.copy()
+            pd[out_lat] = pd[col].apply(lambda v: (_geocode_address(v, provider) or {}).get('lat'))
+            pd[out_lon] = pd[col].apply(lambda v: (_geocode_address(v, provider) or {}).get('lon'))
+            return pd
+        except Exception:
+            return df
+
+
+# --- Spell-correction & NLP normalization ---
+def _spell_correct_column(df, col, params=None):
+    """Apply simple typo correction and abbreviation expansion.
+    params: {'vocabulary': [...], 'abbrev_map': {'st':'street'}, 'max_dist':0.8}
+    """
+    params = params or {}
+    vocab = params.get('vocabulary') or []
+    abbrev = params.get('abbrev_map') or {}
+    max_dist = float(params.get('max_dist', 0.8))
+    try:
+        import pandas as _pd
+    except Exception:
+        _pd = None
+
+    def normalize(s):
+        if s is None:
+            return None
+        t = str(s).strip()
+        # expand abbreviations
+        parts = t.split()
+        parts = [abbrev.get(p.lower(), p) for p in parts]
+        t = ' '.join(parts)
+        return t
+
+    def correct_one(s):
+        if s is None:
+            return None
+        t = normalize(s)
+        if not vocab:
+            return t
+        # find best match using difflib
+        m = difflib.get_close_matches(t, vocab, n=1, cutoff=max_dist)
+        return m[0] if m else t
+
+    if _is_polars_df(df):
+        try:
+            vals = df.select(pl.col(col)).to_series().to_list()
+            out = [correct_one(v) for v in vals]
+            df = df.with_columns(pl.Series(col, out).alias(col))
+            return df
+        except Exception:
+            try:
+                pd = df.to_pandas()
+                pd[col] = pd[col].astype(str).apply(correct_one)
+                return pl.from_pandas(pd)
+            except Exception:
+                return df
+    else:
+        try:
+            pd = df.copy()
+            pd[col] = pd[col].astype(str).apply(correct_one)
+            return pd
+        except Exception:
+            return df
+
+
+# --- Outlier detection & robust imputation ---
+def _detect_outliers(df, col, params=None):
+    params = params or {}
+    method = params.get('method', 'iqr')
+    multiplier = float(params.get('multiplier', 1.5))
+    flag_col = params.get('flag_col') or f"{col}__outlier"
+
+    if _is_polars_df(df):
+        try:
+            ser = df.select(pl.col(col)).to_series().to_list()
+            import numpy as _np
+            arr = _np.array([float(x) for x in ser if x is not None and str(x).strip() != ''], dtype=float)
+            if arr.size == 0:
+                return df
+            if method == 'iqr':
+                q1 = _np.percentile(arr, 25)
+                q3 = _np.percentile(arr, 75)
+                iqr = q3 - q1
+                low = q1 - multiplier * iqr
+                high = q3 + multiplier * iqr
+            else:
+                mu = arr.mean(); sd = arr.std()
+                low = mu - multiplier * sd; high = mu + multiplier * sd
+            flags = []
+            for v in ser:
+                try:
+                    nv = float(v)
+                    flags.append(nv < low or nv > high)
+                except Exception:
+                    flags.append(False)
+            df = df.with_columns(pl.Series(flag_col, flags).alias(flag_col))
+            return df
+        except Exception:
+            return df
+    else:
+        try:
+            import pandas as _pd
+            ser = df[col].astype(float, errors='coerce')
+            if method == 'iqr':
+                q1 = ser.quantile(0.25)
+                q3 = ser.quantile(0.75)
+                iqr = q3 - q1
+                low = q1 - multiplier * iqr
+                high = q3 + multiplier * iqr
+            else:
+                mu = ser.mean(); sd = ser.std()
+                low = mu - multiplier * sd; high = mu + multiplier * sd
+            df[flag_col] = ser.apply(lambda v: False if _pd.isna(v) else (v < low or v > high))
+            return df
+        except Exception:
+            return df
+
+
+def _robust_impute(df, col, params=None):
+    params = params or {}
+    strategy = params.get('strategy', 'group_median')
+    group_by = params.get('group_by')
+
+    if _is_polars_df(df):
+        try:
+            if group_by:
+                grp = df.groupby(group_by).agg(pl.col(col).median().alias('__grp_med__'))
+                df = df.join(grp, on=group_by, how='left')
+                df = df.with_columns(pl.when(pl.col(col).is_null()).then(pl.col('__grp_med__')).otherwise(pl.col(col)).alias(col))
+                try:
+                    df = df.drop('__grp_med__')
+                except Exception:
+                    pass
+                return df
+            else:
+                med = df.select(pl.col(col)).to_series().drop_nulls().median()
+                return df.with_columns(pl.when(pl.col(col).is_null()).then(pl.lit(med)).otherwise(pl.col(col)).alias(col))
+        except Exception:
+            return df
+    else:
+        try:
+            import pandas as _pd
+            pd_df = df.copy()
+            if group_by and group_by in pd_df.columns:
+                med = pd_df.groupby(group_by)[col].transform('median')
+                pd_df[col] = pd_df[col].fillna(med)
+            else:
+                pd_df[col] = pd_df[col].fillna(pd_df[col].median())
+            return pd_df
+        except Exception:
+            return df
+
+
+# --- Mixed-type column splitting / reconciliation ---
+def _split_mixed_column(df, col, params=None):
+    params = params or {}
+    prefix = params.get('prefix') or f"{col}__"
+
+    def detect_type(v):
+        if v is None:
+            return None
+        s = str(v).strip()
+        if s == '':
+            return None
+        if '@' in s and '.' in s:
+            return 'email'
+        if _is_date_str(s):
+            return 'date'
+        if re.match(r'^[-+]?[0-9]+(\.[0-9]+)?$', s):
+            return 'numeric'
+        if re.search(r'\d{5}(?:-\d{4})?', s):
+            return 'postal'
+        if ',' in s:
+            return 'address'
+        return 'text'
+
+    if _is_polars_df(df):
+        try:
+            vals = df.select(pl.col(col)).to_series().to_list()
+            out = {f'{prefix}numeric': [], f'{prefix}date': [], f'{prefix}email': [], f'{prefix}address': [], f'{prefix}text': []}
+            for v in vals:
+                t = detect_type(v)
+                for k in out:
+                    out[k].append(v if k.endswith(t) else None)
+            cols = [pl.Series(k.split(prefix,1)[1] if prefix in k else k, out[k]).alias(k.split(prefix,1)[1]) for k in out]
+            df = df.with_columns(*cols)
+            return df
+        except Exception:
+            try:
+                pd = df.to_pandas()
+                for k in ['numeric','date','email','address','text']:
+                    pd[f'{prefix}{k}'] = pd[col].apply(lambda v: v if detect_type(v)==k else None)
+                return pl.from_pandas(pd)
+            except Exception:
+                return df
+    else:
+        try:
+            pd = df.copy()
+            for k in ['numeric','date','email','address','text']:
+                pd[f'{prefix}{k}'] = pd[col].apply(lambda v: v if detect_type(v)==k else None)
+            return pd
+        except Exception:
+            return df
+
+
+# --- Complex conditional derivations ---
+def _apply_derivations(df, params=None):
+    """Apply multi-condition derived columns. params: {'rules': [ {'if': '<expr>', 'then': {'col':'name','value':'<expr>'}} ] }
+    Expressions may reference columns by name; they are evaluated per-row with a minimal locals mapping.
+    """
+    params = params or {}
+    import ast
+    rules = params.get('rules') or []
+    if not rules:
+        return df
+
+    def _eval_expr(expr, row):
+        if expr is None:
+            return None
+        try:
+            # parse expression AST and evaluate safely
+            node = ast.parse(expr, mode='eval').body
+        except Exception:
+            try:
+                return ast.literal_eval(expr)
+            except Exception:
+                return None
+
+        def _eval(node):
+            # literals
+            if isinstance(node, ast.Constant):
+                return node.value
+            # names -> lookup in row mapping
+            if isinstance(node, ast.Name):
+                return row.get(node.id)
+            # binary operations
+            if isinstance(node, ast.BinOp):
+                left = _eval(node.left)
+                right = _eval(node.right)
+                op = node.op
+                try:
+                    if isinstance(op, ast.Add):
+                        return left + right
+                    if isinstance(op, ast.Sub):
+                        return left - right
+                    if isinstance(op, ast.Mult):
+                        return left * right
+                    if isinstance(op, ast.Div):
+                        return left / right
+                    if isinstance(op, ast.Mod):
+                        return left % right
+                    if isinstance(op, ast.Pow):
+                        return left ** right
+                except Exception:
+                    return None
+            # boolean ops
+            if isinstance(node, ast.BoolOp):
+                vals = [_eval(v) for v in node.values]
+                if isinstance(node.op, ast.And):
+                    return all(bool(v) for v in vals)
+                if isinstance(node.op, ast.Or):
+                    return any(bool(v) for v in vals)
+            # unary ops
+            if isinstance(node, ast.UnaryOp):
+                v = _eval(node.operand)
+                if isinstance(node.op, ast.Not):
+                    return not bool(v)
+                if isinstance(node.op, ast.USub):
+                    return -v
+                if isinstance(node.op, ast.UAdd):
+                    return +v
+            # comparisons
+            if isinstance(node, ast.Compare):
+                left = _eval(node.left)
+                res = True
+                for op, comp in zip(node.ops, node.comparators):
+                    right = _eval(comp)
+                    try:
+                        if isinstance(op, ast.Eq):
+                            res = res and (left == right)
+                        elif isinstance(op, ast.NotEq):
+                            res = res and (left != right)
+                        elif isinstance(op, ast.Lt):
+                            res = res and (left < right)
+                        elif isinstance(op, ast.LtE):
+                            res = res and (left <= right)
+                        elif isinstance(op, ast.Gt):
+                            res = res and (left > right)
+                        elif isinstance(op, ast.GtE):
+                            res = res and (left >= right)
+                        elif isinstance(op, ast.In):
+                            res = res and (left in right)
+                        elif isinstance(op, ast.NotIn):
+                            res = res and (left not in right)
+                        else:
+                            res = False
+                    except Exception:
+                        res = False
+                    left = right
+                return res
+            # fallback: unsupported node
+            return None
+
+        try:
+            return _eval(node)
+        except Exception:
+            return None
+
+    if _is_polars_df(df):
+        try:
+            pd = df.to_pandas()
+        except Exception:
+            try:
+                pd = pl.from_dicts(df.to_dicts()).to_pandas()
+            except Exception:
+                return df
+    else:
+        pd = df
+
+    for rule in rules:
+        cond = rule.get('if')
+        then = rule.get('then') or {}
+        out_col = then.get('col')
+        out_expr = then.get('value')
+        if not out_col:
+            continue
+        def apply_row(r):
+            import math
+            def _is_nan(x):
+                try:
+                    return isinstance(x, float) and math.isnan(x)
+                except Exception:
+                    return False
+            env = {k: (v if not _is_nan(v) else None) for k, v in dict(r).items()}
+            try:
+                keep = True if cond is None else bool(_eval_expr(cond, env))
+            except Exception:
+                keep = False
+            if keep:
+                try:
+                    return _eval_expr(out_expr, env)
+                except Exception:
+                    return None
+            return None
+        try:
+            pd[out_col] = pd.apply(apply_row, axis=1)
+        except Exception:
+            # fallback: iterate
+            vals = []
+            for _, r in pd.iterrows():
+                vals.append(apply_row(r))
+            pd[out_col] = vals
+
+    if pl is not None:
+        try:
+            return pl.from_pandas(pd)
+        except Exception:
+            try:
+                return pl.from_dicts(pd.to_dict(orient='records'))
+            except Exception:
+                return pd
+    return pd
+
+
+# --- Cross-column consistency rules with auto-correct suggestions ---
+def _cross_column_consistency(df, params=None):
+    """Params: {'rules': [ {'lhs':'postal_code','rhs':'city','map_path': 'data/postal_city.csv','auto_fix': True} ] }
+    Returns df with flag/suggestion columns for mismatches and optionally applies fixes.
+    """
+    params = params or {}
+    rules = params.get('rules') or []
+    lookups = {}
+    for r in rules:
+        map_path = r.get('map_path')
+        if map_path:
+            try:
+                tbl = _read_table(map_path)
+                if _is_polars_df(tbl):
+                    try:
+                        mp = {str(x[0]): x[1] for x in tbl.select(tbl.columns[0], tbl.columns[1]).to_numpy()}
+                    except Exception:
+                        mp = {str(row[tbl.columns[0]]): row[tbl.columns[1]] for row in tbl.to_dicts()}
+                else:
+                    mp = {str(r[tbl.columns[0]]): r[tbl.columns[1]] for r in tbl.to_dicts()} if hasattr(tbl, 'to_dicts') else {}
+                lookups[map_path] = mp
+            except Exception:
+                lookups[map_path] = {}
+
+    if _is_polars_df(df):
+        try:
+            pd_df = df.to_pandas()
+        except Exception:
+            try:
+                pd_df = pl.from_dicts(df.to_dicts()).to_pandas()
+            except Exception:
+                return df
+    else:
+        pd_df = df
+
+    diagnostics = []
+    for r in rules:
+        lhs = r.get('lhs'); rhs = r.get('rhs')
+        map_path = r.get('map_path'); auto = bool(r.get('auto_fix', False))
+        flag_col = r.get('flag_col') or f"{lhs}__{rhs}__mismatch"
+        suggest_col = r.get('suggest_col') or f"{lhs}__{rhs}__suggestion"
+        mp = lookups.get(map_path, {}) if map_path else {}
+        def resolve(row):
+            l = str(row.get(lhs) or '')
+            expected = mp.get(l)
+            actual = row.get(rhs)
+            if expected is None:
+                return (False, None)
+            if str(actual) != str(expected):
+                return (True, expected)
+            return (False, None)
+
+        flags = []; suggs = []
+        for _, row in pd_df.iterrows():
+            f, s = resolve(row)
+            flags.append(f); suggs.append(s)
+        pd_df[flag_col] = flags
+        pd_df[suggest_col] = suggs
+        if auto:
+            # apply fixes where suggestion is present
+            pd_df.loc[pd_df[flag_col] == True, rhs] = pd_df.loc[pd_df[flag_col] == True, suggest_col]
+        diagnostics.append({'rule': r, 'mismatches': int(sum(1 for v in flags if v))})
+
+    return (pl.from_pandas(pd_df) if pl is not None else pd_df, diagnostics)
+
+
+# helper: coerce a pandas Series to datetime-like
+def _coerce_to_datetime_series(series):
+    try:
+        import pandas as _pd
+        return _pd.to_datetime(series, errors='coerce')
+    except Exception:
+        return series
+
+
+# --- Schema validation & evolution ---
+def _validate_and_evolve_schema(df, schema, params=None):
+    """Schema format: {col: {'type':'int|float|str|date','required':bool,'default':...,'rename_from': 'old'}}
+    params: {'strict': True/False, 'migrations': {...}}
+    Returns (df, diagnostics)
+    """
+    params = params or {}
+    strict = bool(params.get('strict', False))
+    migrations = params.get('migrations') or {}
+    diagnostics = []
+
+    if _is_polars_df(df):
+        try:
+            pd_df = df.to_pandas()
+        except Exception:
+            try:
+                pd_df = pl.from_dicts(df.to_dicts()).to_pandas()
+            except Exception:
+                return df, [{'error': 'cannot_convert_df'}]
+    else:
+        pd_df = df
+
+    # apply renames
+    for col, spec in (schema or {}).items():
+        old = spec.get('rename_from')
+        if old and old in pd_df.columns and col not in pd_df.columns:
+            pd_df = pd_df.rename(columns={old: col})
+
+    # add missing columns with defaults
+    for col, spec in (schema or {}).items():
+        if col not in pd_df.columns:
+            if 'default' in spec:
+                pd_df[col] = spec.get('default')
+                diagnostics.append({'added_column': col})
+            elif strict and spec.get('required'):
+                return df, [{'error': f'required_column_missing: {col}'}]
+
+    # attempt casts
+    for col, spec in (schema or {}).items():
+        if col in pd_df.columns and spec.get('type'):
+            t = spec.get('type')
+            try:
+                if t in ('int','integer'):
+                    pd_df[col] = pd_df[col].astype('Int64')
+                elif t in ('float','number'):
+                    pd_df[col] = pd_df[col].astype(float)
+                elif t in ('str','string'):
+                    pd_df[col] = pd_df[col].astype(str)
+                elif t in ('date','datetime'):
+                    pd_df[col] = _coerce_to_datetime_series(pd_df[col])
+                diagnostics.append({'casted': col, 'to': t})
+            except Exception:
+                diagnostics.append({'failed_cast': col, 'to': t})
+                if strict:
+                    return df, diagnostics
+
+    return (pl.from_pandas(pd_df) if pl is not None else pd_df, diagnostics)
+
+
+# --- External lookup / join integration ---
+_EXTERNAL_LOOKUP_CACHE = {}
+
+def _external_lookup(df, params=None):
+    """Support HTTP templated lookups or sqlite queries.
+    params: {'mode':'http'|'sqlite','template': 'https://...{col}...', 'map':{'json_key':'out_col'}}
+    """
+    params = params or {}
+    mode = params.get('mode', 'http')
+    mapping = params.get('map') or {}
+    timeout = int(params.get('timeout', 5))
+
+    if _is_polars_df(df):
+        try:
+            pd_df = df.to_pandas()
+        except Exception:
+            try:
+                pd_df = pl.from_dicts(df.to_dicts()).to_pandas()
+            except Exception:
+                return df
+    else:
+        pd_df = df
+
+    if mode == 'http':
+        template = params.get('template')
+        headers = params.get('headers') or {}
+        import httpx
+        results = {out: [] for out in mapping.values()} if mapping else {}
+        for _, row in pd_df.iterrows():
+            try:
+                url = template.format(**{k: row.get(k, '') for k in pd_df.columns})
+                cache_key = ('http', url)
+                now = int(time.time())
+                entry = _EXTERNAL_LOOKUP_CACHE.get(cache_key)
+                if entry and now - entry[1] < int(params.get('cache_ttl', 3600)):
+                    data = entry[0]
+                else:
+                    resp = httpx.get(url, timeout=timeout, headers=headers)
+                    data = resp.json() if resp.status_code == 200 else {}
+                    _EXTERNAL_LOOKUP_CACHE[cache_key] = (data, now)
+                for jkey, outcol in mapping.items():
+                    val = data.get(jkey)
+                    results.setdefault(outcol, []).append(val)
+            except Exception:
+                for outcol in mapping.values():
+                    results.setdefault(outcol, []).append(None)
+        for outcol, vals in results.items():
+            pd_df[outcol] = vals
+        return pl.from_pandas(pd_df) if pl is not None else pd_df
+    elif mode == 'sqlite':
+        db = params.get('db')
+        qtemplate = params.get('query')
+        import sqlite3
+        conn = sqlite3.connect(db)
+        results = {out: [] for out in mapping.values()} if mapping else {}
+        for _, row in pd_df.iterrows():
+            try:
+                q = qtemplate.format(**{k: row.get(k, '') for k in pd_df.columns})
+                cur = conn.execute(q)
+                r = cur.fetchone()
+                for idx, outcol in enumerate(mapping.values()):
+                    results.setdefault(outcol, []).append(r[idx] if r and idx < len(r) else None)
+            except Exception:
+                for outcol in mapping.values():
+                    results.setdefault(outcol, []).append(None)
+        conn.close()
+        for outcol, vals in results.items():
+            pd_df[outcol] = vals
+        return pl.from_pandas(pd_df) if pl is not None else pd_df
+    return df
+
+
+# --- OCR / extraction cleanup ---
+def _clean_ocr_column(df, col, params=None):
+    params = params or {}
+    repl_map = params.get('replacements') or {
+        '0': 'O',
+        'O': '0',
+        '1': 'I',
+        'I': '1',
+    }
+    # common corrections patterns (simple)
+    patterns = params.get('patterns') or [ (r'[^\x20-\x7E]', ''), (r'\bll\b', 'll') ]
+
+    def fix_one(s):
+        if s is None:
+            return None
+        t = str(s)
+        # remove non-printables
+        for pat, sub in patterns:
+            t = re.sub(pat, sub, t)
+        # simple char map
+        for a, b in repl_map.items():
+            t = t.replace(a, b)
+        # collapse spaces
+        t = re.sub(r'\s+', ' ', t).strip()
+        return t
+
+    if _is_polars_df(df):
+        try:
+            vals = df.select(pl.col(col)).to_series().to_list()
+            out = [fix_one(v) for v in vals]
+            df = df.with_columns(pl.Series(col, out).alias(col))
+            return df
+        except Exception:
+            try:
+                pd_df = df.to_pandas()
+                pd_df[col] = pd_df[col].astype(str).apply(fix_one)
+                return pl.from_pandas(pd_df)
+            except Exception:
+                return df
+    else:
+        try:
+            pd_df = df.copy()
+            pd_df[col] = pd_df[col].astype(str).apply(fix_one)
+            return pd_df
+        except Exception:
+            return df
+
+
+# In-memory cache for fetched exchange rates: {(provider, frm, to): (rate, ts)}
+_EXCHANGE_RATE_CACHE = {}
+
+
+def _fetch_exchange_rate(provider, frm, to, api_key=None, cache_ttl=3600, timeout=5):
+    """Fetch exchange rate for frm->to from supported providers.
+    Returns numeric rate or None on failure. Caches results in-memory for `cache_ttl` seconds.
+    Supported providers: 'exchangerate.host' (no key), 'openexchangerates' (requires `api_key`).
+    """
+    key = (provider, frm, to)
+    now = int(time.time())
+    entry = _EXCHANGE_RATE_CACHE.get(key)
+    if entry:
+        r, ts = entry
+        if now - ts < int(cache_ttl):
+            return r
+    if provider in (None, '', 'sample'):
+        return None
+    try:
+        import httpx
+        if provider == 'exchangerate.host':
+            url = f"https://api.exchangerate.host/convert?from={frm}&to={to}"
+            resp = httpx.get(url, timeout=timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict) and data.get('result') is not None:
+                    r = float(data.get('result'))
+                    _EXCHANGE_RATE_CACHE[key] = (r, now)
+                    return r
+        elif provider == 'openexchangerates':
+            if not api_key:
+                return None
+            url = f"https://openexchangerates.org/api/latest.json?app_id={api_key}"
+            resp = httpx.get(url, timeout=timeout)
+            if resp.status_code == 200:
+                data = resp.json()
+                rates = data.get('rates') or {}
+                base = data.get('base', 'USD')
+                if not rates:
+                    return None
+                if frm == base or frm == 'USD':
+                    r = float(rates.get(to))
+                else:
+                    r = float(rates.get(to)) / float(rates.get(frm))
+                _EXCHANGE_RATE_CACHE[key] = (r, now)
+                return r
+    except Exception:
+        return None
+    return None
 
 
 def _is_date_str(val: str) -> bool:
@@ -2690,6 +3647,44 @@ class Cleaner:
         except Exception:
             pass
         diagnostics = []
+        # Allow dataset-level steps to run once before per-column steps
+        for step in recipe.cleaning_steps:
+            act = getattr(step, 'action', None)
+            try:
+                if act == 'entity_resolution':
+                    params = step.params or {}
+                    res = _entity_resolution(df, params)
+                    if res is not None:
+                        df = res
+                elif act == 'consistency_check' or act == 'consistency_rules':
+                    params = step.params or {}
+                    try:
+                        res = _cross_column_consistency(df, params)
+                        if isinstance(res, tuple):
+                            df = res[0]
+                    except Exception:
+                        pass
+                elif act == 'validate_schema' or act == 'schema_migrate':
+                    params = step.params or {}
+                    schema = params.get('schema') or {}
+                    try:
+                        res, diag = _validate_and_evolve_schema(df, schema, params)
+                        if res is not None:
+                            df = res
+                    except Exception:
+                        pass
+                elif act == 'external_lookup' or act == 'lookup_join':
+                    params = step.params or {}
+                    try:
+                        res = _external_lookup(df, params)
+                        if res is not None:
+                            df = res
+                    except Exception:
+                        pass
+            except Exception:
+                # ensure dataset-level hooks do not stop the runner
+                pass
+        
         def _step_cols(step):
             c = getattr(step, "column", None)
             if c is None:
@@ -2833,6 +3828,27 @@ class Cleaner:
                     cond = params.get("condition")
                     if cond is not None:
                         df = _conditional_transform(df, col, val, cond)
+                elif step.action in ("derive", "derive_column"):
+                    try:
+                        params = step.params or {}
+                        # allow per-column shortform: single rule inferred from params
+                        if not params.get('rules'):
+                            # build rule: if provided condition apply expression to this col
+                            cond = params.get('condition')
+                            expr = params.get('expression') or params.get('value')
+                            rules = [{ 'if': cond, 'then': {'col': params.get('output') or col, 'value': expr }}]
+                            params = {'rules': rules}
+                        res = _apply_derivations(df, params)
+                        if res is not None:
+                            df = res
+                    except Exception:
+                        pass
+                elif step.action in ("ocr_cleanup", "ocr_clean") and col:
+                    params = step.params or {}
+                    try:
+                        df = _clean_ocr_column(df, col, params)
+                    except Exception:
+                        pass
                 elif step.action == "join":
                     params = step.params or {}
                     left_path = params.get("left")
@@ -3040,6 +4056,45 @@ class Cleaner:
         before = _strip_meta_rows(before)
         df_after = df_for_ops
         warnings = []
+        # run dataset-level pre-processing steps for preview (non-destructive)
+        for step in recipe.cleaning_steps:
+            act = getattr(step, 'action', None)
+            try:
+                if act == 'entity_resolution':
+                    try:
+                        params = step.params or {}
+                        res = _entity_resolution(df_after, params)
+                        if res is not None:
+                            df_after = res
+                    except Exception:
+                        pass
+                elif act in ('consistency_check','consistency_rules'):
+                    try:
+                        params = step.params or {}
+                        res = _cross_column_consistency(df_after, params)
+                        if isinstance(res, tuple):
+                            df_after = res[0]
+                    except Exception:
+                        pass
+                elif act in ('validate_schema','schema_migrate'):
+                    try:
+                        params = step.params or {}
+                        schema = params.get('schema') or {}
+                        res, diag = _validate_and_evolve_schema(df_after, schema, params)
+                        if res is not None:
+                            df_after = res
+                    except Exception:
+                        pass
+                elif act in ('external_lookup','lookup_join'):
+                    try:
+                        params = step.params or {}
+                        res = _external_lookup(df_after, params)
+                        if res is not None:
+                            df_after = res
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         def _step_cols(step):
             c = getattr(step, "column", None)
             if c is None:

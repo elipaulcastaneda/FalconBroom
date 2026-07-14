@@ -1,0 +1,24 @@
+﻿{
+    "sources":  [
+                    {
+                        "path":  "C:\\Users\\Elijah\\FalconBroom\\data\\uploads\\combined_whitespace_case_e30903e3_9712_57d4.csv"
+                    }
+                ],
+    "cleaning_steps":  [
+                           {
+                               "action":  "normalize",
+                               "column":  "username",
+                               "params":  {
+                                              "case":  "lower"
+                                          }
+                           }
+                       ],
+    "joins":  [
+
+              ],
+    "outputs":  [
+                    {
+                        "path":  "output_from_text.csv"
+                    }
+                ]
+}

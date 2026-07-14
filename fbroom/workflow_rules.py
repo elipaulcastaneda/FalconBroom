@@ -12,6 +12,8 @@ Anything beyond these rules is where AI becomes useful rather than required.
 from __future__ import annotations
 
 import re
+import os
+import csv
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -22,7 +24,8 @@ from .recipe_schema import CleaningStep, JoinSpec, Recipe
 ACTION_ALIASES = {
     "drop_column": ["drop", "remove", "delete", "exclude"],
     "impute": ["fill", "impute", "replace missing", "fill missing", "populate missing"],
-    "normalize": ["normalize", "standardize", "lowercase", "uppercase", "trim", "clean up"],
+    # single, consolidated normalize alias set (include common case/trim variants)
+    "normalize": ["normalize", "standardize", "lowercase", "uppercase", "trim", "strip", "clean up", "capitalize", "capitalise", "capitalized", "title case", "titlecase", "proper case"],
     "replace": ["replace", "substitute", "swap"],
     "map": ["map", "map values", "remap", "translate"],
     "regex_replace": ["regex", "regular expression", "regex replace", "replace regex"],
@@ -81,9 +84,107 @@ def _match_score(haystack: str, needle: str) -> float:
 
 def infer_action(text: str) -> Optional[str]:
     t = _norm(text)
+    # If instruction contains sequential clauses joined by 'then' or ';', parse each clause in order
+    try:
+        parts = [p.strip() for p in re.split(r'(?i)\bthen\b|;', text) if p and p.strip()]
+        if len(parts) > 1:
+            all_steps: List[CleaningStep] = []
+            for p in parts:
+                print('DEBUG: parsing clause ->', repr(p))
+                parsed = False
+                # 1) typed move with optional 'non-' prefix: e.g. "move all non-numerical values from postal_code to city"
+                # allow optional 'all' and optional 'values/entries' so phrasing like
+                # 'move non-numerical values from X to Y' or 'move non-numerical from X to Y'
+                # accept a wide range of clarifying type words so users can say
+                # 'numeric', 'number', 'digits', 'string', 'text', 'letters', 'alpha', 'alphabetic', 'alphanumeric', 'chars', 'characters', 'date', etc.
+                m_typed = re.search(r"(?i)(?:move|put|copy)\s+(?:all\s+)?(?P<neg>non[-\s]?|not\s+)?(?P<type>numeric|numerical|number|numbers|digits|string|text|letters|alpha|alphabetic|alphanumeric|chars|characters|date|dates)\s*(?:values|entries)?\s*(?:in|from|of)?\s*(?P<src>[A-Za-z0-9_]+)\s*(?:column)?\s*(?:to|into|in)\s*(?P<tgt>[A-Za-z0-9_]+)", p)
+                if m_typed:
+                    neg = bool(m_typed.group('neg'))
+                    typ = m_typed.group('type').lower()
+                    src = m_typed.group('src')
+                    tgt = m_typed.group('tgt')
+                    # invert type on negation (non-numerical => string)
+                    if neg and typ in ('numeric', 'numerical', 'number', 'numbers'):
+                        typ_out = 'string'
+                    elif neg and typ in ('string', 'text', 'letters'):
+                        typ_out = 'numeric'
+                    else:
+                        typ_out = 'numeric' if typ in ('numeric', 'numerical', 'number', 'numbers') else 'string'
+                    params = {"source": src, "target": tgt, "type": typ_out, "exceptions": [], "replacement": ""}
+                    all_steps.append(CleaningStep(action="move_by_type", column=None, params=params))
+                    parsed = True
+
+                # 2) move all values (no type) -> emit two moves to capture numeric and string variants
+                if not parsed:
+                    # accept variants like 'move values from A to B', 'move A to B', or 'move all values from A to B'
+                    m_all = re.search(r"(?i)(?:move|put|copy)\s+(?:all\s+)?(?:values\s*)?(?:in|from|of)?\s*(?P<src>[A-Za-z0-9_]+)\s*(?:column)?\s*(?:to|into|in)\s*(?P<tgt>[A-Za-z0-9_]+)", p)
+                    if m_all:
+                        src = m_all.group('src')
+                        tgt = m_all.group('tgt')
+                        all_steps.append(CleaningStep(action="move_by_type", column=None, params={"source": src, "target": tgt, "type": "string", "exceptions": [], "replacement": ""}))
+                        all_steps.append(CleaningStep(action="move_by_type", column=None, params={"source": src, "target": tgt, "type": "numeric", "exceptions": [], "replacement": ""}))
+                        parsed = True
+
+                # 3) drop column shorthand: 'drop col_6' or 'drop column col_6'
+                if not parsed:
+                    m_drop = re.search(r"(?i)drop\s+(?:column\s+)?(?P<col>[A-Za-z0-9_]+)", p)
+                    if m_drop:
+                        col = m_drop.group('col')
+                        all_steps.append(CleaningStep(action="drop_column", column=col, params={}))
+                        parsed = True
+
+                # 4) fallback: attempt to parse the clause recursively
+                if not parsed:
+                    try:
+                        sub = recipe_from_plain_english(p, profile, source_path, output_path, regression_options)
+                        if sub and getattr(sub, 'cleaning_steps', None):
+                            all_steps.extend([s for s in sub.cleaning_steps])
+                    except Exception:
+                        continue
+
+            if all_steps:
+                print('DEBUG: combined steps count ->', len(all_steps))
+                # ensure steps are plain dicts for Pydantic consumption
+                serial_steps = []
+                for s in all_steps:
+                    try:
+                        if hasattr(s, 'model_dump'):
+                            serial_steps.append(s.model_dump())
+                        elif hasattr(s, 'dict'):
+                            serial_steps.append(s.dict())
+                        else:
+                            serial_steps.append(dict(s))
+                    except Exception:
+                        try:
+                            serial_steps.append(dict(s))
+                        except Exception:
+                            # fallback: minimal representation
+                            serial_steps.append({ 'action': getattr(s, 'action', None), 'column': getattr(s, 'column', None), 'params': getattr(s, 'params', {}) })
+                print('DEBUG: serial_steps ->', serial_steps)
+                # Return the serializable step list to the caller for recipe construction
+                return serial_steps
+    except Exception:
+        pass
+    # fallback: if text contains common normalize tokens, prefer normalize action
+    try:
+        if any(k in t for k in ["normalize", "lower", "uppercase", "lowercase", "trim", "strip", "capitalize", "title"]):
+            return "normalize"
+    except Exception:
+        pass
+    try:
+        t = re.sub(r"non[- ]?numeric|non[- ]?numerical|non ?numeric", "string", t, flags=re.IGNORECASE)
+    except Exception:
+        pass
+
+    # match aliases as whole words/phrases to avoid accidental substring matches
     for action, aliases in ACTION_ALIASES.items():
-        if any(alias in t for alias in aliases):
-            return action
+        for alias in aliases:
+            try:
+                if re.search(r"\b" + re.escape(alias) + r"\b", t, flags=re.IGNORECASE):
+                    return action
+            except Exception:
+                if alias in t:
+                    return action
     return None
 
 
@@ -189,8 +290,72 @@ def _default_strategy_for_column(meta: Dict[str, Any]) -> str:
 def recipe_from_plain_english(text: str, profile: Dict[str, Dict[str, Any]], source_path: str, output_path: str, regression_options: Optional[dict] = None) -> Recipe:
     """Map a plain-English instruction into a deterministic recipe when possible."""
     action = infer_action(text)
+    # If infer_action returned a pre-serialized list of steps for multi-clause inputs, build Recipe
+    try:
+        if isinstance(action, list):
+            try:
+                return Recipe.model_validate({"sources": [{"path": source_path}], "cleaning_steps": action, "joins": [], "outputs": [{"path": output_path}]})
+            except Exception:
+                return Recipe(sources=[{"path": source_path}], cleaning_steps=action, joins=[], outputs=[{"path": output_path}])
+    except Exception:
+        pass
     # detect any explicit column names mentioned in the instruction (exact whole-word matches)
     t = _norm(text)
+    # helper: parse condition text into engine condition dicts
+    def _parse_condition_text(cond_text: str):
+        s = cond_text.strip()
+        if not s:
+            return None
+        # split on top-level ' or ' then ' and '
+        if re.search(r"\s+or\s+", s, flags=re.IGNORECASE):
+            parts = [p.strip() for p in re.split(r"\s+or\s+", s, flags=re.IGNORECASE) if p.strip()]
+            return {"op": "or", "conds": [_parse_condition_text(p) for p in parts]}
+        if re.search(r"\s+and\s+", s, flags=re.IGNORECASE):
+            parts = [p.strip() for p in re.split(r"\s+and\s+", s, flags=re.IGNORECASE) if p.strip()]
+            return {"op": "and", "conds": [_parse_condition_text(p) for p in parts]}
+        # not prefix
+        mnot = re.match(r"^not\s+(.+)$", s, flags=re.IGNORECASE)
+        if mnot:
+            inner = mnot.group(1).strip()
+            return {"op": "not", "cond": _parse_condition_text(inner)}
+        # comparison
+        m = re.search(r"([a-zA-Z0-9_\.]+)\s*(>=|<=|==|=|!=|<>|>|<)\s*([\'\"\w\-\.]+)", s)
+        if m:
+            col, op, val = m.groups()
+            # try numeric
+            try:
+                if re.match(r"^-?\d+\.\d+$", val):
+                    v = float(val)
+                elif re.match(r"^-?\d+$", val):
+                    v = int(val)
+                else:
+                    v = re.sub(r"^[\'\"]|[\'\"]$", "", val)
+            except Exception:
+                v = re.sub(r"^[\'\"]|[\'\"]$", "", val)
+            return {"column": col, "op": op, "value": v}
+        # contains / in
+        m2 = re.search(r"([a-zA-Z0-9_\.]+)\s+contains\s+[\'\"]?(.+?)[\'\"]?$", s, flags=re.IGNORECASE)
+        if m2:
+            col, val = m2.groups()
+            return {"column": col, "op": "contains", "value": val}
+        m3 = re.search(r"([a-zA-Z0-9_\.]+)\s+in\s*\(?([a-zA-Z0-9_\',\s]+)\)?", s, flags=re.IGNORECASE)
+        if m3:
+            col, lst = m3.groups()
+            parts = [re.sub(r"^[\'\"]|[\'\"]$", "", p.strip()) for p in re.split(r",|\band\b", lst) if p.strip()]
+            vals = []
+            for p in parts:
+                try:
+                    if re.match(r"^-?\d+\.\d+$", p):
+                        vals.append(float(p))
+                    elif re.match(r"^-?\d+$", p):
+                        vals.append(int(p))
+                    else:
+                        vals.append(p)
+                except Exception:
+                    vals.append(p)
+            return {"column": col, "op": "in", "value": vals}
+        # fallback: no parse
+        return None
     mentioned: List[str] = []
     for column in _profile_column_names(profile):
         try:
@@ -199,14 +364,251 @@ def recipe_from_plain_english(text: str, profile: Dict[str, Dict[str, Any]], sou
         except Exception:
             continue
 
+    # Resolve colloquial/implicit names to actual profile columns using fuzzy inference
+    def _resolve_name(name: str) -> str:
+        if not name:
+            return name
+        if name in profile:
+            return name
+        # handle common colloquial synonyms
+        try:
+            nlow = name.lower()
+            # map common postal synonyms to columns containing 'postal' or 'zip' or 'post'
+            postal_syns = ['zip', 'zip code', 'postcode', 'postal', 'postal code', 'zip_code']
+            for syn in postal_syns:
+                if syn in nlow:
+                    # prefer profile columns that contain 'postal' or 'zip' or 'post'
+                    for col in profile.keys():
+                        lowc = col.lower()
+                        if 'postal' in lowc or 'zip' in lowc or 'post' in lowc:
+                            return col
+        except Exception:
+            pass
+        # try fuzzy inference from the text fragment
+        try:
+            matches = infer_columns_from_text(name, profile, top_n=1)
+            if matches:
+                return matches[0][0]
+        except Exception:
+            pass
+        return name
+
+    resolved_mentioned = [_resolve_name(m) for m in mentioned]
+
     candidates = infer_columns_from_text(text, profile, top_n=5)
     suggested_columns = [column for column, _, _ in candidates]
     # prefer explicitly mentioned columns when available
     if mentioned:
         suggested_columns = mentioned + [c for c in suggested_columns if c not in mentioned]
 
+    # Pre-check: explicit 'first letter' capitalization requests (catch common phrasings)
+    try:
+        cap_match = re.search(r"first\s+letter|only\s+the\s+first|first\s+character|first\s+char|capitalize\s+first|first\s+letter\s+capital", t, flags=re.IGNORECASE)
+        if cap_match or ("first" in t and ("uppercase" in t or "capital" in t)):
+            # build preview columns from reconstructed table (if available)
+            preview_cols = []
+            try:
+                from .engine import _read_table, Cleaner
+                df_raw = _read_table(source_path)
+                recon = Cleaner()._reconstruct_table_from_df(df_raw, offset=0, limit=1)
+                if recon and isinstance(recon, list) and len(recon) > 0:
+                    preview_cols = [k for k in recon[0].keys()]
+            except Exception:
+                preview_cols = []
+
+            # choose explicit mentioned column if present
+            col = resolved_mentioned[0] if resolved_mentioned else (suggested_columns[0] if suggested_columns else None)
+            # if chosen col isn't in preview/header, try to pick a suggested column that is present in preview
+            if col and preview_cols and col not in preview_cols:
+                found = None
+                for c in suggested_columns:
+                    if c in preview_cols:
+                        found = c
+                        break
+                if found:
+                    col = found
+                else:
+                    # prefer username-like keys from preview when available
+                    for k in preview_cols:
+                        lk = k.lower()
+                        if 'username' == lk or lk == 'user' or 'user' in lk or ('name' in lk and not any(x in lk for x in ('first','last','firstname','lastname'))):
+                            col = k
+                            break
+            # fallback: try fuzzy inference for common username-like columns
+            if not col:
+                try:
+                    inferred = infer_columns_from_text('username', profile, top_n=1)
+                    if inferred:
+                        col = inferred[0][0]
+                except Exception:
+                    # heuristic scan for 'user'/'name' tokens in profile keys
+                    for c in profile.keys():
+                        lowc = c.lower()
+                        if 'user' in lowc or ('name' in lowc and 'first' not in lowc and 'last' not in lowc):
+                            col = c
+                            break
+            # check actual file header: if chosen col isn't in the CSV header, prefer a username-like header
+            try:
+                with open(source_path, newline='', encoding='utf-8') as fh:
+                    reader = csv.reader(fh)
+                    hdr = next(reader, None)
+                    if hdr:
+                        hdr_norm = [h.strip().lower() for h in hdr]
+                        if col and col.lower() not in hdr_norm:
+                            for i, h in enumerate(hdr_norm):
+                                if 'user' in h or ('name' in h and not any(x in h for x in ('first','last','firstname','lastname'))):
+                                    col = hdr[i]
+                                    break
+            except Exception:
+                pass
+            # If still no column or the chosen column isn't in the profile, try reading the source CSV header
+            if (not col) or (col not in profile):
+                try:
+                    with open(source_path, newline='', encoding='utf-8') as fh:
+                        reader = csv.reader(fh)
+                        hdr = next(reader, None)
+                        if hdr:
+                            # map normalized header -> original
+                            hdr_map = { re.sub(r'[^a-z0-9]', '', h.lower()): h for h in hdr }
+                            for norm_h, orig_h in hdr_map.items():
+                                if norm_h == 'username' or norm_h == 'user' or 'user' in norm_h or ('name' in norm_h and not any(x in norm_h for x in ('firstname','lastname','first','last'))):
+                                    col = orig_h
+                                    break
+                except Exception:
+                    pass
+            # If still no column, try reconstructing a wide table (preview) to detect surfaced keys like 'username'
+            if (not col) or (col not in profile):
+                try:
+                    # local import to avoid circular at module import time
+                    from .engine import _read_table, Cleaner
+                    df_raw = _read_table(source_path)
+                    recon = Cleaner()._reconstruct_table_from_df(df_raw, offset=0, limit=1)
+                    if recon and isinstance(recon, list) and len(recon) > 0:
+                        first = recon[0]
+                        # prefer exact 'username' key, else look for 'user'/'name' heuristics
+                        if 'username' in first:
+                            col = 'username'
+                        else:
+                            for k in first.keys():
+                                lk = k.lower()
+                                if 'user' in lk or ('name' in lk and not any(x in lk for x in ('first','last','firstname','lastname'))):
+                                    col = k
+                                    break
+                except Exception:
+                    pass
+            if col:
+                steps.append(CleaningStep(action="normalize", column=col, params={"case": "capitalize"}))
+                return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
+    except Exception:
+        pass
+
     steps: List[CleaningStep] = []
+    # Special-case: "remove the '-' character from X column" should be a regex_replace,
+    # not a column drop. Handle quoted or unquoted dash/hyphen/minus/dash-word forms.
+    try:
+        m_remove_char = re.search(r"remove\s+(?:the\s+)?['\"]?([-–—]|dash|hyphen|minus)['\"]?\s+(?:character\s+)?(?:from|in|of)\s+(?:the\s+)?([a-zA-Z0-9_ ]+)(?:\s+column)?", text, flags=re.IGNORECASE)
+        if m_remove_char:
+            char = m_remove_char.group(1)
+            col_raw = m_remove_char.group(2).strip()
+            col = _resolve_name(col_raw)
+            # map common words to literal characters
+            if char.lower() in ('dash', 'hyphen'):
+                pat = r"-"
+            elif char.lower() == 'minus':
+                pat = r"-"
+            else:
+                # normalize unicode dashes to simple hyphen in the pattern
+                pat = re.escape(char)
+            steps.append(CleaningStep(action="regex_replace", column=col, params={"pattern": pat, "replace": ""}))
+            return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
+    except Exception:
+        pass
+
+    # Special-case: "remove any letters" or "remove letters" in a column -> regex_replace letters
+    try:
+        m_remove_letters = re.search(r"remove\s+(?:any\s+)?(?:letters|alphabetic(?:\s+characters)?)\s+(?:in|from|of)\s+(?:the\s+)?([a-zA-Z0-9_ ]+)(?:\s+column)?", text, flags=re.IGNORECASE)
+        if m_remove_letters:
+            col_raw = m_remove_letters.group(1).strip()
+            col = _resolve_name(col_raw)
+            # remove contiguous ASCII letters; keep digits, punctuation, decimals
+            steps.append(CleaningStep(action="regex_replace", column=col, params={"pattern": r"[A-Za-z]+", "replace": ""}))
+            return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
+    except Exception:
+        pass
+    # Detect numeric transform requests like making negatives positive or rounding
+    try:
+        m_neg = re.search(r"make\s+(?:all\s+)?negative\s+(?:number\s+)?values\s+(?:in|of)\s+(?:the\s+)?([a-zA-Z0-9_ ]+)(?:\s+column)?\s+positive", text, flags=re.IGNORECASE)
+        if not m_neg:
+            m_neg = re.search(r"turn\s+(?:all\s+)?negative\s+(?:number\s+)?values\s+(?:in|of)\s+(?:the\s+)?([a-zA-Z0-9_ ]+)(?:\s+column)?\s+positive", text, flags=re.IGNORECASE)
+        if m_neg:
+            col_raw = m_neg.group(1).strip()
+            col = _resolve_name(col_raw)
+            steps.append(CleaningStep(action="numeric_transform", column=col, params={"operation": "abs"}))
+            return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
+
+        m_round = re.search(r"round\s+(?:the\s+)?([a-zA-Z0-9_ ]+?)\s+(?:column\s*)?(?:to\s+the\s+nearest|to)\s+(?:the\s+)?(?:(\d+)\s+decimal\s+places|(tenths|hundredths|thousandths|ones|tens|hundreds|thousands|millions|billions|millionths|billionths))", text, flags=re.IGNORECASE)
+        if m_round:
+            col_raw = m_round.group(1).strip()
+            col = _resolve_name(col_raw)
+            ndigits = None
+            if m_round.group(2):
+                try:
+                    ndigits = int(m_round.group(2))
+                except Exception:
+                    ndigits = None
+            else:
+                unit = (m_round.group(3) or "").lower()
+                unit_map = {
+                    'tenths': 1,
+                    'hundredths': 2,
+                    'thousandths': 3,
+                    'ones': 0,
+                    'tens': -1,
+                    'hundreds': -2,
+                    'thousands': -3,
+                    'millions': -6,
+                    'billions': -9,
+                    'millionths': 6,
+                    'billionths': 9,
+                }
+                ndigits = unit_map.get(unit, None)
+            if ndigits is None:
+                ndigits = 0
+            steps.append(CleaningStep(action="numeric_transform", column=col, params={"operation": "round", "ndigits": ndigits}))
+            return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
+    except Exception:
+        pass
     t = _norm(text)
+    # Early detection: catch move-like instructions that name multiple columns
+    try:
+        if re.search(r"\b(?:put|move|copy|transfer)\b", t, flags=re.IGNORECASE) and len(resolved_mentioned) >= 2 and not re.search(r"columns?", t, flags=re.IGNORECASE):
+            # order mentioned columns by position in the original text
+            positions = []
+            for col in mentioned:
+                try:
+                    pos = [m.start() for m in re.finditer(re.escape(col), text, flags=re.IGNORECASE)][0]
+                except Exception:
+                    pos = text.lower().find(col.lower())
+                positions.append((col, pos))
+            positions.sort(key=lambda x: x[1])
+            cols_ordered = [ _resolve_name(c) for c, _ in positions if c ]
+            src_cols = cols_ordered[:-1]
+            tgt_col = cols_ordered[-1]
+            # infer type hint from text
+            if re.search(r"non|not", t) and re.search(r"num|digit|number|numeric", t):
+                typ = "string"
+            elif re.search(r"num|digit|number|numeric", t):
+                typ = "numeric"
+            elif re.search(r"string|text|char|alpha", t):
+                typ = "string"
+            else:
+                typ = "string"
+            for s in src_cols:
+                params = {"source": s, "target": tgt_col, "type": typ, "exceptions": [], "replacement": ""}
+                steps.append(CleaningStep(action="move_by_type", column=None, params=params))
+            return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
+    except Exception:
+        pass
     # Detect explicit date-normalization requests like:
     # "Convert the order_date column to YYYY-MM-DD" or
     # "Make all the values in the order_date column year-month-day"
@@ -313,7 +715,8 @@ def recipe_from_plain_english(text: str, profile: Dict[str, Dict[str, Any]], sou
         join_match = re.findall(r"join\s+([a-zA-Z0-9_\.\/-]+)\s+with\s+([a-zA-Z0-9_\.\/-]+)\s+on\s+([a-zA-Z0-9_ ]+)", t)
         if join_match:
             left, right, key = join_match[0]
-            steps.append(CleaningStep(action="join", params={"left": left, "right": right, "keys": [key.strip()], "fuzzy": True}))
+            steps.append(CleaningStep(action="join", column=None, params={"left": left, "right": right, "keys": [key.strip()], "fuzzy": True}))
+            return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
         greater = re.findall(r">\s*(\d+(?:\.\d+)?)\s*:\s*([a-zA-Z0-9_ -]+)", t)
         for val, label in greater:
             buckets.append({"min": float(val), "max": None, "label": label.strip()})
@@ -484,6 +887,38 @@ def recipe_from_plain_english(text: str, profile: Dict[str, Dict[str, Any]], sou
         except Exception:
             pass
 
+        # Detect explicit move instructions with multiple source columns, e.g.
+        # "Put all non-numerical values in the postal_code and col_6 columns into the city column"
+        try:
+            for m_multi in re.finditer(r"put\s+all\s+([a-zA-Z0-9_\- ]+?)\s+values\s+(?:in|from|of)?\s+([a-zA-Z0-9_ ,and]+?)\s+columns?\s*(?:into|in|to)?\s*(?:the\s+)?([a-zA-Z0-9_ ]+)\s+column", t, flags=re.IGNORECASE):
+                type_token = (m_multi.group(1) or "").strip()
+                src_list = m_multi.group(2) or ""
+                tgt_raw = (m_multi.group(3) or "").strip()
+                tgt = _resolve_name(tgt_raw)
+
+                # normalize type hints
+                tt = type_token.lower()
+                if re.search(r"non|not", tt) and re.search(r"num|digit|number|numeric", tt):
+                    typ = "string"
+                elif re.search(r"num|digit|number|numeric", tt):
+                    typ = "numeric"
+                elif re.search(r"string|text|char|alpha", tt):
+                    typ = "string"
+                else:
+                    # default to string when unsure
+                    typ = "string"
+
+                # split source list by commas/and
+                parts = [re.sub(r"\b(the|columns|column)\b", "", p, flags=re.IGNORECASE).strip() for p in re.split(r",|\band\b", src_list) if p and p.strip()]
+                for s in parts:
+                    src_col = _resolve_name(s)
+                    params = {"source": src_col, "target": tgt, "type": typ, "exceptions": [], "replacement": ""}
+                    steps.append(CleaningStep(action="move_by_type", column=None, params=params))
+                if parts:
+                    return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
+        except Exception:
+            pass
+
     # Try strict patterns first to capture '... values of the COL column in the COL column'
     moves = []
     strict1 = re.compile(r"(string|text|numeric|numerical|number|numbers)\s+(?:values|entries)?\s+of\s+the\s+([A-Za-z0-9_]+)\s+column\s*(?:except\s+([^,\.]+?)\s*)?(?:in|into|to)\s+the\s+([A-Za-z0-9_]+)\s+column", flags=re.IGNORECASE)
@@ -503,7 +938,7 @@ def recipe_from_plain_english(text: str, profile: Dict[str, Dict[str, Any]], sou
     # Fallback: split into clauses and try a relaxed pattern per clause
     if not moves:
         clauses = re.split(r"\band\b|,", t)
-        move_simple = re.compile(r"(?:put|move|copy)\s+all\s+(string|text|numeric|numerical|number|numbers)\s*(?:values|entries)?(?:\s+of\s+the|\s+of)?\s*([a-zA-Z0-9_ ]+?)\s*(?:column)?\s*(?:except\s+([^,\.]+?)\s*)?.*?(?:in|into|to)\s+([a-zA-Z0-9_ ]+)", flags=re.IGNORECASE)
+        move_simple = re.compile(r"(?:put|move|copy)\s+(?:all\s+)?(string|text|numeric|numerical|number|numbers)\s*(?:values|entries)?(?:\s+of\s+the|\s+of)?\s*([a-zA-Z0-9_ ]+?)\s*(?:column)?\s*(?:except\s+([^,\.]+?)\s*)?.*?(?:in|into|to)\s+([a-zA-Z0-9_ ]+)", flags=re.IGNORECASE)
         for cl in clauses:
             m = move_simple.search(cl)
             if not m:
@@ -540,6 +975,59 @@ def recipe_from_plain_english(text: str, profile: Dict[str, Dict[str, Any]], sou
                 continue
             steps.append(CleaningStep(action="move_by_type", column=None, params=m))
         return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
+
+    # Extended conditional parsing: support multiple 'if ... then ...' and '... when ...' clauses
+    try:
+        # form: if CONDITION then ACTION; allow multiple occurrences
+        for mm in re.finditer(r"(?:if|when)\s+(.+?)\s+then\s+(.+?)(?:;|$)", text, flags=re.IGNORECASE | re.DOTALL):
+            cond_txt = mm.group(1)
+            action_txt = mm.group(2).strip()
+            cond = _parse_condition_text(cond_txt)
+            # expand the action_txt into concrete steps and attach condition to each
+            try:
+                inner = recipe_from_plain_english(action_txt, profile, source_path, output_path)
+                for inner_step in inner.cleaning_steps:
+                    p = dict(inner_step.params or {})
+                    p['condition'] = cond
+                    steps.append(CleaningStep(action=inner_step.action, column=inner_step.column, params=p))
+                # also keep an explicit conditional step for explainability/tests
+                steps.append(CleaningStep(action="conditional", column=None, params={"condition": cond, "action_text": action_txt}))
+            except Exception:
+                params = {"condition": cond, "action_text": action_txt}
+                steps.append(CleaningStep(action="conditional", column=None, params=params))
+        # form: ACTION when CONDITION (e.g. 'normalize name when age > 18')
+        for mm in re.finditer(r"(.+?)\s+when\s+(.+?)(?:;|$)", text, flags=re.IGNORECASE | re.DOTALL):
+            action_txt = mm.group(1).strip()
+            cond_txt = mm.group(2).strip()
+            # avoid catching 'fill X with Y' earlier patterns as ACTION when CONDITION if already parsed
+            if len(action_txt) < 3:
+                continue
+            cond = _parse_condition_text(cond_txt)
+            try:
+                inner = recipe_from_plain_english(action_txt, profile, source_path, output_path)
+                for inner_step in inner.cleaning_steps:
+                    p = dict(inner_step.params or {})
+                    p['condition'] = cond
+                    steps.append(CleaningStep(action=inner_step.action, column=inner_step.column, params=p))
+                steps.append(CleaningStep(action="conditional", column=None, params={"condition": cond, "action_text": action_txt}))
+            except Exception:
+                params = {"condition": cond, "action_text": action_txt}
+                steps.append(CleaningStep(action="conditional", column=None, params=params))
+        if any(s.action == "conditional" for s in steps):
+            return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
+    except Exception:
+        pass
+
+    # Special-case removal of letters/characters within values (not column drop).
+    # e.g. "Remove any letters in the values in the quantity column" -> regex_replace
+    try:
+        m_letters = re.search(r"remove\s+(?:any|all|the)?\s*letters?\s+(?:in|from|of)\s+(?:the\s+)?([a-zA-Z0-9_ ]+)(?:\s+column)?", text, flags=re.IGNORECASE)
+        if m_letters:
+            col = _resolve_name(m_letters.group(1).strip())
+            steps.append(CleaningStep(action="regex_replace", column=col, params={"pattern": r"[A-Za-z]+", "replace": ""}))
+            return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
+    except Exception:
+        pass
 
     if action == "drop_column":
         for column in suggested_columns[:1]:
@@ -745,9 +1233,58 @@ def recipe_from_plain_english(text: str, profile: Dict[str, Dict[str, Any]], sou
         if mentioned:
             targets = mentioned
         else:
-            targets = suggested_columns[:3]
-        for column in targets:
-            steps.append(CleaningStep(action="normalize", column=column, params={"case": "lower" if any(k in t for k in ["lower", "lowercase"]) else "preserve"}))
+            # attempt to prefer columns present in reconstructed preview (e.g., 'username')
+            preview_cols = []
+            try:
+                from .engine import _read_table, Cleaner
+                df_raw = _read_table(source_path)
+                recon = Cleaner()._reconstruct_table_from_df(df_raw, offset=0, limit=1)
+                if recon and isinstance(recon, list) and len(recon) > 0:
+                    preview_cols = [k for k in recon[0].keys()]
+            except Exception:
+                preview_cols = []
+
+            # if username present in preview, target it explicitly
+            if preview_cols:
+                for k in preview_cols:
+                    lk = k.lower()
+                    if lk == 'username' or 'user' in lk or ('name' in lk and not any(x in lk for x in ('first','last','firstname','lastname'))):
+                        targets = [k]
+                        break
+                else:
+                    # prefer suggested columns that appear in preview, and favor string-like columns
+                    prefs = [c for c in suggested_columns if c in preview_cols]
+                    # prefer up to 5 targets for broader coverage when user is vague
+                    targets = prefs[:5]
+                    if not targets:
+                        targets = suggested_columns[:5]
+            else:
+                # prefer string-like columns first, else fall back to suggested columns
+                string_cols = [c for c, m in profile.items() if any(x in str(m.get('dtype','')).lower() for x in ('utf','str','object'))]
+                if string_cols:
+                    targets = [c for c in suggested_columns if c in string_cols][:5] or suggested_columns[:5]
+                else:
+                    targets = suggested_columns[:5]
+            for column in targets:
+                # detect explicit 'first letter' capitalization requests
+                if re.search(r"first\s+letter|only\s+the\s+first|capitalize\s+first\s+letter|make\s+first\s+letter\s+capital", t, flags=re.IGNORECASE):
+                    case = "capitalize"
+                elif any(k in t for k in ["title case", "titlecase", "title case", "capitalize each word", "proper case"]):
+                    case = "title"
+                elif any(k in t for k in ["upper", "uppercase"]):
+                    case = "upper"
+                elif any(k in t for k in ["trim", "strip", "whitespace", "leading", "trailing"]):
+                    # If user explicitly requests trim-only, perform trim
+                    case = "trim"
+                else:
+                    case = "lower" if any(k in t for k in ["lower", "lowercase"]) else "preserve"
+                # prepend a trim step if not already just trimming and the user likely meant whitespace cleanup
+                try:
+                    if case != 'trim' and any(k in t for k in ['trim', 'strip', 'whitespace']):
+                        steps.append(CleaningStep(action="normalize", column=column, params={"case": "trim"}))
+                except Exception:
+                    pass
+                steps.append(CleaningStep(action="normalize", column=column, params={"case": case}))
     elif action == "deduplicate":
         # Comprehensive impute phrase handling used by data analysts
         # Examples handled:
@@ -924,13 +1461,46 @@ def recipe_from_plain_english(text: str, profile: Dict[str, Dict[str, Any]], sou
             if buckets:
                 steps.append(CleaningStep(action="bucketize", column=colm.group(1).strip(), params={"buckets": buckets}))
     else:
-        # Default behavior for vague instructions: target the most problematic columns.
+        # For vague instructions, avoid auto-normalizing columns (don't lowercase strings).
+        # Only suggest imputation for columns that clearly need it (have nulls).
         for column, _, _ in suggest_columns_to_clean(profile, top_n=3):
             meta = profile.get(column, {})
             if int(meta.get("nulls", 0) or 0) > 0:
                 steps.append(CleaningStep(action="impute", column=column, params={"strategy": _default_strategy_for_column(meta)}))
-            else:
-                steps.append(CleaningStep(action="normalize", column=column, params={"case": "lower"}))
+
+    # Fallback: if the intent was normalize but no steps were produced by earlier heuristics,
+    # create a conservative normalize step targeting the top suggested columns.
+    try:
+        if action == "normalize" and not steps:
+            cols = []
+            try:
+                if mentioned:
+                    cols = mentioned
+                else:
+                    cols = [c for c, _, _ in (infer_columns_from_text(text, profile, top_n=5) or [])]
+            except Exception:
+                cols = []
+            if not cols and suggested_columns:
+                cols = suggested_columns[:5]
+            # default case: lower unless user requested upper/title/capitalize/trim
+            case = "lower"
+            try:
+                if any(k in t for k in ["title case", "titlecase", "title", "proper case", "capitalize each word"]):
+                    case = "title"
+                elif any(k in t for k in ["capitalize", "capitalise", "first letter"]):
+                    case = "capitalize"
+                elif any(k in t for k in ["upper", "uppercase"]):
+                    case = "upper"
+                elif any(k in t for k in ["trim", "strip", "whitespace", "leading", "trailing"]):
+                    case = "trim"
+            except Exception:
+                pass
+            for c in cols:
+                if case != 'trim' and any(k in t for k in ['trim', 'strip', 'whitespace']):
+                    steps.append(CleaningStep(action="normalize", column=c, params={"case": "trim"}))
+                steps.append(CleaningStep(action="normalize", column=c, params={"case": case}))
+    except Exception:
+        pass
 
     return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
 
@@ -997,22 +1567,63 @@ def explain_recipe(recipe: Recipe, profile: Optional[Dict[str, Dict[str, Any]]] 
                     reason = f"{col} is explicit in the recipe and will be removed exactly."
                     confidence = 0.95
                 else:
-                    reason = f"{step.action} on {col} is applied literally as specified."
-                    confidence = 0.7
-            else:
-                if step.action == "impute":
-                    step.params = dict(step.params or {}, strategy=step.params.get("strategy") if step.params else "median")
-                    reason = "No column profile match found; defaulting to the first plausible imputation strategy."
-                    confidence = 0.35
-                elif step.action == "normalize":
-                    reason = "No matching column profile found; normalization is applied only if the column exists."
-                    confidence = 0.4
-                elif step.action == "drop_column":
-                    reason = "No profile match found; drop is only safe when the column name is exact."
-                    confidence = 0.35
-                else:
-                    reason = "This step is underspecified and only a deterministic literal execution is possible."
-                    confidence = 0.3
+                    # Add richer explanations for non-impute/normalize/drop steps
+                    if step.action == "cast":
+                        fmt = step.params.get("format") if step.params else None
+                        reason = f"Convert {col} to {step.params.get('to_type','datetime')}{(' with format '+fmt) if fmt else ''}."
+                        confidence = 0.85
+                    elif step.action == "move_by_type":
+                        p = step.params or {}
+                        reason = f"Move values of type {p.get('type','string')} from {p.get('source')} to {p.get('target')}."
+                        confidence = 0.7
+                    elif step.action == "swap_by_types":
+                        reason = f"Swap/move values between columns as specified by types in the step."
+                        confidence = 0.75
+                    elif step.action == "remove_by_type":
+                        reason = f"Remove values matching type criteria from {col}."
+                        confidence = 0.7
+                    elif step.action == "map":
+                        reason = f"Map specific values in {col} according to provided mapping."
+                        confidence = 0.8
+                    elif step.action == "regex_replace":
+                        reason = f"Apply regex replacement on {col} to clean/standardize patterns."
+                        confidence = 0.8
+                    elif step.action == "bucketize":
+                        reason = f"Bucketize numeric ranges in {col} into labeled bins."
+                        confidence = 0.8
+                    elif step.action == "conditional":
+                        reason = f"Conditionally set values in {col} based on the provided predicate."
+                        confidence = 0.7
+                    elif step.action == "join":
+                        reason = f"Join datasets using keys; this step may be fuzzy if requested."
+                        confidence = 0.75
+                    elif step.action == "fuzzy_join":
+                        reason = f"Perform a fuzzy/approximate join on the specified keys."
+                        confidence = 0.7
+                    elif step.action == "deduplicate":
+                        reason = "Remove duplicate rows using the specified keys or heuristics."
+                        confidence = 0.8
+                    elif step.action == "regex_replace":
+                        reason = f"Apply regex replacement to the target column to clean/standardize patterns."
+                        confidence = 0.75
+                    elif step.action == "bucketize":
+                        reason = f"Bucketize numeric ranges into labeled bins as requested."
+                        confidence = 0.75
+                    elif step.action == "conditional":
+                        reason = "This is a conditional step; apply the action only where the condition holds."
+                        confidence = 0.6
+                    elif step.action == "join" or step.action == "fuzzy_join":
+                        reason = "Join datasets using specified keys; fuzzy matching may be used if requested."
+                        confidence = 0.7
+                    elif step.action == "deduplicate":
+                        reason = "Remove duplicate rows using the specified keys or heuristics."
+                        confidence = 0.8
+                    elif step.action == "rename":
+                        reason = "Rename columns as specified in the recipe."
+                        confidence = 0.9
+                    else:
+                        reason = "This step is underspecified and only a deterministic literal execution is possible."
+                        confidence = 0.3
 
             # attach explanation; include column information in the step for clarity
             s_copy = step

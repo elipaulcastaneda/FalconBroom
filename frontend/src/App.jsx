@@ -2,6 +2,23 @@ import React, {useMemo, useRef, useState, useEffect} from "react"
 import { BACKEND } from './config'
 import authFetch from './utils/authFetch'
 import PrivacyAdmin from './PrivacyAdmin'
+
+function PathBasename(p){
+  try{
+    if(!p) return ''
+    const parts = String(p).split(/\\|\//)
+    return parts[parts.length-1]
+  }catch(e){ return p }
+}
+
+function DownloadLink({ url, label }){
+  return (
+    <button onClick={(e)=>{ try{ window.open(url) }catch(err){ window.location.href = url } }}
+      style={{background:'none',border:'none',padding:0,color:'var(--link)',textDecoration:'underline',cursor:'pointer'}}>
+      {label}
+    </button>
+  )
+}
 const NAV_ITEMS = [
   { section: "Start", id: "source", label: "Source", detail: "Profile and prompt to recipe", icon: "⟡" },
   { section: "Start", id: "uploads", label: "Uploads", detail: "Saved uploads", icon: "⇪" },
@@ -169,6 +186,16 @@ export default function App() {
   const [signupUsername, setSignupUsername] = useState('')
   const [signupEmail, setSignupEmail] = useState('')
   const [signupPassword, setSignupPassword] = useState('')
+  const [signupRole, setSignupRole] = useState('member')
+  const [adminUserIdInput, setAdminUserIdInput] = useState('')
+  const [adminRoleInput, setAdminRoleInput] = useState('member')
+  const [adminActionMsg, setAdminActionMsg] = useState('')
+  const [adminActionLoading, setAdminActionLoading] = useState(false)
+  const [adminUsers, setAdminUsers] = useState([])
+  const [adminQuery, setAdminQuery] = useState('')
+  const [adminLoadingUsers, setAdminLoadingUsers] = useState(false)
+  const [adminDropdownOpen, setAdminDropdownOpen] = useState(false)
+  const [adminDropdownIndex, setAdminDropdownIndex] = useState(-1)
   const [loginIdentity, setLoginIdentity] = useState('')
   const [loginPassword, setLoginPassword] = useState('')
   const [teamName, setTeamName] = useState('')
@@ -178,6 +205,28 @@ export default function App() {
   const [sharedUploads, setSharedUploads] = useState([])
   useEffect(()=>{
     if (accountUser) loadDsarPropagation()
+  }, [accountUser])
+
+  async function loadAdminUsers(q=''){
+    try{
+      setAdminLoadingUsers(true)
+      const url = `${BACKEND}/admin/users` + (q ? `?q=${encodeURIComponent(q)}` : '')
+      const res = await authFetch(url)
+      if(!res.ok){ const t = await res.text(); setAdminUsers([]); addToast('Failed to load users: '+t,'error'); return }
+      const j = await res.json()
+      setAdminUsers(j.users || [])
+    }catch(e){ addToast('Load users error: '+e.message,'error'); setAdminUsers([]) }
+    finally{ setAdminLoadingUsers(false) }
+  }
+
+  useEffect(()=>{
+    try{
+      if(accountUser && (accountUser.role === 'admin' || accountUser.is_admin)){
+        loadAdminUsers('')
+      }else{
+        setAdminUsers([])
+      }
+    }catch(e){}
   }, [accountUser])
 
   // show a welcome-back banner after login if the user had manually signed out earlier
@@ -234,6 +283,7 @@ export default function App() {
   const [deleteTarget, setDeleteTarget] = useState(null)
   const [deleteConfirmText, setDeleteConfirmText] = useState('')
   const [previewRows, setPreviewRows] = useState(6)
+  const [previewAddRowIndex, setPreviewAddRowIndex] = useState(false)
   const [showDedupeConfirm, setShowDedupeConfirm] = useState(false)
   const [dedupeConfirmText, setDedupeConfirmText] = useState('')
   const [candidateColumns, setCandidateColumns] = useState([])
@@ -311,6 +361,30 @@ export default function App() {
 
   const activeItem = NAV_ITEMS.find((item) => item.id === activeTab) || NAV_ITEMS[0]
 
+  const ADMIN_NAV_ITEM = { section: "Account", id: "admin_metrics", label: "Admin", detail: "Metrics & monitoring", icon: "⚑" }
+
+  const navItemsToRender = useMemo(() => {
+    try {
+      const base = NAV_ITEMS.slice()
+      // show admin nav when logged-in user is admin
+      if (accountUser && (accountUser.role === 'admin' || accountUser.is_admin)) {
+        if (!base.find((i) => i.id === ADMIN_NAV_ITEM.id)) base.push(ADMIN_NAV_ITEM)
+      }
+      // also show admin nav when an ADMIN_TOKEN is supplied to the desktop app
+      try {
+        const hasAdminToken = typeof window !== 'undefined' && (
+          !!window.localStorage.getItem('ADMIN_TOKEN') ||
+          !!window.localStorage.getItem('admin_token') ||
+          !!window.localStorage.getItem('falconbroom_admin_token')
+        )
+        if (hasAdminToken && !base.find((i) => i.id === ADMIN_NAV_ITEM.id)) base.push(ADMIN_NAV_ITEM)
+      } catch (e) {
+        // ignore access errors
+      }
+      return base
+    } catch (e) { return NAV_ITEMS }
+  }, [accountUser])
+
   const themeClass = theme === "light" ? "theme-light" : "theme-dark"
 
   function persistTheme(nextTheme) {
@@ -327,6 +401,156 @@ export default function App() {
     const trimmed = nextHistory.slice(0, 8)
     setUploadHistory(trimmed)
     window.localStorage.setItem("falconbroom-upload-history", JSON.stringify(trimmed))
+  }
+
+  // Admin metrics dashboard: parses Prometheus metrics and shows key values
+  function AdminMetricsView() {
+    const [metricsText, setMetricsText] = useState('Loading metrics...')
+    const [parsed, setParsed] = useState(null)
+    const [autoRefresh, setAutoRefresh] = useState(true)
+    const [lastRefreshedAt, setLastRefreshedAt] = useState(null)
+    useEffect(() => {
+      let cancelled = false
+      async function load() {
+        try {
+          const res = await authFetch(`${BACKEND}/metrics`)
+          if (!res.ok) {
+            const t = await res.text()
+            if (!cancelled) setMetricsText('Metrics not available: ' + res.status + ' ' + t)
+            return
+          }
+          const txt = await res.text()
+          if (!cancelled) setMetricsText(txt)
+          // parse Prometheus text format
+          const lines = txt.split(/\r?\n/)
+          const metrics = {}
+          for (let l of lines) {
+            l = l.trim()
+            if (!l || l.startsWith('#')) continue
+            // split name/labels and value
+            const m = l.match(/^(\w+)(\{[^}]*\})?\s+(\S+)$/)
+            if (!m) continue
+            const name = m[1]
+            const labelsRaw = m[2]
+            const value = Number(m[3])
+            const labels = {}
+            if (labelsRaw) {
+              const inner = labelsRaw.slice(1, -1)
+              // split by comma but ignore commas inside quotes
+              const parts = inner.match(/(\w+)="([^"]*)"/g) || []
+              parts.forEach(p => {
+                const mm = p.match(/(\w+)="([^"]*)"/)
+                if (mm) labels[mm[1]] = mm[2]
+              })
+            }
+            if (!metrics[name]) metrics[name] = []
+            metrics[name].push({ labels, value })
+          }
+          // compute summaries
+          const previewReq = (metrics['fbroom_preview_requests_total'] || []).reduce((s, e) => s + (isNaN(e.value) ? 0 : e.value), 0)
+          const previewWarn = (metrics['fbroom_preview_warnings_total'] || []).reduce((s, e) => s + (isNaN(e.value) ? 0 : e.value), 0)
+          const runs = metrics['fbroom_recipe_runs_total'] || []
+          const runsByStatus = {}
+          const runsByRecipe = {}
+          runs.forEach(r => {
+            const status = r.labels.status || 'unknown'
+            const rid = r.labels.recipe_id || 'unknown'
+            runsByStatus[status] = (runsByStatus[status] || 0) + (isNaN(r.value) ? 0 : r.value)
+            runsByRecipe[rid] = (runsByRecipe[rid] || 0) + (isNaN(r.value) ? 0 : r.value)
+          })
+          const topRecipes = Object.entries(runsByRecipe).sort((a,b)=>b[1]-a[1]).slice(0,10)
+          if (!cancelled) setParsed({ previewReq, previewWarn, runsByStatus, topRecipes, raw: metrics })
+          if (!cancelled) setLastRefreshedAt(new Date().toISOString())
+        } catch (e) {
+          if (!cancelled) setMetricsText('Metrics fetch failed: ' + e.message)
+        }
+      }
+      // auto-refresh on document processed events
+      const handler = () => { load() }
+      try { window.addEventListener('fbroom:documentProcessed', handler) } catch (e) {}
+
+      // periodic refresh every 30s when enabled
+      let iv = null
+      function startInterval() {
+        try {
+          iv = setInterval(() => { load() }, 30000)
+        } catch (e) { iv = null }
+      }
+
+      load()
+      if (autoRefresh) startInterval()
+
+      return () => {
+        cancelled = true
+        try { window.removeEventListener('fbroom:documentProcessed', handler) } catch (e) {}
+        try { if (iv) clearInterval(iv) } catch (e) {}
+      }
+    }, [autoRefresh])
+
+    if (!parsed) {
+      return (
+        <Card eyebrow="Admin" title="Metrics" subtitle="Prometheus metrics endpoint">
+          <pre className="json-block json-block-soft">{metricsText}</pre>
+        </Card>
+      )
+    }
+
+    return (
+      <div>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:8}}>
+          <h3 style={{margin:0}}>Metrics Dashboard</h3>
+          <div style={{display:'flex',alignItems:'center',gap:12}}>
+            <label style={{fontSize:'0.9rem',color:'var(--muted)'}}>
+              <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(Boolean(e.target.checked))} /> Auto-refresh (30s)
+            </label>
+            {lastRefreshedAt ? <small style={{color:'var(--muted)'}}>Last: {new Date(lastRefreshedAt).toLocaleTimeString()}</small> : null}
+          </div>
+        </div>
+
+        <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:12}}>
+          <Card eyebrow="Preview" title="Preview requests" subtitle="Total preview requests">
+            <Stat label="Requests" value={String(parsed.previewReq)} tone="teal" />
+            <Stat label="Warnings" value={String(parsed.previewWarn)} tone="amber" />
+          </Card>
+
+          <Card eyebrow="Runs" title="Recipe runs" subtitle="Aggregated by status">
+            <div style={{display:'flex',flexDirection:'column',gap:6}}>
+              {Object.entries(parsed.runsByStatus).length === 0 ? (
+                <div className="empty-state">No run metrics yet</div>
+              ) : (
+                Object.entries(parsed.runsByStatus).map(([s,c]) => (
+                  <div key={s} style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                    <div style={{textTransform:'capitalize'}}>{s}</div>
+                    <div><strong>{String(c)}</strong></div>
+                  </div>
+                ))
+              )}
+            </div>
+          </Card>
+
+          <Card eyebrow="Top" title="Top recipes" subtitle="By run count (last scrape)">
+            {parsed.topRecipes.length === 0 ? (
+              <div className="empty-state">No recipes</div>
+            ) : (
+              <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                {parsed.topRecipes.map(([rid, count]) => (
+                  <div key={rid} style={{display:'flex',justifyContent:'space-between'}}>
+                    <div style={{overflow:'hidden',textOverflow:'ellipsis'}}>{rid}</div>
+                    <div><strong>{String(count)}</strong></div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
+        </div>
+
+        <div style={{marginTop:12}}>
+          <Card eyebrow="Raw" title="Raw metrics" subtitle="Prometheus text">
+            <pre className="json-block json-block-soft" style={{whiteSpace:'pre-wrap',maxHeight:320,overflow:'auto'}}>{metricsText}</pre>
+          </Card>
+        </div>
+      </div>
+    )
   }
 
   async function doInspectSource(nextPath, nextOffset = 0) {
@@ -365,6 +589,12 @@ export default function App() {
         // ignore profile build errors
       }
       setInspectOffset(nextOffset)
+      try {
+        // notify admin dashboard that a document was processed/inspected
+        if (typeof window !== 'undefined' && window.dispatchEvent) {
+          window.dispatchEvent(new CustomEvent('fbroom:documentProcessed', { detail: { path: nextPath } }))
+        }
+      } catch (e) {}
     // mark last refreshed on uploads list for UI
     setUploadsList((list) => {
       if (!list) return list
@@ -403,6 +633,11 @@ export default function App() {
       const profilePayload = await profileRes.json()
       setProfile(profilePayload.profile)
       await doInspectSource(nextPath, 0)
+      try {
+        if (typeof window !== 'undefined' && window.dispatchEvent) {
+          window.dispatchEvent(new CustomEvent('fbroom:documentProcessed', { detail: { path: nextPath } }))
+        }
+      } catch (e) {}
     } catch (err) {
       console.error('Profile request failed', err)
       addToast('Profile request failed: ' + (err.message || String(err)), 'error', 6000)
@@ -414,14 +649,18 @@ export default function App() {
   useEffect(() => {
     async function fetchMe() {
       let token = authToken || window.localStorage.getItem('falconbroom_access_token')
+      try { console.debug('fetchMe: initial token present?', !!token) } catch (e) {}
       if (!token) {
         // try to refresh via httpOnly cookie
         try {
+          try { console.debug('fetchMe: attempting /refresh because no token') } catch (e) {}
           const rres = await fetch(`${BACKEND}/refresh`, { method: 'POST', credentials: 'include' })
+          try { console.debug('fetchMe: /refresh status', rres.status) } catch (e) {}
           if (rres.ok) {
             const jr = await rres.json()
             token = jr.access_token
             saveToken(token)
+            try { console.debug('fetchMe: obtained access token from /refresh') } catch (e) {}
           }
         } catch (e) {
           // ignore
@@ -484,9 +723,14 @@ export default function App() {
               <input value={signupEmail} onChange={(e)=>setSignupEmail(e.target.value)} placeholder="you@example.com" />
               <label style={{marginTop:8}}>Password</label>
               <input type="password" value={signupPassword} onChange={(e)=>setSignupPassword(e.target.value)} placeholder="password" />
+              <label style={{marginTop:8}}>Role</label>
+              <select value={signupRole} onChange={(e)=>setSignupRole(e.target.value)}>
+                <option value="member">Member</option>
+                <option value="admin">Admin</option>
+              </select>
               <div style={{marginTop:12,display:'flex',gap:8}}>
                 <button className="primary" onClick={doSignup}>Create account</button>
-                <button onClick={()=>{ setSignupUsername(''); setSignupEmail(''); setSignupPassword('') }}>Clear</button>
+                <button onClick={()=>{ setSignupUsername(''); setSignupEmail(''); setSignupPassword(''); setSignupRole('member') }}>Clear</button>
               </div>
             </div>
           </div>
@@ -655,14 +899,14 @@ export default function App() {
 
   async function doSignup() {
     try {
-      const res = await fetch(`${BACKEND}/signup`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: signupUsername, email: signupEmail, password: signupPassword }) })
+      const res = await fetch(`${BACKEND}/signup`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: signupUsername, email: signupEmail, password: signupPassword, role: signupRole }) })
       if (!res.ok) {
         const txt = await res.text()
         addToast('Signup failed: ' + txt, 'error')
         return
       }
       addToast('Account created — please log in', 'success')
-      setSignupUsername(''); setSignupEmail(''); setSignupPassword('')
+      setSignupUsername(''); setSignupEmail(''); setSignupPassword(''); setSignupRole('member')
     } catch (e) { addToast('Signup error: ' + e.message, 'error') }
   }
 
@@ -676,6 +920,8 @@ export default function App() {
       }
       const j = await res.json()
       saveToken(j.access_token)
+      // In dev, server may return refresh_token for local fallback; store it in localStorage
+      try { if (j.refresh_token) { window.localStorage.setItem('falconbroom_refresh_token', j.refresh_token) } } catch (e) {}
       setLoginIdentity(''); setLoginPassword('')
       addToast('Logged in', 'success')
     } catch (e) { addToast('Login error: ' + e.message, 'error') }
@@ -689,6 +935,7 @@ export default function App() {
     setAccountUser(null); setAuthToken(''); try { window.localStorage.removeItem('falconbroom_access_token') } catch {}
     // refresh cookie cleared by server during logout
     try { window.localStorage.setItem('fb_manual_signed_out', '1') } catch (e) {}
+    try { window.localStorage.removeItem('falconbroom_refresh_token') } catch (e) {}
     addToast('Logged out', 'info')
   }
 
@@ -1437,6 +1684,13 @@ export default function App() {
       }
       // store only the generated recipe for the Generated recipe panel
       setRecipeFromText(recipeObj)
+      // also populate the editable recipe text so Preview callers always have the generated steps
+      try {
+        const safeRecipeJson = JSON.stringify(sanitizeRecipe(recipeObj), null, 2)
+        setRecipeText(safeRecipeJson)
+      } catch (e) {
+        // ignore formatting errors and leave recipeText unchanged
+      }
       // if multiple candidate columns, ask for confirmation before applying
         if (j.column_candidates && j.column_candidates.length > 1) {
         // filter out metadata columns (underscore-prefixed or known meta keys)
@@ -1663,6 +1917,17 @@ export default function App() {
       if (nParam != null) qs.push(`n=${encodeURIComponent(nParam)}`)
       if (recipeId) qs.push(`recipe_id=${encodeURIComponent(recipeId)}`)
       const url = `${BACKEND}/preview${qs.length ? `?${qs.join('&')}` : ''}`
+      // ensure recipe targets the currently selected source path to avoid previewing a different upload
+      try {
+        if (recipe && Array.isArray(recipe.sources)) {
+          if (!recipe.sources[0] || recipe.sources[0].path !== path) {
+            recipe.sources = [{ path: path }]
+          }
+        } else {
+          recipe = { ...(recipe || {}), sources: [{ path: path }] }
+        }
+      } catch (e) {}
+
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2231,14 +2496,19 @@ export default function App() {
         return
       }
       const cols = selectedColumns && selectedColumns.length > 0 ? selectedColumns : Object.keys(rows[0])
+      const includeIndex = !!previewAddRowIndex
       const escapeCell = (v) => {
         if (v === null || v === undefined) return ''
         const s = String(v)
         if (s.includes('"') || s.includes(',') || s.includes('\n')) return '"' + s.replace(/"/g, '""') + '"'
         return s
       }
-      const header = cols.join(',')
-      const csv = [header, ...rows.map(r => cols.map(c => escapeCell(r[c] ?? '')).join(','))].join('\n')
+      const header = (includeIndex ? ['#', ...cols] : cols).join(',')
+      const csvRows = rows.map((r, idx) => {
+        const rowVals = cols.map(c => escapeCell(r[c] ?? ''))
+        return includeIndex ? [String(idx+1), ...rowVals].join(',') : rowVals.join(',')
+      })
+      const csv = [header, ...csvRows].join('\n')
       const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
@@ -2478,7 +2748,7 @@ export default function App() {
                         <div>Started: {r.started_at}</div>
                         {r.finished_at && <div>Finished: {r.finished_at}</div>}
                         {r.output_path && (
-                          <div>Output: <small>{r.output_path}</small> <a href={`${BACKEND}/download?path=${encodeURIComponent(r.output_path)}`} target="_blank" rel="noreferrer">Download</a></div>
+                          <div>Output: <small>{r.output_path}</small> <DownloadLink url={`${BACKEND}/download?path=${encodeURIComponent(r.output_path)}`} label="Download" /></div>
                         )}
                         {r.warnings && <div style={{color:'#f59e0b'}}>Warnings: {JSON.stringify(r.warnings)}</div>}
                       </div>
@@ -2777,13 +3047,43 @@ export default function App() {
               <div className="upload-history">
                 {uploadsList.map((item) => (
                   <div key={item.path} className="upload-item-row">
-                    <div style={{flex:'1 1 0'}}>
+                      <div style={{flex:'1 1 0'}}>
                       <div className="upload-item-name">{item.name}</div>
                       <small style={{display:'block',color:'var(--muted)'}}>{item.path}</small>
                       {(item.last_refreshed || item.inspected_at || item.uploadedAt || item.modified_at) && (
                         <small style={{display:'block',color:'var(--muted)',marginTop:4}}>
                           Last refreshed: {new Date(item.last_refreshed || item.inspected_at || item.uploadedAt || item.modified_at).toLocaleString()}
                         </small>
+                      )}
+                      {/* Extra info: row count, warnings, download links, related files */}
+                      {(item.row_count || (item.warnings && item.warnings.length) || (item.related_files && item.related_files.length) || (item.metadata_paths && item.metadata_paths.length)) && (
+                        <div style={{marginTop:8}}>
+                          {item.row_count != null && <small style={{display:'inline-block',marginRight:12}}>Rows: <strong>{item.row_count}</strong></small>}
+                          {item.warnings && item.warnings.length > 0 && <small style={{display:'inline-block',marginRight:12,color:'var(--muted)'}}>Warnings: {item.warnings.length}</small>}
+                                      {item.path && (
+                                        <small style={{display:'inline-block',marginRight:12}}>
+                                          <DownloadLink url={`${BACKEND}/download?path=${encodeURIComponent(item.path)}`} label={'Download CSV'} />
+                                        </small>
+                                      )}
+                          {item.metadata_paths && item.metadata_paths.length > 0 && (
+                            <small style={{display:'block',marginTop:6}}>
+                              {item.metadata_paths.map((mp) => (
+                                <span key={mp} style={{display:'inline-block',marginRight:8}}>
+                                  <DownloadLink url={`${BACKEND}/download?path=${encodeURIComponent(mp)}`} label={'Recipe JSON'} />
+                                </span>
+                              ))}
+                            </small>
+                          )}
+                          {item.related_files && item.related_files.length > 0 && (
+                            <small style={{display:'block',marginTop:6,color:'var(--muted)'}}>
+                              Related: {item.related_files.map((rf, idx) => (
+                                <span key={rf} style={{marginRight:8}}>
+                                  <DownloadLink url={`${BACKEND}/download?path=${encodeURIComponent(rf)}`} label={PathBasename(rf) || rf} />
+                                </span>
+                              ))}
+                            </small>
+                          )}
+                        </div>
                       )}
                     </div>
                     <div style={{display:'flex',gap:8}}>
@@ -2905,6 +3205,14 @@ export default function App() {
           <Card eyebrow="Apply" title="Apply result" subtitle="Confirm what was written to disk after the recipe runs.">
             <JsonBlock value={applyRes} empty="Nothing applied yet." />
           </Card>
+        </div>
+      )
+    }
+
+    if (activeTab === "admin_metrics") {
+      return (
+        <div className="tab-stack tab-panel">
+          <AdminMetricsView />
         </div>
       )
     }
@@ -3053,6 +3361,13 @@ export default function App() {
                         <span style={{fontSize:12,color:'var(--muted)'}}>Password</span>
                         <input type="password" value={signupPassword} onChange={(e)=>setSignupPassword(e.target.value)} placeholder="choose a password" />
                       </label>
+                      <label style={{display:'flex',flexDirection:'column',gap:6,marginTop:8}}>
+                        <span style={{fontSize:12,color:'var(--muted)'}}>Role</span>
+                        <select value={signupRole} onChange={(e)=>setSignupRole(e.target.value)}>
+                          <option value="member">Member</option>
+                          <option value="admin">Admin</option>
+                        </select>
+                      </label>
                       <div style={{marginTop:10}}>
                         <button className="primary" onClick={doSignup}>Create account</button>
                       </div>
@@ -3151,6 +3466,98 @@ export default function App() {
                                   )) : <div style={{fontSize:12,color:'var(--muted)'}}>None</div>}
                                 </div>
                               </div>
+                              {accountUser && (accountUser.role === 'admin' || accountUser.is_admin) && (
+                                <div style={{marginTop:12,borderTop:'1px dashed rgba(255,255,255,0.04)',paddingTop:12}}>
+                                  <h5>Admin: Manage users</h5>
+                                  <div style={{display:'flex',gap:8,alignItems:'center',marginTop:8}}>
+                                    <input placeholder="Search users (id, username, email)" value={adminQuery} onChange={(e)=>setAdminQuery(e.target.value)} />
+                                    <button onClick={async ()=>{ await loadAdminUsers(adminQuery) }}>Search</button>
+                                    <button onClick={async ()=>{ setAdminQuery(''); await loadAdminUsers('') }} style={{marginLeft:8}}>Refresh</button>
+                                  </div>
+                                  <div style={{marginTop:8,display:'flex',gap:12}}>
+                                    <div style={{flex:1,maxHeight:200,overflow:'auto',border:'1px solid rgba(255,255,255,0.03)',padding:8}}>
+                                      {adminLoadingUsers ? <div>Loading...</div> : (
+                                        adminUsers.length===0 ? <div className="empty-state">No users</div> : adminUsers.map(u => (
+                                          <div key={u.id} style={{padding:'6px 0',borderBottom:'1px solid rgba(255,255,255,0.02)',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+                                            <div>
+                                              <div><strong>{u.username}</strong> <small style={{color:'var(--muted)'}}>{u.id}</small></div>
+                                              <div style={{color:'var(--muted)'}}>{u.email || ''} • {u.role || 'member'}</div>
+                                            </div>
+                                            <div style={{display:'flex',gap:8}}>
+                                              <button onClick={()=>{ setAdminUserIdInput(u.id); setAdminRoleInput(u.role || 'member') }}>Select</button>
+                                            </div>
+                                          </div>
+                                        ))
+                                      )}
+                                    </div>
+                                    <div style={{width:320}}>
+                                      <div style={{display:'flex',gap:8,alignItems:'center'}}>
+                                        <div style={{position:'relative',flex:1}}>
+                                          <input
+                                            placeholder="search or paste user id (e.g. user_abc123)"
+                                            value={adminUserIdInput}
+                                            onChange={(e)=>{ setAdminUserIdInput(e.target.value); setAdminDropdownOpen(true); setAdminDropdownIndex(-1) }}
+                                            onFocus={()=>{ setAdminDropdownOpen(true); setAdminDropdownIndex(-1) }}
+                                            onKeyDown={(e)=>{
+                                              const suggestions = adminUsers.filter(u => {
+                                                const q = (adminUserIdInput||'').toLowerCase()
+                                                return (u.username||'').toLowerCase().includes(q) || (u.email||'').toLowerCase().includes(q) || (u.id||'').toLowerCase().includes(q)
+                                              }).slice(0,20)
+                                              if(e.key === 'ArrowDown'){
+                                                e.preventDefault(); setAdminDropdownIndex(i => Math.min(i+1, suggestions.length-1))
+                                              }else if(e.key === 'ArrowUp'){
+                                                e.preventDefault(); setAdminDropdownIndex(i => Math.max(i-1, 0))
+                                              }else if(e.key === 'Enter'){
+                                                if(adminDropdownIndex >= 0 && adminDropdownIndex < suggestions.length){
+                                                  const u = suggestions[adminDropdownIndex]
+                                                  setAdminUserIdInput(u.id); setAdminRoleInput(u.role || 'member'); setAdminDropdownOpen(false)
+                                                  e.preventDefault()
+                                                }
+                                              }else if(e.key === 'Escape'){
+                                                setAdminDropdownOpen(false)
+                                              }
+                                            }}
+                                            style={{width:'100%'}}
+                                          />
+                                          {adminDropdownOpen && adminUsers && adminUsers.length>0 && (
+                                            <div style={{position:'absolute',left:0,right:0,top:'42px',zIndex:40,maxHeight:220,overflow:'auto',background:'#111',border:'1px solid rgba(255,255,255,0.04)',borderRadius:6,padding:6}}>
+                                              {adminUsers.filter(u => {
+                                                const q = (adminUserIdInput||'').toLowerCase()
+                                                return !q || (u.username||'').toLowerCase().includes(q) || (u.email||'').toLowerCase().includes(q) || (u.id||'').toLowerCase().includes(q)
+                                              }).slice(0,20).map((u, idx) => (
+                                                <div key={u.id} onMouseDown={(ev)=>{ ev.preventDefault(); setAdminUserIdInput(u.id); setAdminRoleInput(u.role || 'member'); setAdminDropdownOpen(false) }}
+                                                  style={{padding:6,borderRadius:4,background: idx === adminDropdownIndex ? 'rgba(255,255,255,0.04)' : 'transparent',cursor:'pointer'}}>
+                                                  <div style={{fontSize:13}}><strong>{u.username}</strong> <small style={{color:'var(--muted)'}}>{u.id}</small></div>
+                                                  <div style={{fontSize:12,color:'var(--muted)'}}>{u.email || ''} • {u.role || 'member'}</div>
+                                                </div>
+                                              ))}
+                                            </div>
+                                          )}
+                                        </div>
+                                      </div>
+                                      <div style={{marginTop:8,display:'flex',gap:8,alignItems:'center'}}>
+                                        <select value={adminRoleInput} onChange={(e)=>setAdminRoleInput(e.target.value)}>
+                                          <option value="member">Member</option>
+                                          <option value="admin">Admin</option>
+                                        </select>
+                                        <button className="primary" onClick={async ()=>{
+                                          try{
+                                            setAdminActionLoading(true); setAdminActionMsg('')
+                                            if(!adminUserIdInput) { setAdminActionMsg('Enter user id'); setAdminActionLoading(false); return }
+                                            const res = await authFetch(`${BACKEND}/admin/users/${encodeURIComponent(adminUserIdInput)}/role`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ role: adminRoleInput }) })
+                                            if(!res.ok){ const t = await res.text(); setAdminActionMsg('Error: '+t); setAdminActionLoading(false); return }
+                                            const j = await res.json()
+                                            setAdminActionMsg('Updated '+(j.user?.id || adminUserIdInput))
+                                            // refresh list to reflect change
+                                            await loadAdminUsers(adminQuery)
+                                          }catch(e){ setAdminActionMsg('Error: '+e.message) }finally{ setAdminActionLoading(false) }
+                                        }}>{adminActionLoading ? 'Working...' : 'Set role'}</button>
+                                      </div>
+                                      {adminActionMsg && <div style={{marginTop:8,color:'var(--muted)'}}>{adminActionMsg}</div>}
+                                    </div>
+                                  </div>
+                                </div>
+                              )}
                             </div>
                           </div>
                         </div>
@@ -3159,10 +3566,12 @@ export default function App() {
                   </div>
                 )}
 
-                <div style={{marginTop:12}}>
-                  <button onClick={() => setShowPrivacyAdmin(s => !s)}>{showPrivacyAdmin ? 'Hide' : 'Manage'} privacy inventory & DPIAs</button>
-                </div>
-                {showPrivacyAdmin && <PrivacyAdmin addToast={addToast} />}
+                {accountUser && (accountUser.role === 'admin' || accountUser.is_admin) && (
+                  <div style={{marginTop:12}}>
+                    <button onClick={() => setShowPrivacyAdmin(s => !s)}>{showPrivacyAdmin ? 'Hide' : 'Manage'} privacy inventory & DPIAs</button>
+                  </div>
+                )}
+                {showPrivacyAdmin && (accountUser && (accountUser.role === 'admin' || accountUser.is_admin)) && <PrivacyAdmin addToast={addToast} />}
 
                 {accountUser && (accountUser.role === 'admin' || accountUser.is_admin) && (
                   <div style={{marginTop:18}}>
@@ -3483,7 +3892,7 @@ export default function App() {
 
         <nav className="side-nav" aria-label="Primary">
           {NAV_SECTIONS.map((sectionName, index) => {
-            const sectionItems = NAV_ITEMS.filter((item) => item.section === sectionName)
+            const sectionItems = navItemsToRender.filter((item) => item.section === sectionName)
             return (
               <div key={sectionName} className="nav-group">
                 <div className={`nav-section-label ${railCollapsed ? "nav-section-label-collapsed" : ""}`}>
@@ -3908,6 +4317,10 @@ export default function App() {
                 <button title="Debug: show logs and attempt run+download" onClick={() => debugRunDownload(runFormatRef.current?.value || 'csv')}>Debug Run & Download</button>
                 <button onClick={exportToSheets} disabled={!recipeId}>Export to Google Sheets</button>
                 <input placeholder="target user id or email" value={exportTargetUser} onChange={(e)=>setExportTargetUser(e.target.value)} style={{marginLeft:8,width:220}} />
+                <label style={{display:'inline-flex',alignItems:'center',gap:8,marginLeft:8}}>
+                  <input type="checkbox" checked={previewAddRowIndex} onChange={(e)=>setPreviewAddRowIndex(e.target.checked)} />
+                  <small style={{color:'var(--muted)'}}>Include row index (#)</small>
+                </label>
                 <button onClick={() => downloadPreviewCsv()} disabled={!generatedPreview}>Download CSV</button>
               </div>
             </div>

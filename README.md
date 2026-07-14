@@ -28,6 +28,23 @@ Demo and file picking
 - A sample recipe is at `samples/demo_recipe.json` which runs imputations and normalization and writes to `data/output/customers_cleaned.csv`.
 - The frontend now uploads files directly from the Source tab. Local exports of Google Workspace files work when you upload the exported `.docx`, `.xlsx`, or `.pptx` file.
 
+Prompt guidance
+---------------
+
+Short, clear phrases work best. When asking the parser to move or copy values between columns, include a clarifying type or quantifier when possible. Supported clarifying terms include (but are not limited to):
+
+- quantity/selection words: `all`, `values`, `entries`, `items`, `rows`, `records`
+- type hints: `numeric`, `number`, `digits`, `string`, `text`, `letters`, `alpha`, `alphabetic`, `alphanumeric`, `chars`, `characters`, `date`, `postal`, `zip`, `city`
+- negation forms: `non-numeric`, `non-numerical`, `not numeric`
+
+Examples:
+
+- "Move all non-numerical values from postal_code to city, then drop col_6."
+- "Move values from col_6 to postal_code, then drop col_6."
+- "Move digits from zip_code to postal_code."
+
+If your instruction is very terse (e.g., "Move A to B"), the parser may need more context; adding a clarifying token like `values` or a type hint reduces ambiguity.
+
 Google Drive authenticated fetches
 - To fetch Google Docs, Sheets, and Slides shortcuts directly from Drive, set `FALCONBROOM_GOOGLE_DRIVE_ACCESS_TOKEN` to a valid OAuth access token.
 - The backend will export Google Workspace files through the Drive API when a shortcut JSON contains a Drive URL or file ID.
