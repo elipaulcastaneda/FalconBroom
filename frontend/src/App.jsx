@@ -2043,10 +2043,36 @@ export default function App() {
       setApplyRes((prev)=> ({...(prev||{}), last_export: j.export_path}))
       // Auto-download the created export by opening the backend download endpoint
       try {
-        if (j && j.export_path) {
+          if (j && j.export_path) {
           const dl = `${BACKEND}/download?path=${encodeURIComponent(j.export_path)}`
-          // open in a new tab/window so the browser can handle the FileResponse
-          window.open(dl, '_blank')
+          // Try opening in a new tab/window so the browser can handle the FileResponse.
+          // If popup is blocked (e.g. embedded webview), fallback to fetching the blob
+          try {
+            const w = (() => { try { return window.open(dl, '_blank') } catch(e) { return null } })()
+            if (!w) {
+              const res2 = await fetch(dl, { credentials: 'include' })
+              if (!res2.ok) throw new Error('Download fetch failed')
+              const blob = await res2.blob()
+              let filename = exportFilename || 'download'
+              try{
+                const cd = res2.headers.get('content-disposition') || ''
+                let m = /filename\*=UTF-8''([^;\n]+)/i.exec(cd)
+                if (!m) m = /filename=\"?([^\";]+)\"?/i.exec(cd)
+                if (m && m[1]) filename = decodeURIComponent(m[1])
+              }catch(e){}
+              const objUrl = URL.createObjectURL(blob)
+              const a = document.createElement('a')
+              a.href = objUrl
+              a.download = filename
+              document.body.appendChild(a)
+              a.click()
+              a.remove()
+              try { window.dispatchEvent(new CustomEvent('fb_download_completed', { detail: { filename } })) } catch (e) {}
+              URL.revokeObjectURL(objUrl)
+            }
+          } catch (e) {
+            console.warn('auto-download failed', e)
+          }
         }
       } catch (e) {
         console.warn('auto-download failed', e)
