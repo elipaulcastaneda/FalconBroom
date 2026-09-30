@@ -2053,7 +2053,15 @@ export default function App() {
               const res2 = await fetch(dl, { credentials: 'include' })
               if (!res2.ok) throw new Error('Download fetch failed')
               const blob = await res2.blob()
-              let filename = exportFilename || 'download'
+              // prefer server-provided filename (preserves extension), fall back to `exportFilename`
+              let filename = 'download'
+              try {
+                if (j && j.export_path) {
+                  const parts = String(j.export_path).split(/\\|\//)
+                  if (parts.length) filename = parts[parts.length-1]
+                }
+              } catch (e) {}
+              if (!filename || filename === 'download') filename = (exportFilename && String(exportFilename).trim()) || 'download'
               try{
                 const cd = res2.headers.get('content-disposition') || ''
                 let m = /filename\*=UTF-8''([^;\n]+)/i.exec(cd)
