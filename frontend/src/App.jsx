@@ -3024,28 +3024,74 @@ export default function App() {
             </div>
             {historyList.length ? (
               <div className="history-list">
-                {historyList.map((r, idx) => (
-                  <div key={r && (r.id || r.run_id) ? (r.id || r.run_id) : `history-${idx}`} className="history-item">
-                    <div style={{flex:'1 1 0'}}>
-                      <div className="history-top">
-                        <strong>{r.id}</strong>
-                        <small style={{marginLeft:8}}>{r.recipe_id} • {r.status}</small>
-                      </div>
-                      <div className="history-body">
-                        <div>Started: {r.started_at}</div>
-                        {r.finished_at && <div>Finished: {r.finished_at}</div>}
-                        {r.output_path && (
-                          <div>Output: <small>{r.output_path}</small> <DownloadLink url={`${BACKEND}/download?path=${encodeURIComponent(r.output_path)}`} label="Download" /></div>
+                {/* Group history into Joins and Transformations */}
+                {(() => {
+                  const joins = (historyList || []).filter((h) => (h && h.type) === 'join')
+                  const transforms = (historyList || []).filter((h) => (h && h.type) !== 'join')
+                  return (
+                    <>
+                      <div style={{marginBottom:12}}>
+                        <h4 style={{margin: '6px 0'}}>Joins</h4>
+                        {joins.length ? (
+                          joins.map((r, idx) => (
+                            <div key={r && (r.id || r.run_id) ? (r.id || r.run_id) : `join-${idx}`} className="history-item">
+                              <div style={{flex:'1 1 0'}}>
+                                <div className="history-top">
+                                  <strong>{r.id}</strong>
+                                  <small style={{marginLeft:8}}>{r.recipe_id} • {r.status}</small>
+                                </div>
+                                <div className="history-body">
+                                  <div>Started: {r.started_at}</div>
+                                  {r.finished_at && <div>Finished: {r.finished_at}</div>}
+                                  {r.output_path && (
+                                    <div>Output: <small>{r.output_path}</small> <DownloadLink url={`${BACKEND}/download?path=${encodeURIComponent(r.output_path)}`} label="Download" /></div>
+                                  )}
+                                  {r.warnings && <div style={{color:'#f59e0b'}}>Warnings: {JSON.stringify(r.warnings)}</div>}
+                                </div>
+                              </div>
+                              <div className="history-actions">
+                                <button onClick={() => rollbackRun(r.id)}>Rollback</button>
+                                <button onClick={() => { setDeleteTarget(r.id); setShowDeleteConfirm(true) }} style={{marginLeft:8,color:'#fff',background:'#ef4444',border:'none',padding:'6px 8px'}}>Delete</button>
+                              </div>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="empty-state">No join history yet.</div>
                         )}
-                        {r.warnings && <div style={{color:'#f59e0b'}}>Warnings: {JSON.stringify(r.warnings)}</div>}
                       </div>
-                    </div>
-                    <div className="history-actions">
-                      <button onClick={() => rollbackRun(r.id)}>Rollback</button>
-                      <button onClick={() => { setDeleteTarget(r.id); setShowDeleteConfirm(true) }} style={{marginLeft:8,color:'#fff',background:'#ef4444',border:'none',padding:'6px 8px'}}>Delete</button>
-                    </div>
-                  </div>
-                ))}
+
+                      <div>
+                        <h4 style={{margin: '6px 0'}}>Transformations</h4>
+                        {transforms.length ? (
+                          transforms.map((r, idx) => (
+                            <div key={r && (r.id || r.run_id) ? (r.id || r.run_id) : `transform-${idx}`} className="history-item">
+                              <div style={{flex:'1 1 0'}}>
+                                <div className="history-top">
+                                  <strong>{r.id}</strong>
+                                  <small style={{marginLeft:8}}>{r.recipe_id} • {r.status}</small>
+                                </div>
+                                <div className="history-body">
+                                  <div>Started: {r.started_at}</div>
+                                  {r.finished_at && <div>Finished: {r.finished_at}</div>}
+                                  {r.output_path && (
+                                    <div>Output: <small>{r.output_path}</small> <DownloadLink url={`${BACKEND}/download?path=${encodeURIComponent(r.output_path)}`} label="Download" /></div>
+                                  )}
+                                  {r.warnings && <div style={{color:'#f59e0b'}}>Warnings: {JSON.stringify(r.warnings)}</div>}
+                                </div>
+                              </div>
+                              <div className="history-actions">
+                                <button onClick={() => rollbackRun(r.id)}>Rollback</button>
+                                <button onClick={() => { setDeleteTarget(r.id); setShowDeleteConfirm(true) }} style={{marginLeft:8,color:'#fff',background:'#ef4444',border:'none',padding:'6px 8px'}}>Delete</button>
+                              </div>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="empty-state">No transformation runs yet.</div>
+                        )}
+                      </div>
+                    </>
+                  )
+                })()}
               </div>
             ) : (
               <div className="empty-state">No runs yet. Run a saved recipe to populate history.</div>
