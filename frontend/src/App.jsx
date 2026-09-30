@@ -2,6 +2,10 @@ import React, {useMemo, useRef, useState, useEffect} from "react"
 import { BACKEND } from './config'
 import authFetch from './utils/authFetch'
 import PrivacyAdmin from './PrivacyAdmin'
+import SignIn from './components/SignIn'
+import SignOut from './components/SignOut'
+import { useAccountUser } from './auth'
+import tokenStore from './tokenStore'
 
 function PathBasename(p){
   try{
@@ -12,13 +16,53 @@ function PathBasename(p){
 }
 
 function DownloadLink({ url, label }){
+  async function handleClick(e){
+    e && e.preventDefault && e.preventDefault()
+    // Try opening a new window/tab first (user gesture)
+    try{
+      const w = window.open(url)
+      if (w) return
+    }catch(err){/* continue to fallback */}
+
+    // Fallback: fetch the resource and trigger a blob download
+    try{
+      const res = await fetch(url, { credentials: 'include' })
+      if (!res.ok) throw new Error('Download failed')
+      const blob = await res.blob()
+      // try to parse filename from content-disposition
+      let filename = label || 'download'
+      try{
+        const cd = res.headers.get('content-disposition') || ''
+        let m = /filename\*=UTF-8''([^;\n]+)/i.exec(cd)
+        if (!m) m = /filename="?([^\";]+)"?/i.exec(cd)
+        if (m && m[1]) filename = decodeURIComponent(m[1])
+      }catch(e){}
+      const objUrl = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = objUrl
+      a.download = filename
+      // Some environments (embedded webviews) require adding to DOM
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      try { window.dispatchEvent(new CustomEvent('fb_download_completed', { detail: { filename } })) } catch (e) {}
+      URL.revokeObjectURL(objUrl)
+      return
+    }catch(err){
+      // Last resort: navigate the window (may trigger download or show file)
+      try{ window.location.href = url }catch(e){}
+    }
+  }
+
   return (
-    <button onClick={(e)=>{ try{ window.open(url) }catch(err){ window.location.href = url } }}
+    <button onClick={handleClick}
       style={{background:'none',border:'none',padding:0,color:'var(--link)',textDecoration:'underline',cursor:'pointer'}}>
       {label}
     </button>
   )
 }
+
+  // end DownloadLink
 const NAV_ITEMS = [
   { section: "Start", id: "source", label: "Source", detail: "Profile and prompt to recipe", icon: "⟡" },
   { section: "Start", id: "uploads", label: "Uploads", detail: "Saved uploads", icon: "⇪" },
@@ -128,6 +172,10 @@ export default function App() {
   const [recipeStatus, setRecipeStatus] = useState("")
   const [showApproveConfirm, setShowApproveConfirm] = useState(false)
   const [historyList, setHistoryList] = useState([])
+  const [downloadToken, setDownloadToken] = useState(() => {
+    try { return typeof window !== 'undefined' ? window.localStorage.getItem('falconbroom_delete_token') : null } catch(e) { return null }
+  })
+  const [downloadingAll, setDownloadingAll] = useState(false)
   const [toasts, setToasts] = useState([])
   const [toastArchive, setToastArchive] = useState([])
   const [showToastPanel, setShowToastPanel] = useState(false)
@@ -181,7 +229,18 @@ export default function App() {
     try { return window.localStorage.getItem('falconbroom_analytics_id') || '' } catch { return '' }
   })
   const [authToken, setAuthToken] = useState(() => { try { return window.localStorage.getItem('falconbroom_access_token') || '' } catch { return '' } })
+  const [refreshingAuth, setRefreshingAuth] = useState(false)
   const [accountUser, setAccountUser] = useState(null)
+  const { accountUser: remoteAccountUser, loading: accountLoading, reload: reloadAccount } = useAccountUser()
+
+  // sync remote-loaded account into local state so existing code can call setAccountUser
+  useEffect(() => {
+    try{
+      if (remoteAccountUser && JSON.stringify(remoteAccountUser) !== JSON.stringify(accountUser)) {
+        setAccountUser(remoteAccountUser)
+      }
+    }catch(e){}
+  }, [remoteAccountUser])
   const [showPrivacyAdmin, setShowPrivacyAdmin] = useState(false)
   const [signupUsername, setSignupUsername] = useState('')
   const [signupEmail, setSignupEmail] = useState('')
@@ -199,12 +258,29 @@ export default function App() {
   const [loginIdentity, setLoginIdentity] = useState('')
   const [loginPassword, setLoginPassword] = useState('')
   const [teamName, setTeamName] = useState('')
+
+  // helper to get current access token (from state or secure store)
+  async function getCurrentAccess() {
+    try {
+      if (authToken) return authToken
+      const a = await tokenStore.getAccess()
+      if (a) { setAuthToken(a); return a }
+      return null
+    } catch (e) { return null }
+  }
+
+  // sync authToken from secure store on mount
+  useEffect(() => {
+    (async () => {
+      try { const a = await tokenStore.getAccess(); if (a) setAuthToken(a) } catch(e){}
+    })()
+  }, [])
   const [teamMembers, setTeamMembers] = useState([])
   const [teamMemberObjects, setTeamMemberObjects] = useState([])
   const [pendingInvites, setPendingInvites] = useState([])
   const [sharedUploads, setSharedUploads] = useState([])
   useEffect(()=>{
-    if (accountUser) loadDsarPropagation()
+    if(accountUser) loadDsarPropagation()
   }, [accountUser])
 
   async function loadAdminUsers(q=''){
@@ -648,19 +724,51 @@ export default function App() {
 
   useEffect(() => {
     async function fetchMe() {
-      let token = authToken || window.localStorage.getItem('falconbroom_access_token')
-      try { console.debug('fetchMe: initial token present?', !!token) } catch (e) {}
+      let token = authToken
+      try {
+        if (!token) token = await tokenStore.getAccess()
+        console.debug('fetchMe: initial token present?', !!token)
+      } catch (e) {}
       if (!token) {
         // try to refresh via httpOnly cookie
         try {
           try { console.debug('fetchMe: attempting /refresh because no token') } catch (e) {}
-          const rres = await fetch(`${BACKEND}/refresh`, { method: 'POST', credentials: 'include' })
+            const backendBase = (BACKEND === '/api' ? 'http://127.0.0.1:3009' : BACKEND)
+            const rres = await fetch(`${backendBase}/refresh`, { method: 'POST', credentials: 'include' })
           try { console.debug('fetchMe: /refresh status', rres.status) } catch (e) {}
           if (rres.ok) {
             const jr = await rres.json()
             token = jr.access_token
-            saveToken(token)
+            await saveToken(token)
             try { console.debug('fetchMe: obtained access token from /refresh') } catch (e) {}
+          } else {
+            // try dev-local fallback: send refresh token from localStorage in Authorization header
+            try {
+              const devRefresh = await tokenStore.getRefresh()
+              if (devRefresh) {
+                try { console.debug('fetchMe: attempting /refresh with dev refresh token') } catch (e) {}
+                const backendBase = (BACKEND === '/api' ? 'http://127.0.0.1:3009' : BACKEND)
+                const r2 = await fetch(`${backendBase}/refresh`, { method: 'POST', headers: { 'Authorization': `Bearer ${devRefresh}` }, credentials: 'include' })
+                try { console.debug('fetchMe: /refresh(dev) status', r2.status) } catch (e) {}
+                if (r2.ok) {
+                  const jr = await r2.json()
+                  token = jr.access_token
+                  await saveToken(token)
+                  try { console.debug('fetchMe: obtained access token from /refresh (dev)') } catch (e) {}
+                  try { window.dispatchEvent(new CustomEvent('fb_backend_refresh_success', { detail: { source: 'fetchMe' } })) } catch(e){}
+                } else {
+                  try { window.dispatchEvent(new CustomEvent('fb_backend_refresh_failure', { detail: { status: r2.status } })) } catch(e){}
+                  // clear stale dev refresh tokens on 400/401 responses
+                  try {
+                    if (r2 && (r2.status === 400 || r2.status === 401)) {
+                      await tokenStore.removeRefresh()
+                    }
+                  } catch (e) {}
+                }
+              }
+            } catch (e) {
+              // ignore
+            }
           }
         } catch (e) {
           // ignore
@@ -698,8 +806,8 @@ export default function App() {
         ))}
       </div>
 
-      <div className="auth-root" style={{display:'flex',justifyContent:'center',alignItems:'center',minHeight:'60vh',padding:24}}>
-        <div style={{maxWidth:720,display:'flex',gap:24,alignItems:'flex-start',width:'100%'}}>
+      <div className="auth-root" style={{display:'flex',justifyContent:'center',alignItems:'center',minHeight:'100vh',padding:48}}>
+        <div style={{maxWidth:920,display:'flex',gap:28,alignItems:'stretch',width:'100%'}}>
           <div className="card" style={{flex:1}}>
             <div className="card-header"><h2>Welcome back</h2><p>Log in to access your team, uploads, and recipes.</p></div>
             <div style={{padding:12}}>
@@ -828,7 +936,7 @@ export default function App() {
   async function removeTeamMember(email) {
     try {
       // call server-side removal (owner endpoint) if authenticated
-      const token = authToken || window.localStorage.getItem('falconbroom_access_token')
+      const token = authToken || await tokenStore.getAccess()
       if (token) {
         const res = await authFetch(`${BACKEND}/team/members`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'remove', email }) })
         if (!res.ok) { addToast('Remove failed', 'error'); return }
@@ -890,58 +998,75 @@ export default function App() {
     return () => { try { if (ws) ws.close() } catch (e) {} }
   }, [activeTab])
 
-  function saveToken(access) {
+  async function saveToken(access) {
     setAuthToken(access)
-    try { window.localStorage.setItem('falconbroom_access_token', access) } catch {}
+    try { await tokenStore.setAccess(access) } catch(e){}
   }
+
+  useEffect(() => {
+    function handleRefreshed(e) {
+      try { if (e && e.detail && e.detail.access_token) saveToken(e.detail.access_token) } catch (err) {}
+    }
+    function handleRefreshStart() { setRefreshingAuth(true) }
+    function handleRefreshDone() { setRefreshingAuth(false) }
+    function handleBackendRefreshSuccess() { addToast('Authentication refreshed (backend)', 'success', 3000) }
+    function handleBackendRefreshFailure(e) { const s = e && e.detail && e.detail.status ? (' status=' + e.detail.status) : ''; addToast('Backend refresh failed' + s, 'error', 5000) }
+    window.addEventListener('fb_access_token_refreshed', handleRefreshed)
+    window.addEventListener('fb_refresh_started', handleRefreshStart)
+    window.addEventListener('fb_refresh_finished', handleRefreshDone)
+    window.addEventListener('fb_backend_refresh_success', handleBackendRefreshSuccess)
+    window.addEventListener('fb_backend_refresh_failure', handleBackendRefreshFailure)
+    function handleDownload(e){ try { const fn = e && e.detail && e.detail.filename ? e.detail.filename : 'download'; addToast('Downloaded: ' + fn, 'success', 5000) } catch(err) {} }
+    window.addEventListener('fb_download_completed', handleDownload)
+    return () => { window.removeEventListener('fb_access_token_refreshed', handleRefreshed); window.removeEventListener('fb_download_completed', handleDownload); window.removeEventListener('fb_refresh_started', handleRefreshStart); window.removeEventListener('fb_refresh_finished', handleRefreshDone); window.removeEventListener('fb_backend_refresh_success', handleBackendRefreshSuccess); window.removeEventListener('fb_backend_refresh_failure', handleBackendRefreshFailure) }
+  }, [])
 
   // use global authFetch from ./utils/authFetch
 
   async function doSignup() {
     try {
-      const res = await fetch(`${BACKEND}/signup`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: signupUsername, email: signupEmail, password: signupPassword, role: signupRole }) })
-      if (!res.ok) {
-        const txt = await res.text()
-        addToast('Signup failed: ' + txt, 'error')
-        return
-      }
-      addToast('Account created — please log in', 'success')
+      // Use Supabase client for signup
+      const supabase = (await import('./supabaseClient')).default
+      const { data, error } = await supabase.auth.signUp({ email: signupEmail, password: signupPassword, options: { data: { username: signupUsername || signupEmail } } })
+      if (error) { addToast('Signup failed: ' + error.message, 'error'); return }
+      addToast('Account created — please check email for verification', 'success')
       setSignupUsername(''); setSignupEmail(''); setSignupPassword(''); setSignupRole('member')
     } catch (e) { addToast('Signup error: ' + e.message, 'error') }
   }
 
   async function doLogin() {
     try {
-      const payload = loginIdentity.includes('@') ? { email: loginIdentity, password: loginPassword, persistent: true } : { username: loginIdentity, password: loginPassword, persistent: true }
-      const res = await fetch(`${BACKEND}/login`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), credentials: 'include' })
-      if (!res.ok) {
-        addToast('Login failed', 'error')
-        return
+      const supabase = (await import('./supabaseClient')).default
+      const { data, error } = await supabase.auth.signInWithPassword({ email: loginIdentity, password: loginPassword })
+      if (error) { addToast('Login failed: ' + error.message, 'error'); return }
+      const access = data?.session?.access_token
+      const refresh = data?.session?.refresh_token
+      if (access) await saveToken(access)
+      if (refresh) {
+        try { await tokenStore.setRefresh(refresh) } catch(e){}
       }
-      const j = await res.json()
-      saveToken(j.access_token)
-      // In dev, server may return refresh_token for local fallback; store it in localStorage
-      try { if (j.refresh_token) { window.localStorage.setItem('falconbroom_refresh_token', j.refresh_token) } } catch (e) {}
       setLoginIdentity(''); setLoginPassword('')
+      // refresh local account info
+      try { window.dispatchEvent(new CustomEvent('fb_signed_in')) } catch(e){}
       addToast('Logged in', 'success')
     } catch (e) { addToast('Login error: ' + e.message, 'error') }
   }
 
   async function doLogout() {
     try {
-      const token = authToken || window.localStorage.getItem('falconbroom_access_token')
-      if (token) await authFetch(`${BACKEND}/logout`, { method: 'POST' })
+      const supabase = (await import('./supabaseClient')).default
+      await supabase.auth.signOut()
     } catch (e) { /* ignore */ }
     setAccountUser(null); setAuthToken(''); try { window.localStorage.removeItem('falconbroom_access_token') } catch {}
     // refresh cookie cleared by server during logout
     try { window.localStorage.setItem('fb_manual_signed_out', '1') } catch (e) {}
-    try { window.localStorage.removeItem('falconbroom_refresh_token') } catch (e) {}
+    try { await tokenStore.removeAccess(); await tokenStore.removeRefresh() } catch(e){}
     addToast('Logged out', 'info')
   }
 
   async function saveAccountUpdates() {
     try {
-      const token = authToken || window.localStorage.getItem('falconbroom_access_token')
+      const token = authToken || await tokenStore.getAccess()
       if (!token) { addToast('Not authenticated', 'error'); return }
       const body = { email: accountUser?.email || '', team_name: teamName, team_members: teamMembers }
       const res = await authFetch(`${BACKEND}/account`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
@@ -954,7 +1079,7 @@ export default function App() {
 
   async function doAccountExport() {
     try {
-      const token = authToken || window.localStorage.getItem('falconbroom_access_token')
+      const token = authToken || await tokenStore.getAccess()
       if (!token) { addToast('Not authenticated', 'error'); return }
       const res = await authFetch(`${BACKEND}/account/export`, { method: 'POST' })
       if (!res.ok) { addToast('Export request failed', 'error'); return }
@@ -983,7 +1108,7 @@ export default function App() {
 
   async function doAccountDelete() {
     try {
-      const token = authToken || window.localStorage.getItem('falconbroom_access_token')
+      const token = authToken || await tokenStore.getAccess()
       if (!token) { addToast('Not authenticated', 'error'); return }
       const res = await authFetch(`${BACKEND}/account/delete`, { method: 'POST', headers: { 'Content-Type':'application/json' }, body: JSON.stringify({ password: deletePassword, confirm_text: deleteConfirmTextLocal }) })
       if (!res.ok) { const t = await res.text(); addToast('Delete failed: ' + t, 'error'); return }
@@ -994,7 +1119,7 @@ export default function App() {
 
   async function doDsarRequest(action) {
     try {
-      const token = authToken || window.localStorage.getItem('falconbroom_access_token')
+      const token = authToken || await tokenStore.getAccess()
       if (!token) { addToast('Not authenticated', 'error'); return }
       const payload = { action }
       if (action === 'delete' && dsarPassword) payload.password = dsarPassword
@@ -1292,6 +1417,25 @@ export default function App() {
     fetchRightCols()
     return () => { cancelled = true }
   }, [rightPath, uploadsList])
+
+  // If both sides contain any of the preferred keys, default and limit choices
+  React.useEffect(()=>{
+    try{
+      // configurable preference order
+      const preferredKeys = ['customer_id','id']
+      if(!joinLeftColsOptions || !joinRightColsOptions) return
+      // find first preferred key present on both sides
+      const commonPref = preferredKeys.find(k => joinLeftColsOptions.includes(k) && joinRightColsOptions.includes(k))
+      // only auto-default/limit when both sides have it and user hasn't selected keys yet
+      if(commonPref && (!joinLeftOnArr || joinLeftOnArr.length===0) && (!joinRightOnArr || joinRightOnArr.length===0)){
+        setJoinLeftColsOptions([commonPref])
+        setJoinRightColsOptions([commonPref])
+        setJoinLeftOnArr([commonPref]); setJoinRightOnArr([commonPref])
+        setJoinLeftOn(commonPref); setJoinRightOn(commonPref)
+        setCompositePairs([{ left: commonPref, right: commonPref }])
+      }
+    }catch(e){/* ignore */}
+  }, [joinLeftColsOptions, joinRightColsOptions, joinLeftOnArr, joinRightOnArr])
 
   // keep compositePairs in sync with selected arrays
   React.useEffect(()=>{
@@ -1811,8 +1955,11 @@ export default function App() {
         left_on = validPairs.map(p=>p.left)
         right_on = validPairs.map(p=>p.right)
       } else {
-        left_on = (joinLeftOnArr && joinLeftOnArr.length>0) ? joinLeftOnArr : (joinLeftOn ? joinLeftOn.split(',').map(s => s.trim()).filter(Boolean) : undefined)
-        right_on = (joinRightOnArr && joinRightOnArr.length>0) ? joinRightOnArr : (joinRightOn ? joinRightOn.split(',').map(s => s.trim()).filter(Boolean) : undefined)
+        // normalize joinLeftOn/joinRightOn in case they are arrays or other types
+        const joinLeftOnVal = Array.isArray(joinLeftOn) ? joinLeftOn.join(',') : (joinLeftOn || '')
+        const joinRightOnVal = Array.isArray(joinRightOn) ? joinRightOn.join(',') : (joinRightOn || '')
+        left_on = (joinLeftOnArr && joinLeftOnArr.length>0) ? joinLeftOnArr : (joinLeftOnVal ? joinLeftOnVal.split(',').map(s => String(s).trim()).filter(Boolean) : undefined)
+        right_on = (joinRightOnArr && joinRightOnArr.length>0) ? joinRightOnArr : (joinRightOnVal ? joinRightOnVal.split(',').map(s => String(s).trim()).filter(Boolean) : undefined)
       }
       // if compositePairs exist but have incomplete pairs, alert user
       const hasAnyPairs = (compositePairs || []).length > 0
@@ -1820,12 +1967,14 @@ export default function App() {
       if(hasAnyPairs && incomplete) { addToast('Cannot preview: some composite pairs are incomplete', 'error'); setJoinPreviewLoading(false); return }
       // parse rename mappings from textarea
       const mappings = []
-      (mappingText || '').split('\n').map(l=>l.trim()).filter(Boolean).forEach(line=>{
+      const mappingTextNormalized = Array.isArray(mappingText) ? mappingText.join('\n') : (mappingText || '')
+      mappingTextNormalized.split('\n').map(l=>String(l).trim()).filter(Boolean).forEach(line=>{
         const m = line.match(/^(left|right)\s*:\s*(.+?)\s*->\s*(.+)$/i)
         if(m){ mappings.push({ side: m[1].toLowerCase(), from: m[2].trim(), to: m[3].trim() }) }
       })
       const conflict = { suffix_left: suffixLeft, suffix_right: suffixRight, prefer: preferResolve, rename_map: mappings }
       const payload = { left_path: leftPath, right_path: rightPath, left_on, right_on, join_type: joinType, sample: Number(joinSampleSize), conflict_resolution: conflict }
+      console.log('join-preview payload:', payload)
       const res = await fetch(`${BACKEND}/join-preview`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
       if(!res.ok) {
         const txt = await res.text()
@@ -1862,20 +2011,25 @@ export default function App() {
         left_on = validPairs.map(p=>p.left)
         right_on = validPairs.map(p=>p.right)
       } else {
-        left_on = (joinLeftOnArr && joinLeftOnArr.length>0) ? joinLeftOnArr : (joinLeftOn ? joinLeftOn.split(',').map(s=>s.trim()).filter(Boolean) : undefined)
-        right_on = (joinRightOnArr && joinRightOnArr.length>0) ? joinRightOnArr : (joinRightOn ? joinRightOn.split(',').map(s=>s.trim()).filter(Boolean) : undefined)
+        // keep same normalization logic as doJoinPreview
+        const joinLeftOnVal = Array.isArray(joinLeftOn) ? joinLeftOn.join(',') : (joinLeftOn || '')
+        const joinRightOnVal = Array.isArray(joinRightOn) ? joinRightOn.join(',') : (joinRightOn || '')
+        left_on = (joinLeftOnArr && joinLeftOnArr.length>0) ? joinLeftOnArr : (joinLeftOnVal ? joinLeftOnVal.split(',').map(s=>String(s).trim()).filter(Boolean) : undefined)
+        right_on = (joinRightOnArr && joinRightOnArr.length>0) ? joinRightOnArr : (joinRightOnVal ? joinRightOnVal.split(',').map(s=>String(s).trim()).filter(Boolean) : undefined)
       }
       const hasAnyPairs = (compositePairs || []).length > 0
       const incomplete = (compositePairs || []).some(p=> !p.left || !p.right)
       if(hasAnyPairs && incomplete) { addToast('Cannot export: some composite pairs are incomplete', 'error'); setJoinExporting(false); return }
       const mappings = []
-      (mappingText || '').split('\n').map(l=>l.trim()).filter(Boolean).forEach(line=>{
+      const mappingTextNormalized = Array.isArray(mappingText) ? mappingText.join('\n') : (mappingText || '')
+      mappingTextNormalized.split('\n').map(l=>String(l).trim()).filter(Boolean).forEach(line=>{
         const m = line.match(/^(left|right)\s*:\s*(.+?)\s*->\s*(.+)$/i)
         if(m){ mappings.push({ side: m[1].toLowerCase(), from: m[2].trim(), to: m[3].trim() }) }
       })
       const conflict = { suffix_left: suffixLeft, suffix_right: suffixRight, prefer: preferResolve, rename_map: mappings }
       const payload = { left_path: leftPath, right_path: rightPath, left_on, right_on, join_type: joinType, export_format: exportFormat, filename: exportFilename, conflict_resolution: conflict }
       if (joinTargetUser) payload.target_user = joinTargetUser
+      console.log('join-export payload:', payload)
       const res = await fetch(`${BACKEND}/join-export`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
       })
@@ -1887,6 +2041,16 @@ export default function App() {
       addToast('Export created: ' + (j.export_path || ''), 'success')
       // surface download link to user
       setApplyRes((prev)=> ({...(prev||{}), last_export: j.export_path}))
+      // Auto-download the created export by opening the backend download endpoint
+      try {
+        if (j && j.export_path) {
+          const dl = `${BACKEND}/download?path=${encodeURIComponent(j.export_path)}`
+          // open in a new tab/window so the browser can handle the FileResponse
+          window.open(dl, '_blank')
+        }
+      } catch (e) {
+        console.warn('auto-download failed', e)
+      }
     } catch (e) {
       addToast('Join export failed: '+(e.message||e), 'error')
     } finally {
@@ -2419,6 +2583,93 @@ export default function App() {
     }
   }
 
+  async function handleDownloadAll() {
+    setDownloadingAll(true)
+    try {
+      const backendBase = (BACKEND === '/api' ? 'http://127.0.0.1:3009' : BACKEND)
+      const res = await authFetch(`${backendBase}/admin/history/download_all_zip`, { method: 'GET' })
+      if (!res.ok) {
+        let text = await res.text()
+        addToast('Download all failed: ' + text, 'error')
+        return
+      }
+      const deleteToken = res.headers.get('X-Delete-Token')
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = 'history_lineage.zip'
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      URL.revokeObjectURL(url)
+      if (deleteToken) {
+        setDownloadToken(deleteToken)
+        try { window.localStorage.setItem('falconbroom_delete_token', deleteToken) } catch(e){}
+      }
+      addToast('Downloaded history and lineage', 'success')
+    } catch (e) {
+      console.error(e)
+      addToast('Download all failed: ' + (e.message || e), 'error')
+    } finally {
+      setDownloadingAll(false)
+    }
+  }
+
+  async function handleDeleteAll() {
+    // If we don't have a delete token, request one automatically.
+    if (!downloadToken) {
+      try {
+        const token = await tokenStore.getAccess()
+        const backendBase = (BACKEND === '/api' ? 'http://127.0.0.1:3009' : BACKEND)
+        const r = await fetch(`${backendBase}/admin/history/request_delete_token`, { method: 'POST', headers: { 'Authorization': token ? `Bearer ${token}` : '' } })
+        if (!r.ok) {
+          const t = await r.text()
+          addToast('Request delete token failed: ' + t, 'error')
+          return
+        }
+        const j = await r.json()
+        if (j && j.delete_token) {
+          setDownloadToken(j.delete_token)
+          try { window.localStorage.setItem('falconbroom_delete_token', j.delete_token) } catch(e){}
+          addToast('Delete token obtained', 'success')
+        } else {
+          addToast('Request delete token failed: no token in response', 'error')
+          return
+        }
+      } catch (e) {
+        addToast('Request delete token failed: ' + (e.message || e), 'error')
+        return
+      }
+    }
+
+    // confirmation: require typing DELETE to proceed
+    try {
+      const v = window.prompt('Type DELETE to confirm permanent deletion of all history')
+      if (v === null) { addToast('Delete cancelled', 'info'); return }
+      if (String(v).trim() !== 'DELETE') { addToast('Delete cancelled (confirmation mismatch)', 'info'); return }
+    } catch (e) {}
+    try {
+      const backendBase = (BACKEND === '/api' ? 'http://127.0.0.1:3009' : BACKEND)
+      const res = await authFetch(`${backendBase}/history/delete_all`, { method: 'POST', headers: { 'X-Delete-Token': downloadToken } })
+      if (!res.ok) {
+        let text = await res.text()
+        // clear stale token on 400/401/403 to avoid repeated failures
+        try { if (res.status === 400 || res.status === 401 || res.status === 403) { window.localStorage.removeItem('falconbroom_delete_token'); setDownloadToken(null) } } catch(e){}
+        addToast('Delete all failed: ' + text, 'error')
+        return
+      }
+      const j = await res.json()
+      addToast('Deleted history: ' + JSON.stringify(j.deleted), 'success')
+      setHistoryList([])
+      setDownloadToken(null)
+      try { window.localStorage.removeItem('falconbroom_delete_token') } catch(e){}
+    } catch (e) {
+      console.error(e)
+      addToast('Delete all failed: ' + (e.message || e), 'error')
+    }
+  }
+
   async function rollbackRun(runId) {
     try {
       const res = await fetch(`${BACKEND}/history/${encodeURIComponent(runId)}/rollback`, { method: "POST" })
@@ -2732,8 +2983,10 @@ export default function App() {
 
           <Card eyebrow="Run history" title="Runs and lineage" subtitle="View previous runs, outputs, and create rollbacks.">
               <div className="button-row">
-              <button onClick={fetchHistory}>Refresh history</button>
-              <button onClick={() => setShowDedupeConfirm(true)}>Remove duplicates</button>
+                  <button onClick={fetchHistory}>Refresh history</button>
+                  <button onClick={() => setShowDedupeConfirm(true)}>Remove duplicates</button>
+                      <button onClick={handleDownloadAll} disabled={downloadingAll}>{downloadingAll ? 'Downloading...' : 'Download All'}</button>
+                      <button onClick={handleDeleteAll} disabled={!downloadToken}>Delete All</button>
             </div>
             {historyList.length ? (
               <div className="history-list">
@@ -2789,16 +3042,34 @@ export default function App() {
           <Card eyebrow="Joins" title="Join hints" subtitle="Find the most likely keys before blending datasets.">
             <div className="inline-grid">
               <div>
-                <label>Left CSV path</label>
+                <label>Left CSV</label>
                 <div style={{display:'flex',gap:8,alignItems:'center'}}>
-                  <input value={leftPath} onChange={(e) => setLeftPath(e.target.value)} placeholder="Left CSV path" style={{flex:1}} />
+                  <select
+                    value={leftPath}
+                    onChange={(e) => setLeftPath(e.target.value)}
+                    style={{flex:1}}
+                  >
+                    <option value="">-- select upload --</option>
+                    {(uploadsList || []).map((u) => (
+                      <option key={u.path} value={u.path}>{u.name || u.path}</option>
+                    ))}
+                  </select>
                   <button onClick={() => { setUploadTarget('left'); uploadInputRef.current?.click() }} title="Upload left file">Upload</button>
                 </div>
               </div>
               <div>
-                <label>Right CSV path</label>
+                <label>Right CSV</label>
                 <div style={{display:'flex',gap:8,alignItems:'center'}}>
-                  <input value={rightPath} onChange={(e) => setRightPath(e.target.value)} placeholder="Right CSV path" style={{flex:1}} />
+                  <select
+                    value={rightPath}
+                    onChange={(e) => setRightPath(e.target.value)}
+                    style={{flex:1}}
+                  >
+                    <option value="">-- select upload --</option>
+                    {(uploadsList || []).map((u) => (
+                      <option key={u.path} value={u.path}>{u.name || u.path}</option>
+                    ))}
+                  </select>
                   <button onClick={() => { setUploadTarget('right'); uploadInputRef.current?.click() }} title="Upload right file">Upload</button>
                 </div>
               </div>
@@ -3092,6 +3363,18 @@ export default function App() {
                         disabled={uploadsLoading || (inspectionLoading && inspectingPath === item.path)}
                       >
                         {inspectionLoading && inspectingPath === item.path ? 'Opening…' : 'Open'}
+                      </button>
+                      <button
+                        onClick={() => { setLeftPath(item.path); setActiveTab('joins'); }}
+                        title="Use this upload as Left for joins"
+                      >
+                        Use as left
+                      </button>
+                      <button
+                        onClick={() => { setRightPath(item.path); setActiveTab('joins'); }}
+                        title="Use this upload as Right for joins"
+                      >
+                        Use as right
                       </button>
                       <button
                         onClick={() => { setPath(item.path); doProfileForPath(item.path) }}
@@ -3763,6 +4046,16 @@ export default function App() {
     )
   }
 
+  // If not authenticated, render only the unauthenticated/login view so
+  // users see the sign-in screen as the first thing (hide rails/main UI).
+  if (!accountUser) {
+    return (
+      <div className={`auth-page ${themeClass}`} data-theme={theme}>
+        {unauthView}
+      </div>
+    )
+  }
+
   return (
     <div className={`app-shell ${themeClass}`} data-theme={theme}>
       <header className="app-header">
@@ -3946,6 +4239,9 @@ export default function App() {
             <span className="chip">Tab: {activeItem.label}</span>
             {backgroundBusy && (
               <span className="chip" title="Background tasks running">Loading…</span>
+            )}
+            {refreshingAuth && (
+              <span className="chip" title="Refreshing authentication">Refreshing auth…</span>
             )}
           </div>
         </header>
