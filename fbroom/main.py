@@ -13,12 +13,24 @@ import time
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+if __name__ == '__main__' and __package__ is None:
+    # When running this file directly (python fbroom/main.py), ensure the
+    # package root is on sys.path so relative imports work.
+    import sys, os
+    pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if pkg_root not in sys.path:
+        sys.path.insert(0, pkg_root)
+    __package__ = 'fbroom'
+
 from .connectors import resolve_source
 from .engine import (
     Cleaner,
+    _is_polars_df,
     _read_table,
+    _df_head_records,
     _suggest_buckets,
     _write_parquet,
+    _write_csv,
     _map_values,
     _string_transform_column,
     _fill_null_column,
@@ -26,6 +38,11 @@ from .engine import (
     _regex_replace,
     _cast_column,
 )
+# Optional polars import for DataFrame operations used in join/export paths
+try:
+    import polars as pl
+except Exception:
+    pl = None
 import re
 import csv
 import shutil
@@ -35,8 +52,14 @@ from .ingest import _google_drive_access_token
 from .recipe_schema import Recipe
 from typing import Optional, Any, List
 import jwt
+try:
+    # PyJWT >=2.0 provides PyJWKClient for JWKS handling
+    from jwt import PyJWKClient
+except Exception:
+    PyJWKClient = None
 import smtplib
 from email.message import EmailMessage
+import httpx
 from .workflow_rules import (
     explain_recipe,
     infer_columns_from_text,
@@ -46,6 +69,13 @@ from .workflow_rules import (
     suggest_join_rules,
 )
 import traceback
+import ipaddress
+import time
+import threading
+try:
+    import redis as _redis_lib
+except Exception:
+    _redis_lib = None
 try:
     from prometheus_client import generate_latest, CONTENT_TYPE_LATEST, Counter
 except Exception:
@@ -68,6 +98,125 @@ logging.getLogger('uvicorn').setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logging.getLogger('uvicorn.error').setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logging.getLogger('uvicorn.access').setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger(__name__)
+
+
+# Temporary startup hook for diagnostics: log when FastAPI startup event completes
+@app.on_event('startup')
+def _log_startup_ready():
+    try:
+        logger.info('fbroom: startup event fired — application ready')
+        # also print to stdout to ensure the external runner sees it in logs
+        print('fbroom: startup event fired — application ready', flush=True)
+    except Exception:
+        pass
+
+
+class ClientLog(BaseModel):
+    entries: list = Field(..., description="Array of early client log entries")
+
+
+@app.post('/_client_log')
+def client_log(payload: ClientLog, request: Request):
+    try:
+        logs_dir = Path(os.getcwd())
+        out = logs_dir.joinpath('client_early_failures.jsonl')
+        with out.open('a', encoding='utf-8') as fh:
+            for e in payload.entries:
+                fh.write(json.dumps({'ts': time.time(), 'remote': request.client.host if request.client else None, 'entry': e}) + "\n")
+        return {"ok": True}
+    except Exception as exc:
+        logger.exception("Failed to write client_log")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+# JWKS cache (in-memory). For multi-process deployments consider using Redis.
+_jwks_cache = {
+    "jwks": None,
+    "fetched_at": 0,
+    "etag": None,
+    "max_age": None,
+    "url": None,
+}
+_jwks_lock = threading.Lock()
+_JWKS_TTL = int(os.environ.get("JWKS_TTL_SECONDS", "300"))
+
+# Temporary delete tokens issued when a download_all is performed.
+_delete_tokens = {}
+_delete_tokens_lock = threading.Lock()
+_DELETE_TOKEN_TTL = int(os.environ.get("DELETE_TOKEN_TTL_SECONDS", "3600"))
+
+def _parse_cache_control_max_age(header_value: str):
+    try:
+        parts = [p.strip() for p in header_value.split(',')]
+        for p in parts:
+            if p.startswith('max-age'):
+                k, v = p.split('=', 1)
+                return int(v)
+    except Exception:
+        return None
+    return None
+
+def _fetch_jwks_cached(jwks_url: str):
+    """Fetch JWKS with simple in-memory caching, ETag support, and TTL.
+
+    Returns the JWKS dict on success or raises Exception if no JWKS available.
+    """
+    now = time.time()
+    with _jwks_lock:
+        # If cache is for a different URL, reset
+        if _jwks_cache.get("url") != jwks_url:
+            _jwks_cache.update({"jwks": None, "fetched_at": 0, "etag": None, "max_age": None, "url": jwks_url})
+
+        # determine if cached JWKS is fresh
+        max_age = _jwks_cache.get("max_age") or _JWKS_TTL
+        if _jwks_cache.get("jwks") and (now - float(_jwks_cache.get("fetched_at", 0)) < int(max_age)):
+            return _jwks_cache.get("jwks")
+
+        # perform conditional GET using ETag when available
+        headers = {}
+        if _jwks_cache.get("etag"):
+            headers["If-None-Match"] = _jwks_cache.get("etag")
+
+        try:
+            r = httpx.get(jwks_url, headers=headers, timeout=5)
+        except Exception as e:
+            # network error: return cached jwks if present
+            if _jwks_cache.get("jwks"):
+                return _jwks_cache.get("jwks")
+            raise
+
+        if r.status_code == 200:
+            try:
+                jwks = r.json()
+            except Exception:
+                jwks = None
+            _jwks_cache["jwks"] = jwks
+            _jwks_cache["fetched_at"] = now
+            _jwks_cache["etag"] = r.headers.get("ETag")
+            cc = r.headers.get("Cache-Control")
+            if cc:
+                ma = _parse_cache_control_max_age(cc)
+                if ma:
+                    _jwks_cache["max_age"] = ma
+            return _jwks_cache.get("jwks")
+        elif r.status_code == 304:
+            # Not modified: update fetched_at
+            _jwks_cache["fetched_at"] = now
+            return _jwks_cache.get("jwks")
+        else:
+            # non-success: fall back to cache if present
+            if _jwks_cache.get("jwks"):
+                return _jwks_cache.get("jwks")
+            r.raise_for_status()
+
+def _find_jwk_for_kid(jwks: dict, kid: str):
+    try:
+        keys = jwks.get("keys") or []
+        for k in keys:
+            if k.get("kid") == kid:
+                return k
+    except Exception:
+        return None
+    return None
 
 # Prometheus counters for per-recipe runs (optional)
 if Counter is not None:
@@ -200,7 +349,18 @@ async def _secure_headers_middleware(request: Request, call_next):
         resp.headers['Permissions-Policy'] = 'interest-cohort=()'
         # Conservative CSP; adjust for your frontend origins if needed
         resp.headers['Content-Security-Policy'] = "default-src 'self'; connect-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'"
+        # Expose custom headers to browser (needed for download-delete token flow)
+        try:
+            # allow client JS to read the X-Delete-Token header returned on download_all
+            existing = resp.headers.get('Access-Control-Expose-Headers')
+            if existing:
+                resp.headers['Access-Control-Expose-Headers'] = existing + ', X-Delete-Token'
+            else:
+                resp.headers['Access-Control-Expose-Headers'] = 'X-Delete-Token'
+        except Exception:
+            pass
     except Exception:
+        logger.exception("Error in _get_user_from_token")
         pass
     return resp
 
@@ -535,7 +695,12 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         # notify websocket clients of updated uploads list
         try:
             import asyncio
-            asyncio.create_task(_broadcast_shared_update_message({"type": "uploads_changed"}))
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_broadcast_shared_update_message({"type": "uploads_changed"}))
+            except RuntimeError:
+                # no running loop in this thread/process — skip scheduling
+                pass
         except Exception:
             pass
         return {
@@ -1534,6 +1699,196 @@ def list_history():
     return {"history": sorted(out, key=lambda r: r.get("started_at", ""), reverse=True)}
 
 
+@app.get("/history/download_all")
+@app.get("/history/download_all_zip")
+@app.get("/history/download-all")
+def download_all_history(request: Request):
+    try:
+        user = _require_auth(request)
+        # create temporary zip of history, inspections, and outputs metadata
+        tmp_dir = Path("data") / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        zip_name = f"history_lineage_{uuid4().hex}.zip"
+        zip_path = tmp_dir / zip_name
+        import zipfile
+        with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+            # add history files
+            try:
+                for p in HISTORY_DIR.glob("*.json"):
+                    try:
+                        zf.write(p, arcname=str(Path('history')/p.name))
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            # add inspections
+            try:
+                for p in INSPECTIONS_DIR.glob("*.json"):
+                    try:
+                        zf.write(p, arcname=str(Path('inspections')/p.name))
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            # add outputs (file names only, include file if small — we'll include the file entry path)
+            try:
+                for p in OUTPUTS_DIR.rglob("*"):
+                    if p.is_file():
+                        try:
+                            # include relative path under outputs/
+                            zf.write(p, arcname=str(Path('outputs')/p.relative_to(OUTPUTS_DIR)))
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+        # issue a temporary delete token tied to this user
+        token = uuid4().hex
+        expires = time.time() + _DELETE_TOKEN_TTL
+        with _delete_tokens_lock:
+            _delete_tokens[token] = {"user_id": user.get('id'), "expires": expires}
+        try:
+            logger.info(f"Issued delete token for user={user.get('id')} token={token} expires={int(expires)}")
+        except Exception:
+            pass
+        try:
+            _append_audit_event(Path('data') / 'delete_audit', 'delete_token_issued', {"token": token, "user_id": user.get('id'), "expires": int(expires)})
+        except Exception:
+            pass
+
+        headers = {"X-Delete-Token": token}
+        return FileResponse(str(zip_path), filename=zip_name, media_type='application/zip', headers=headers)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Admin-scoped alias to avoid conflicts with parameterized /history/{run_id} routes
+@app.get("/admin/history/download_all_zip")
+def admin_download_all_history(request: Request):
+    return download_all_history(request)
+
+
+@app.post("/history/delete_all")
+def delete_all_history(request: Request):
+    try:
+        user = _require_auth(request)
+        token = request.headers.get('X-Delete-Token')
+        if not token:
+            try:
+                logger.info(f"Delete all attempted with no X-Delete-Token by user={user.get('id')}")
+            except Exception:
+                pass
+            try:
+                _append_audit_event(Path('data') / 'delete_audit', 'delete_attempt_no_token', {"user_id": user.get('id')})
+            except Exception:
+                pass
+            raise HTTPException(status_code=400, detail="Missing X-Delete-Token header")
+        with _delete_tokens_lock:
+            info = _delete_tokens.get(token)
+            if not info:
+                try:
+                    logger.warning(f"Invalid or unknown delete token attempted by user={user.get('id')} token={token}")
+                except Exception:
+                    pass
+                try:
+                    _append_audit_event(Path('data') / 'delete_audit', 'delete_attempt_invalid_token', {"token": token, "attempted_by": user.get('id')})
+                except Exception:
+                    pass
+                raise HTTPException(status_code=403, detail="Invalid or expired delete token")
+            if info.get('user_id') != user.get('id'):
+                try:
+                    logger.warning(f"Delete token user mismatch: token={token} issued_to={info.get('user_id')} attempted_by={user.get('id')}")
+                except Exception:
+                    pass
+                try:
+                    _append_audit_event(Path('data') / 'delete_audit', 'delete_attempt_user_mismatch', {"token": token, "issued_to": info.get('user_id'), "attempted_by": user.get('id')})
+                except Exception:
+                    pass
+                raise HTTPException(status_code=403, detail="Delete token not issued to this user")
+            if time.time() > info.get('expires', 0):
+                try:
+                    logger.info(f"Delete token expired for token={token} user={info.get('user_id')}")
+                except Exception:
+                    pass
+                try:
+                    _append_audit_event(Path('data') / 'delete_audit', 'delete_attempt_expired', {"token": token, "issued_to": info.get('user_id'), "expires": int(info.get('expires', 0))})
+                except Exception:
+                    pass
+                del _delete_tokens[token]
+                raise HTTPException(status_code=403, detail="Delete token expired")
+            # consume token
+            try:
+                logger.info(f"Consuming delete token={token} for user={user.get('id')}")
+            except Exception:
+                pass
+            try:
+                _append_audit_event(Path('data') / 'delete_audit', 'delete_token_consumed', {"token": token, "user_id": user.get('id'), "expires": int(info.get('expires', 0))})
+            except Exception:
+                pass
+            del _delete_tokens[token]
+
+        # perform deletion: remove history and inspections JSON files
+        deleted = {"history": 0, "inspections": 0}
+        try:
+            for p in HISTORY_DIR.glob("*.json"):
+                try:
+                    p.unlink()
+                    deleted['history'] += 1
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        try:
+            for p in INSPECTIONS_DIR.glob("*.json"):
+                try:
+                    p.unlink()
+                    deleted['inspections'] += 1
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        _consent_audit('delete_all_history', {'user_id': user.get('id'), 'deleted': deleted})
+        return {'ok': True, 'deleted': deleted}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# Admin can request a short-lived delete token without performing a download
+@app.post("/admin/history/request_delete_token")
+def request_delete_token(request: Request):
+    try:
+        # In production require admin. In non-production allow any authenticated
+        # user to request a delete token to simplify local dev and testing.
+        if os.environ.get('ENV') == 'production':
+            user = _require_admin(request)
+        else:
+            user = _require_auth(request)
+        # issue a temporary delete token tied to this user
+        token = uuid4().hex
+        expires = time.time() + _DELETE_TOKEN_TTL
+        with _delete_tokens_lock:
+            _delete_tokens[token] = {"user_id": user.get('id'), "expires": expires}
+        try:
+            logger.info(f"Issued delete token user={user.get('id')} token={token} expires={int(expires)} (env={os.environ.get('ENV')})")
+        except Exception:
+            pass
+        try:
+            # record whether this was admin-issued or dev-issued
+            evt = 'admin_delete_token_issued' if os.environ.get('ENV') == 'production' else 'dev_delete_token_issued'
+            _append_audit_event(Path('data') / 'delete_audit', evt, {"token": token, "user_id": user.get('id'), "expires": int(expires)})
+        except Exception:
+            pass
+        return {"delete_token": token, "expires": int(expires)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/inspections")
 def list_inspections():
     out = []
@@ -1867,6 +2222,11 @@ def join_suggestions(spec: JoinSuggestionSpec):
         # are missing instead of bubbling up a FileNotFoundError as a 500.
         left_res = resolve_source(spec.left_path)
         right_res = resolve_source(spec.right_path)
+        try:
+            logger.info("/join-preview resolved left: %s", left_res.to_dict() if hasattr(left_res, 'to_dict') else str(left_res))
+            logger.info("/join-preview resolved right: %s", right_res.to_dict() if hasattr(right_res, 'to_dict') else str(right_res))
+        except Exception:
+            pass
         if not left_res.exists:
             raise HTTPException(status_code=404, detail=f"Left source not found: {spec.left_path}")
         if not right_res.exists:
@@ -1885,6 +2245,15 @@ def join_suggestions(spec: JoinSuggestionSpec):
 @app.post("/join-preview")
 def join_preview(spec: JoinPreviewSpec):
     try:
+        # DEBUG: log incoming spec for diagnosis of join key issues
+        try:
+            logger.info("/join-preview incoming spec: %s", json.dumps(spec.dict() if hasattr(spec, 'dict') else spec))
+        except Exception:
+            try:
+                logger.info("/join-preview incoming spec raw: %s", str(spec))
+            except Exception:
+                pass
+
         left_res = resolve_source(spec.left_path)
         right_res = resolve_source(spec.right_path)
         if not left_res.exists:
@@ -1892,8 +2261,114 @@ def join_preview(spec: JoinPreviewSpec):
         if not right_res.exists:
             raise HTTPException(status_code=404, detail=f"Right source not found: {spec.right_path}")
 
-        left_df = _read_table(left_res.materialized_path or left_res.path)
-        right_df = _read_table(right_res.materialized_path or right_res.path)
+        left_mat = getattr(left_res, 'materialized_path', None) or getattr(left_res, 'path', None)
+        right_mat = getattr(right_res, 'materialized_path', None) or getattr(right_res, 'path', None)
+        try:
+            logger.info('/join-preview reading left materialized path: %s', left_mat)
+            logger.info('/join-preview reading right materialized path: %s', right_mat)
+            # quick local file sniff to verify content and delimiter
+            import csv as _csv
+            try:
+                with open(left_mat, 'rb') as _f:
+                    _sample = _f.read(2048)
+                _s = _sample.decode('utf-8', errors='replace')
+                logger.info('/join-preview left file head: %s', _s[:800].replace('\n', '\\n'))
+                try:
+                    _d = _csv.Sniffer().sniff(_s)
+                    _has_header = _csv.Sniffer().has_header(_s)
+                    logger.info('/join-preview left sniff delimiter=%s has_header=%s', _d.delimiter, _has_header)
+                except Exception as _e:
+                    logger.info('/join-preview left sniffer failed: %s', _e)
+            except Exception as _e:
+                logger.info('/join-preview unable to read left_mat %s: %s', left_mat, _e)
+            try:
+                with open(right_mat, 'rb') as _f:
+                    _sample = _f.read(2048)
+                _s = _sample.decode('utf-8', errors='replace')
+                logger.info('/join-preview right file head: %s', _s[:800].replace('\n', '\\n'))
+                try:
+                    _d = _csv.Sniffer().sniff(_s)
+                    _has_header = _csv.Sniffer().has_header(_s)
+                    logger.info('/join-preview right sniff delimiter=%s has_header=%s', _d.delimiter, _has_header)
+                except Exception as _e:
+                    logger.info('/join-preview right sniffer failed: %s', _e)
+            except Exception as _e:
+                logger.info('/join-preview unable to read right_mat %s: %s', right_mat, _e)
+        except Exception:
+            pass
+        left_df = _read_table(left_mat)
+        right_df = _read_table(right_mat)
+
+        # If ingestion produced long-form rows (with `unit_kind` and `text` columns),
+        # reconstruct a table-like DataFrame by parsing the `text` lines into columns
+        # so join logic can operate on tabular data.
+        try:
+            import csv as _csv
+            import io as _io
+            try:
+                import polars as pl
+            except Exception:
+                pl = None
+            def _reconstruct_table(df):
+                try:
+                    if not (hasattr(df, 'columns') and {'unit_kind', 'text'}.issubset(set(df.columns if hasattr(df, 'columns') else []))):
+                        return df
+                    # gather line units
+                    if _is_polars_df(df):
+                        try:
+                            lines = df.filter(pl.col('unit_kind') == 'line').sort('row_index').select(['row_index', 'text']).to_dicts()
+                        except Exception:
+                            lines = df.filter(pl.col('unit_kind') == 'line').select(['row_index', 'text']).to_dicts()
+                    else:
+                        lines = df[df.get('unit_kind') == 'line'][['row_index', 'text']].to_dict('records')
+                    if not lines:
+                        logger.info('/join-preview reconstruction: no line units found')
+                        return df
+                    sample = '\n'.join(str(r.get('text', '')) for r in lines[:8])
+                    counts = {',': sample.count(','), '\t': sample.count('\t'), ';': sample.count(';'), '|': sample.count('|')}
+                    delim = max(counts.items(), key=lambda kv: kv[1])[0]
+                    logger.info('/join-preview reconstruction: lines=%s delim=%s', len(lines), delim)
+                    parsed = []
+                    for r in lines:
+                        text = r.get('text') or ''
+                        try:
+                            reader = _csv.reader(_io.StringIO(text), delimiter=delim)
+                            row = next(reader, [])
+                        except Exception:
+                            row = []
+                        if row:
+                            parsed.append(row)
+                    if not parsed:
+                        logger.info('/join-preview reconstruction: parsing produced 0 parsed rows')
+                        return df
+                    # assume first row is header if it contains non-numeric values
+                    header = parsed[0]
+                    logger.info('/join-preview reconstruction: header=%s', header)
+                    data_rows = parsed[1:]
+                    if not data_rows:
+                        # single-row file: treat header as data
+                        cols = [f'col{i}' for i in range(len(header))]
+                        data = [dict(zip(cols, header))]
+                    else:
+                        cols = header
+                        data = [dict(zip(cols, r)) for r in data_rows]
+                    try:
+                        return pl.DataFrame(data) if pl is not None else __import__('pandas').DataFrame(data)
+                    except Exception:
+                        import pandas as _pd
+                        return _pd.DataFrame(data)
+                except Exception:
+                    return df
+
+            left_df = _reconstruct_table(left_df)
+            right_df = _reconstruct_table(right_df)
+        except Exception:
+            pass
+        try:
+            logger.info('/join-preview left_df columns: %s', list(left_df.columns if _is_polars_df(left_df) else list(left_df.columns)))
+            logger.info('/join-preview right_df columns: %s', list(right_df.columns if _is_polars_df(right_df) else list(right_df.columns)))
+        except Exception:
+            pass
 
         # determine join keys
         left_on = spec.left_on
@@ -1952,6 +2427,40 @@ def join_preview(spec: JoinPreviewSpec):
                             pass
         except Exception:
             pass
+
+        # Validate that provided join keys exist in the resolved dataframes
+        try:
+            # ensure left_on/right_on are lists
+            left_on = list(left_on) if left_on is not None else []
+            right_on = list(right_on) if right_on is not None else []
+        except Exception:
+            left_on = left_on or []
+            right_on = right_on or []
+
+        # Validate join keys and include available columns in error responses for diagnosis
+        left_cols_list = list(left_df.columns if _is_polars_df(left_df) else list(left_df.columns))
+        right_cols_list = list(right_df.columns if _is_polars_df(right_df) else list(right_df.columns))
+        for k in left_on:
+            if k not in (left_df.columns if _is_polars_df(left_df) else list(left_df.columns)):
+                # include resolved source info in the error to aid debugging when devtools are unavailable
+                raise HTTPException(status_code=400, detail={
+                    "message": "Join key not found in left source",
+                    "missing_key": k,
+                    "left_columns": left_cols_list,
+                    "right_columns": right_cols_list,
+                    "left_resolved": {"path": getattr(left_res, 'path', None), "materialized_path": getattr(left_res, 'materialized_path', None), "exists": getattr(left_res, 'exists', None)},
+                    "right_resolved": {"path": getattr(right_res, 'path', None), "materialized_path": getattr(right_res, 'materialized_path', None), "exists": getattr(right_res, 'exists', None)},
+                })
+        for k in right_on:
+            if k not in (right_df.columns if _is_polars_df(right_df) else list(right_df.columns)):
+                raise HTTPException(status_code=400, detail={
+                    "message": "Join key not found in right source",
+                    "missing_key": k,
+                    "left_columns": left_cols_list,
+                    "right_columns": right_cols_list,
+                    "left_resolved": {"path": getattr(left_res, 'path', None), "materialized_path": getattr(left_res, 'materialized_path', None), "exists": getattr(left_res, 'exists', None)},
+                    "right_resolved": {"path": getattr(right_res, 'path', None), "materialized_path": getattr(right_res, 'materialized_path', None), "exists": getattr(right_res, 'exists', None)},
+                })
 
         # perform join (use polars), but first rename conflicting right-side columns
         joined = None
@@ -2082,6 +2591,15 @@ def join_preview(spec: JoinPreviewSpec):
 @app.post("/join-export")
 def join_export(spec: JoinExportSpec):
     try:
+        # DEBUG: log incoming spec for diagnosis of join key issues
+        try:
+            logger.info("/join-export incoming spec: %s", json.dumps(spec.dict() if hasattr(spec, 'dict') else spec))
+        except Exception:
+            try:
+                logger.info("/join-export incoming spec raw: %s", str(spec))
+            except Exception:
+                pass
+
         # If explicit target_user provided, block if they opted out
         if spec.target_user and _is_opted_out(user_id=spec.target_user):
             _privacy_audit("blocked_join_export_target_opt_out", {"target_user": spec.target_user})
@@ -2129,6 +2647,41 @@ def join_export(spec: JoinExportSpec):
         how = spec.join_type or "inner"
         how_map = {"outer": "outer", "full": "outer", "left": "left", "right": "right", "inner": "inner", "anti": "anti"}
         how = how_map.get(how.lower(), how.lower())
+
+        # Validate that provided join keys exist in the resolved dataframes
+        try:
+            left_on = list(left_on) if left_on is not None else []
+            right_on = list(right_on) if right_on is not None else []
+        except Exception:
+            left_on = left_on or []
+            right_on = right_on or []
+        # Validate that provided join keys exist in the resolved dataframes
+        try:
+            # ensure left_on/right_on are lists
+            left_on = list(left_on) if left_on is not None else []
+            right_on = list(right_on) if right_on is not None else []
+        except Exception:
+            left_on = left_on or []
+            right_on = right_on or []
+
+        left_cols_list = list(left_df.columns if _is_polars_df(left_df) else list(left_df.columns))
+        right_cols_list = list(right_df.columns if _is_polars_df(right_df) else list(right_df.columns))
+        for k in left_on:
+            if k not in (left_df.columns if _is_polars_df(left_df) else list(left_df.columns)):
+                raise HTTPException(status_code=400, detail={
+                    "message": "Join key not found in left source",
+                    "missing_key": k,
+                    "left_columns": left_cols_list,
+                    "right_columns": right_cols_list,
+                })
+        for k in right_on:
+            if k not in (right_df.columns if _is_polars_df(right_df) else list(right_df.columns)):
+                raise HTTPException(status_code=400, detail={
+                    "message": "Join key not found in right source",
+                    "missing_key": k,
+                    "left_columns": left_cols_list,
+                    "right_columns": right_cols_list,
+                })
 
         # conflict resolution options
         conf = spec.conflict_resolution or {}
@@ -2239,6 +2792,28 @@ def join_export(spec: JoinExportSpec):
         if fmt == "csv":
             try:
                 _write_csv(joined, str(out_path))
+                # record history entry for this join export
+                try:
+                    now = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
+                    rec = {
+                        "id": f"join_{uuid4().hex}",
+                        "type": "join",
+                        "status": "success",
+                        "started_at": now,
+                        "finished_at": now,
+                        "left_path": spec.left_path,
+                        "right_path": spec.right_path,
+                        "left_on": left_on,
+                        "right_on": right_on,
+                        "join_type": how,
+                        "export_format": fmt,
+                        "output_path": str(out_path),
+                        "filename": fname,
+                    }
+                    outp = HISTORY_DIR / f"{rec['id']}.json"
+                    outp.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding='utf-8')
+                except Exception:
+                    logger.exception('Failed to write join history record')
                 return {"export_path": str(out_path)}
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
@@ -2259,6 +2834,13 @@ def join_export(spec: JoinExportSpec):
                         ws.append(r)
                 xlsx_path = str(OUTPUTS_DIR / f"{fname}.xlsx")
                 wb.save(xlsx_path)
+                try:
+                    now = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
+                    rec = {"id": f"join_{uuid4().hex}", "type": "join", "status": "success", "started_at": now, "finished_at": now, "left_path": spec.left_path, "right_path": spec.right_path, "left_on": left_on, "right_on": right_on, "join_type": how, "export_format": 'xlsx', "output_path": xlsx_path, "filename": fname}
+                    outp = HISTORY_DIR / f"{rec['id']}.json"
+                    outp.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding='utf-8')
+                except Exception:
+                    logger.exception('Failed to write join history record')
                 return {"export_path": xlsx_path}
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
@@ -2269,6 +2851,13 @@ def join_export(spec: JoinExportSpec):
                 pd_df = joined.to_pandas() if hasattr(joined, 'to_pandas') else joined
                 pkl_path = str(OUTPUTS_DIR / f"{fname}.pkl")
                 pd_df.to_pickle(pkl_path)
+                try:
+                    now = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
+                    rec = {"id": f"join_{uuid4().hex}", "type": "join", "status": "success", "started_at": now, "finished_at": now, "left_path": spec.left_path, "right_path": spec.right_path, "left_on": left_on, "right_on": right_on, "join_type": how, "export_format": 'pandas', "output_path": pkl_path, "filename": fname}
+                    outp = HISTORY_DIR / f"{rec['id']}.json"
+                    outp.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding='utf-8')
+                except Exception:
+                    logger.exception('Failed to write join history record')
                 return {"export_path": pkl_path}
             except Exception:
                 # fallback to parquet using polars
@@ -2312,6 +2901,13 @@ def join_export(spec: JoinExportSpec):
                     cur.executemany(f'INSERT INTO joined VALUES ({placeholders})', to_insert)
                     con.commit()
                 con.close()
+                try:
+                    now = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
+                    rec = {"id": f"join_{uuid4().hex}", "type": "join", "status": "success", "started_at": now, "finished_at": now, "left_path": spec.left_path, "right_path": spec.right_path, "left_on": left_on, "right_on": right_on, "join_type": how, "export_format": 'sql', "output_path": db_path, "filename": fname}
+                    outp = HISTORY_DIR / f"{rec['id']}.json"
+                    outp.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding='utf-8')
+                except Exception:
+                    logger.exception('Failed to write join history record')
                 return {"export_path": db_path}
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
@@ -2319,6 +2915,13 @@ def join_export(spec: JoinExportSpec):
         # default: fallback to csv
         try:
             _write_csv(joined, str(out_path))
+            try:
+                now = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
+                rec = {"id": f"join_{uuid4().hex}", "type": "join", "status": "success", "started_at": now, "finished_at": now, "left_path": spec.left_path, "right_path": spec.right_path, "left_on": left_on, "right_on": right_on, "join_type": how, "export_format": fmt, "output_path": str(out_path), "filename": fname}
+                outp = HISTORY_DIR / f"{rec['id']}.json"
+                outp.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding='utf-8')
+            except Exception:
+                logger.exception('Failed to write join history record')
             return {"export_path": str(out_path)}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
@@ -2426,11 +3029,32 @@ def delete_upload(payload: dict):
             raise HTTPException(status_code=403, detail="Delete restricted to uploads directory")
         if not resolved.exists():
             raise HTTPException(status_code=404, detail="File not found")
+        # delete the main file
         resolved.unlink()
+        # also attempt to delete any associated meta file named <filename>.meta.json
+        try:
+            meta = resolved.parent / (resolved.name + '.meta.json')
+            if meta.exists():
+                meta.unlink()
+        except Exception:
+            pass
+        # attempt to log/audit this deletion
+        try:
+            logger.info(f"Upload deleted: {resolved}")
+        except Exception:
+            pass
+        try:
+            _append_audit_event(Path('data') / 'upload_audit', 'upload_deleted', { 'path': str(resolved), 'deleted_by': None })
+        except Exception:
+            pass
         # notify websocket clients of updated uploads list
         try:
             import asyncio
-            asyncio.create_task(_broadcast_shared_update_message({"type": "uploads_changed", "deleted": str(resolved)}))
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_broadcast_shared_update_message({"type": "uploads_changed", "deleted": str(resolved)}))
+            except RuntimeError:
+                pass
         except Exception:
             pass
         return {"deleted": str(resolved)}
@@ -3025,8 +3649,152 @@ def _get_user_from_token(token: str):
             jwt_algo = JWT_ALGO
             try:
                 payload = jwt.decode(token, jwt_secret, algorithms=[jwt_algo], leeway=60)
+                try:
+                    kid = jwt.get_unverified_header(token).get('kid')
+                except Exception:
+                    kid = None
+                logger.info(f"Token verified with local JWT_SECRET (kid={kid})")
             except Exception:
-                return None
+                # Initial HS256 decode failed. Try structured fallbacks:
+                # 1) If SUPABASE_JWT_SECRET is set, try decode with it (HS256).
+                # 2) If available, use JWKS (PyJWKClient) to verify ES256/RS256 tokens.
+                # If neither works, fail (no signature-less decoding).
+                payload = None
+                supa_secret = os.environ.get('SUPABASE_JWT_SECRET')
+                if supa_secret:
+                    try:
+                        payload = jwt.decode(token, supa_secret, algorithms=[jwt_algo], leeway=60)
+                        try:
+                            kid = jwt.get_unverified_header(token).get('kid')
+                        except Exception:
+                            kid = None
+                        logger.info(f"Token verified with SUPABASE_JWT_SECRET (kid={kid})")
+                    except Exception:
+                        payload = None
+
+                # If still not decoded, attempt JWKS verification using SUPABASE_JWKS_URL or SUPABASE_URL
+                if not payload and PyJWKClient is not None:
+                    try:
+                        jwks_url = os.environ.get('SUPABASE_JWKS_URL')
+                        if not jwks_url:
+                            supabase_url = os.environ.get('SUPABASE_URL')
+                            if supabase_url:
+                                jwks_url = supabase_url.rstrip('/') + '/auth/v1/certs'
+                        # As a last resort, try issuer from unverified claims
+                        if not jwks_url:
+                            try:
+                                unverified = jwt.decode(token, options={"verify_signature": False})
+                                iss = unverified.get('iss')
+                                if iss:
+                                    jwks_url = iss.rstrip('/') + '/.well-known/jwks.json'
+                            except Exception:
+                                jwks_url = None
+                        if jwks_url:
+                            try:
+                                # Try cached JWKS first
+                                try:
+                                    jwks = _fetch_jwks_cached(jwks_url)
+                                except Exception:
+                                    jwks = None
+                                try:
+                                    kid = jwt.get_unverified_header(token).get('kid')
+                                except Exception:
+                                    kid = None
+
+                                key_dict = None
+                                if jwks and kid:
+                                    key_dict = _find_jwk_for_kid(jwks, kid)
+
+                                if key_dict:
+                                    # Try to build public key from JWK locally to avoid extra network calls
+                                    try:
+                                        jwk_json = json.dumps(key_dict)
+                                        public_key = None
+                                        try:
+                                            public_key = jwt.algorithms.RSAAlgorithm.from_jwk(jwk_json)
+                                        except Exception:
+                                            try:
+                                                public_key = jwt.algorithms.ECAlgorithm.from_jwk(jwk_json)
+                                            except Exception:
+                                                public_key = None
+                                        if public_key is None:
+                                            raise Exception("Unsupported JWK algorithm for local key construction")
+                                        payload = jwt.decode(token, public_key, algorithms=["ES256", "RS256"], leeway=60, options={"verify_aud": False})
+                                        logger.info(f"Token verified via cached JWKS {jwks_url} (kid={kid})")
+                                    except Exception:
+                                        # Local construction failed — fall back to PyJWKClient if available
+                                        try:
+                                            if PyJWKClient is not None:
+                                                jwks_client = PyJWKClient(jwks_url)
+                                                signing_key = jwks_client.get_signing_key_from_jwt(token)
+                                                public_key = signing_key.key
+                                                payload = jwt.decode(token, public_key, algorithms=["ES256", "RS256"], leeway=60, options={"verify_aud": False})
+                                                logger.info(f"Token verified via JWKS {jwks_url} (kid={kid})")
+                                            else:
+                                                raise
+                                        except Exception:
+                                            logger.exception("JWKS verification attempt failed")
+                                            payload = None
+                                else:
+                                    # No matching kid in cached JWKS — try fetching via PyJWKClient as fallback
+                                    try:
+                                        if PyJWKClient is not None:
+                                            jwks_client = PyJWKClient(jwks_url)
+                                            signing_key = jwks_client.get_signing_key_from_jwt(token)
+                                            public_key = signing_key.key
+                                            payload = jwt.decode(token, public_key, algorithms=["ES256", "RS256"], leeway=60, options={"verify_aud": False})
+                                            try:
+                                                kid = jwt.get_unverified_header(token).get('kid')
+                                            except Exception:
+                                                kid = None
+                                            logger.info(f"Token verified via JWKS {jwks_url} (kid={kid})")
+                                        else:
+                                            payload = None
+                                    except Exception:
+                                        logger.exception("JWKS verification attempt failed")
+                                        payload = None
+                            except Exception:
+                                payload = None
+                    except Exception:
+                        payload = None
+
+                if not payload:
+                    logger.info("Token could not be decoded with configured secrets or JWKS")
+                    return None
+
+                # build minimal user object from decoded claims and map/create local user
+                uid = payload.get('sub') or payload.get('user_id') or payload.get('aud')
+                if not uid:
+                    logger.info("Token decoded but no uid found in claims")
+                    return None
+                local = _get_user_by_id(uid)
+                if local:
+                    return local
+                try:
+                    user = {
+                        'id': uid,
+                        'username': payload.get('email') or str(uid),
+                        'email': payload.get('email'),
+                        'created_at': datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),
+                        'role': payload.get('role') or payload.get('app_role') or 'member',
+                        'is_admin': True if (payload.get('role') == 'admin') else False
+                    }
+                    p = _users_dir() / f"{uid}.json"
+                    p.write_text(json.dumps(user, indent=2, ensure_ascii=False), encoding='utf-8')
+                    logger.info(f"Created local user file from token: {p}")
+                    try:
+                        _consent_audit('create_user_from_supabase', {'user_id': uid, 'email': user.get('email')})
+                    except Exception:
+                        pass
+                    return user
+                except Exception:
+                    return {
+                        'id': uid,
+                        'email': payload.get('email'),
+                        'username': payload.get('email') or uid,
+                        'role': payload.get('role') or payload.get('app_role') or 'authenticated',
+                        'is_admin': payload.get('role') == 'admin'
+                    }
             uid = payload.get("sub")
             # Refresh tokens carry purpose="refresh" and their jti is the session key
             if payload.get("purpose") == "refresh":
@@ -3165,6 +3933,23 @@ def _read_session_file(path: Path):
         return False
 
 
+if __name__ == '__main__':
+    # Programmatic Uvicorn entrypoint for local development and tooling.
+    # This ensures `python fbroom/main.py` behaves like `uvicorn fbroom.main:app`.
+    try:
+        import uvicorn
+    except Exception:
+        raise
+
+    host = os.environ.get('HOST', '127.0.0.1')
+    port = int(os.environ.get('PORT', os.environ.get('PORT', '3009')))
+    log_level = os.environ.get('LOG_LEVEL', 'info').lower()
+    reload_flag = os.environ.get('DEV_RELOAD', 'false').lower() in ('1', 'true', 'yes')
+
+    # Pass the already-imported `app` object to avoid re-importing this module
+    uvicorn.run(app, host=host, port=port, log_level=log_level, reload=reload_flag)
+
+
 def _make_verification_token(user_id: str, email: str, expires_seconds: int = 60 * 60 * 24):
     jwt_secret = JWT_SECRET
     jwt_algo = JWT_ALGO
@@ -3299,8 +4084,9 @@ def login(spec: UserLogin, request: Request, response: Response):
         secure_flag = True if os.environ.get("ENV") == "production" else False
         # For production, prefer SameSite=None with Secure; for local dev use Lax so browsers will send cookie
         samesite_flag = "none" if secure_flag else "lax"
+        cookie_domain = os.environ.get("COOKIE_DOMAIN") or None
         try:
-            response.set_cookie(cookie_name, tokens.get("refresh_token"), httponly=True, samesite=samesite_flag, secure=secure_flag)
+            response.set_cookie(cookie_name, tokens.get("refresh_token"), httponly=True, samesite=samesite_flag, secure=secure_flag, domain=cookie_domain)
         except Exception:
             pass
         _consent_audit("login", {"user_id": user.get("id")})
@@ -3409,12 +4195,20 @@ async def refresh_token(request: Request, response: Response):
             token = None
         # If cookie is missing, allow dev-only fallback to accept a refresh token in the JSON body
         if not token:
-            if os.environ.get("ENV") != "production":
-                try:
-                    body = await request.json()
-                    token = body.get("refresh_token")
-                except Exception:
-                    token = None
+            # 1) Check Authorization header for Bearer token (dev-only)
+            auth_hdr = request.headers.get("authorization") or request.headers.get("Authorization")
+            if auth_hdr and auth_hdr.lower().startswith("bearer ") and os.environ.get("ENV") != "production":
+                token = auth_hdr.split(None, 1)[1].strip()
+                logger.info("Using refresh token from Authorization header (dev-only)")
+
+            # 2) If still missing, allow dev-only JSON body fallback
+            if not token:
+                if os.environ.get("ENV") != "production":
+                    try:
+                        body = await request.json()
+                        token = body.get("refresh_token")
+                    except Exception:
+                        token = None
             if not token:
                 raise HTTPException(status_code=400, detail="Missing refresh_token")
         jwt_secret = JWT_SECRET
@@ -3480,8 +4274,9 @@ async def refresh_token(request: Request, response: Response):
         # set rotated refresh cookie
         secure_flag = True if os.environ.get("ENV") == "production" else False
         samesite_flag = "none" if secure_flag else "lax"
+        cookie_domain = os.environ.get("COOKIE_DOMAIN") or None
         try:
-            response.set_cookie(cookie_name, new_refresh_token, httponly=True, samesite=samesite_flag, secure=secure_flag)
+            response.set_cookie(cookie_name, new_refresh_token, httponly=True, samesite=samesite_flag, secure=secure_flag, domain=cookie_domain)
         except Exception:
             pass
 
@@ -4745,7 +5540,11 @@ def share_upload(name: str, payload: dict, request: Request):
         _privacy_audit("upload_share", {"user": user.get("id"), "file": str(upath), "shared": shared})
         try:
             import asyncio
-            asyncio.create_task(_broadcast_shared_update_message({"type": "shared_changed", "file": str(upath), "shared": shared}))
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_broadcast_shared_update_message({"type": "shared_changed", "file": str(upath), "shared": shared}))
+            except RuntimeError:
+                pass
         except Exception:
             pass
         return {"ok": True}
@@ -4977,6 +5776,7 @@ def me(request: Request):
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Unhandled error in /me route")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -5344,6 +6144,232 @@ def admin_set_user_role(user_id: str, payload: dict, request: Request):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _call_supabase_service_role(path: str, method: str = 'GET', json_body: dict = None):
+    """Internal helper: call Supabase REST API endpoints with the service_role key.
+    Returns httpx.Response-like dict with status_code and json() result when possible.
+    """
+    supabase_url = os.environ.get('SUPABASE_URL')
+    service_key = os.environ.get('SUPABASE_SERVICE_ROLE_KEY')
+    if not supabase_url or not service_key:
+        raise RuntimeError('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set')
+    url = supabase_url.rstrip('/') + path
+    headers = {
+        'Content-Type': 'application/json',
+        'apikey': service_key,
+        'Authorization': f'Bearer {service_key}'
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        if method.upper() == 'GET':
+            r = await client.get(url, headers=headers)
+        elif method.upper() == 'POST':
+            r = await client.post(url, headers=headers, json=json_body)
+        elif method.upper() == 'PATCH':
+            r = await client.patch(url, headers=headers, json=json_body)
+        elif method.upper() == 'DELETE':
+            r = await client.delete(url, headers=headers, json=json_body)
+        else:
+            r = await client.request(method, url, headers=headers, json=json_body)
+    return r
+
+
+# Admin precheck utilities: IP allowlist and simple rate limiting
+ADMIN_RATE_LIMIT_PER_MIN = int(os.environ.get('ADMIN_RATE_LIMIT_PER_MIN', '60'))
+# Redis-backed rate limiting: uses key per IP per-minute
+_admin_rate_counters = None
+_admin_rate_lock = None
+
+
+def _get_redis_client():
+    """Return a Redis client or None if not configured/available."""
+    try:
+        if getattr(app.state, '_redis_client', None):
+            return app.state._redis_client
+        url = os.environ.get('REDIS_URL')
+        if not url:
+            host = os.environ.get('REDIS_HOST')
+            port = os.environ.get('REDIS_PORT', '6379')
+            if host:
+                url = f"redis://{host}:{port}/0"
+        if not url or _redis_lib is None:
+            return None
+        client = _redis_lib.from_url(url, decode_responses=True)
+        app.state._redis_client = client
+        return client
+    except Exception:
+        return None
+
+
+def _get_client_ip(request: Request):
+    # Prefer X-Forwarded-For or X-Real-Ip headers (support proxies), fall back to request.client
+    try:
+        hdr = request.headers.get('x-forwarded-for') or request.headers.get('x-real-ip')
+        if hdr:
+            # may be comma-separated
+            return hdr.split(',')[0].strip()
+        if getattr(request, 'client', None) and getattr(request.client, 'host', None):
+            return request.client.host
+    except Exception:
+        pass
+    return None
+
+
+def _require_admin_with_ip_check(request: Request):
+    # first ensure user is admin according to existing logic
+    user = _require_admin(request)
+    # if an allowlist is configured, enforce it
+    allow = os.environ.get('SUPABASE_ADMIN_IP_ALLOWLIST')
+    if allow:
+        ip = _get_client_ip(request) or ''
+        allowed = [a.strip() for a in allow.split(',') if a.strip()]
+        ok = False
+        for a in allowed:
+            try:
+                if '/' in a:
+                    net = ipaddress.ip_network(a, strict=False)
+                    if ip and ipaddress.ip_address(ip) in net:
+                        ok = True
+                        break
+                else:
+                    if ip == a:
+                        ok = True
+                        break
+            except Exception:
+                # ignore malformed entries
+                continue
+        if not ok:
+            raise HTTPException(status_code=403, detail='Admin access from this IP is not allowed')
+    return user
+
+
+def _admin_rate_limit_check(request: Request):
+    try:
+        ip = _get_client_ip(request) or 'unknown'
+        limit = int(os.environ.get('ADMIN_RATE_LIMIT_PER_MIN', ADMIN_RATE_LIMIT_PER_MIN))
+        # use minute window key
+        window_key = int(time.time() // 60)
+        key = f"admin_rate:{ip}:{window_key}"
+        r = _get_redis_client()
+        if r is not None:
+            val = r.incr(key)
+            if int(val) == 1:
+                # set TTL slightly longer than a minute
+                try:
+                    r.expire(key, 65)
+                except Exception:
+                    pass
+            if int(val) > int(limit):
+                raise HTTPException(status_code=429, detail='Too many admin requests')
+        else:
+            # No redis configured; fail-open to avoid locking out admins.
+            return
+    except HTTPException:
+        raise
+    except Exception:
+        # on any internal error, do not block admin (fail-open)
+        return
+
+
+def _admin_precheck(request: Request):
+    _require_admin_with_ip_check(request)
+    _admin_rate_limit_check(request)
+
+
+@app.post('/admin/supabase/users')
+async def admin_list_supabase_users(request: Request):
+    """Admin-only endpoint that lists Supabase auth users using service-role key.
+    Audits each call via `_consent_audit` and returns limited user info.
+    """
+    try:
+        _admin_precheck(request)
+        # call Supabase REST endpoint for users via service-role helper
+        r = await _call_supabase_service_role('/auth/v1/admin/users', method='GET')
+        _consent_audit('admin_supabase_list_users', {'by': _get_request_audit_context(request), 'status': getattr(r, 'status_code', None)})
+        status = getattr(r, 'status_code', None)
+        if status != 200:
+            raise HTTPException(status_code=502, detail=f"Supabase auth admin error: {status}")
+        try:
+            data = r.json()
+        except Exception:
+            data = None
+        users = []
+        if isinstance(data, dict):
+            items = data.get('users') or []
+        elif isinstance(data, list):
+            items = data
+        else:
+            items = []
+        for u in items:
+            if isinstance(u, dict):
+                users.append({'id': u.get('id'), 'email': u.get('email'), 'aud': u.get('aud'), 'created_at': u.get('created_at')})
+        return {'ok': True, 'users': users}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/admin/supabase/user/delete')
+async def admin_delete_supabase_user(payload: dict, request: Request):
+    """Admin-only: delete a Supabase auth user by id (uses service-role key).
+    Body: { user_id: '<uuid>' }
+    """
+    try:
+        _admin_precheck(request)
+        uid = payload.get('user_id')
+        if not uid:
+            raise HTTPException(status_code=400, detail='Missing user_id')
+        r = await _call_supabase_service_role(f'/auth/v1/admin/users/{uid}', method='DELETE')
+        _consent_audit('admin_supabase_delete_user', {'by': _get_request_audit_context(request), 'target': uid, 'status': getattr(r, 'status_code', None)})
+        status = getattr(r, 'status_code', None)
+        if status not in (200, 204):
+            raise HTTPException(status_code=502, detail=f"Supabase delete user failed: {status}")
+        return {'ok': True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/admin/supabase/rpc')
+async def admin_supabase_rpc(payload: dict, request: Request):
+    """Admin-only: call a Supabase Postgres function (RPC) with service-role key.
+
+    Body: {
+      "function": "my_function",
+      "params": { ... }   # optional object or list
+    }
+    """
+    try:
+        _admin_precheck(request)
+        fn = (payload.get('function') or '').strip() if payload else ''
+        if not fn:
+            raise HTTPException(status_code=400, detail='Missing function name')
+        params = payload.get('params') if payload and 'params' in payload else None
+        # call the Supabase REST RPC endpoint
+        path = f"/rest/v1/rpc/{fn}"
+        r = await _call_supabase_service_role(path, method='POST', json_body=params)
+        _consent_audit('admin_supabase_rpc', {'by': _get_request_audit_context(request), 'function': fn, 'status': getattr(r, 'status_code', None)})
+        status = getattr(r, 'status_code', None)
+        if status is None:
+            raise HTTPException(status_code=502, detail='Supabase RPC no response')
+        try:
+            body = r.json()
+        except Exception:
+            body = None
+        return {'ok': True, 'status': status, 'result': body}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def _get_request_audit_context(request: Request):
+    try:
+        return {'ip': request.client.host if getattr(request, 'client', None) else None, 'path': str(request.url)}
+    except Exception:
+        return {'ip': None, 'path': None}
 
 
 @app.get("/admin/users")
