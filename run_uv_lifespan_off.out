@@ -1,0 +1,6 @@
+run_uvicorn_single: uvicorn version 0.48.0
+Refusing to start: port 3009 already in use by another process.
+Stop the existing process(es) and retry, or use a different port.
+
+Detected listeners:
+  PID 26472: 127.0.0.1:3009 LISTENING cmd: <unknown>

@@ -5,16 +5,17 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1421",
     "build": "vite build",
-    "preview": "vite preview --port 5173",
+    "preview": "vite preview --port 5174",
     "tauri:dev": "cd ..\\src-tauri && cargo tauri dev"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.112.4",
+    "@tauri-apps/api": "^1.6.0",
     "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "@tauri-apps/api": "^1.6.0"
+    "react-dom": "^18.2.0"
   },
   "devDependencies": {
-    "vite": "^5.0.0",
-    "@vitejs/plugin-react": "^4.0.0"
+    "@vitejs/plugin-react": "^4.0.0",
+    "vite": "^5.0.0"
   }
 }

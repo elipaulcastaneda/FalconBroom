@@ -24,6 +24,9 @@ except Exception:
     _dateutil_parser = None
 import time
 
+import logging
+logger = logging.getLogger('fbroom.engine')
+
 # Simple in-memory cache for exchange rates: {(provider, from, to): (rate, ts)}
 _EXCHANGE_RATE_CACHE = {}
 
@@ -2535,14 +2538,77 @@ def _read_table(path: str):
         "try_parse_dates": True,
     }
     suffix = str(materialized_path).lower()
+    logger.info("_read_table materialized_path=%s suffix=%s", materialized_path, suffix)
+    df = None
     if suffix.endswith(".parquet"):
-        return pl.read_parquet(materialized_path)
-    for separator in (",", "\t", ";"):
         try:
-            return pl.read_csv(materialized_path, separator=separator, **read_kwargs)
-        except Exception:
-            continue
-    return pl.read_csv(materialized_path, has_header=False, new_columns=["value"], **read_kwargs)
+            df = pl.read_parquet(materialized_path)
+            logger.info("_read_table parquet read ok, columns=%s", list(df.columns if _is_polars_df(df) else list(df.columns)))
+        except Exception as e:
+            logger.exception("_read_table failed to read parquet %s: %s", materialized_path, e)
+            raise
+    # try common separators
+    last_exc = None
+    if df is None:
+        for separator in (",", "\t", ";"):
+            try:
+                logger.info("_read_table trying separator '%s' for %s", separator, materialized_path)
+                df = pl.read_csv(materialized_path, separator=separator, **read_kwargs)
+                logger.info("_read_table csv read ok with separator '%s', columns=%s", separator, list(df.columns if _is_polars_df(df) else list(df.columns)))
+                break
+            except Exception as e:
+                logger.warning("_read_table csv read failed with separator '%s' for %s: %s", separator, materialized_path, e)
+                last_exc = e
+                df = None
+                continue
+    # fallback: try reading without header into a single column
+    if df is None:
+        try:
+            logger.info("_read_table falling back to has_header=False for %s", materialized_path)
+            df = pl.read_csv(materialized_path, has_header=False, new_columns=["value"], **read_kwargs)
+            logger.info("_read_table fallback read ok, columns=%s", list(df.columns if _is_polars_df(df) else list(df.columns)))
+        except Exception as e:
+            logger.exception("_read_table fallback read failed for %s: %s", materialized_path, e)
+            # raise the last exception for visibility
+            raise last_exc or e
+
+    # If the read produced long-form ingestion rows (unit_kind/text), reconstruct
+    try:
+        cols = set(df.columns if _is_polars_df(df) else list(df.columns))
+        if {'unit_kind', 'text'}.issubset(cols):
+            try:
+                # extract 'line' units and parse CSV text into rows
+                lines = df.filter(pl.col('unit_kind') == 'line').sort('row_index').select(['row_index', 'text']).to_dicts()
+                if lines:
+                    import csv as _csv, io as _io
+                    sample = '\n'.join(str(r.get('text', '')) for r in lines[:8])
+                    counts = {',': sample.count(','), '\t': sample.count('\t'), ';': sample.count(';'), '|': sample.count('|')}
+                    delim = max(counts.items(), key=lambda kv: kv[1])[0]
+                    parsed = []
+                    for r in lines:
+                        text = r.get('text') or ''
+                        reader = _csv.reader(_io.StringIO(text), delimiter=delim)
+                        row = next(reader, [])
+                        if row:
+                            parsed.append(row)
+                    if parsed:
+                        header = parsed[0]
+                        data_rows = parsed[1:]
+                        if not data_rows:
+                            cols_names = [f'col{i}' for i in range(len(header))]
+                            data = [dict(zip(cols_names, header))]
+                        else:
+                            data = [dict(zip(header, r)) for r in data_rows]
+                        logger.info("_read_table reconstructed table with columns=%s", list(data[0].keys()) if data else [])
+                        return pl.DataFrame(data)
+            except Exception:
+                logger.exception("_read_table reconstruction failed for %s", materialized_path)
+                # fall through to returning original df
+                pass
+    except Exception:
+        pass
+
+    return df
 
 
 def _impute_missing(df, col, params=None):

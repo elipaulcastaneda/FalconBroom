@@ -1,0 +1,67 @@
+# Final SSL-enabled nginx site for FalconBroom
+# Domain: falconbroom.com
+# Certbot email: elipaulcastaneda100@gmail.com
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name falconbroom.com www.falconbroom.com;
+
+    # Serve ACME challenge files for Certbot
+    root /var/www/html;
+    client_max_body_size 200M;
+
+    location /.well-known/acme-challenge/ {
+        try_files $uri =404;
+    }
+
+    # Redirect all other HTTP to HTTPS
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name falconbroom.com www.falconbroom.com;
+
+    # TLS certs (populated by Certbot)
+    ssl_certificate /etc/letsencrypt/live/falconbroom.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/falconbroom.com/privkey.pem;
+    include /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+
+    # Security headers
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer-when-downgrade always;
+    add_header Permissions-Policy "interest-cohort=()" always;
+    add_header Content-Security-Policy "default-src 'self'; connect-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'" always;
+
+    client_max_body_size 200M;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+        try_files $uri =404;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:3009;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 120s;
+        proxy_buffering off;
+    }
+
+    # Optional: serve frontend static files if built
+    # location /static/ {
+    #     alias /srv/falconbroom/frontend/dist/;
+    # }
+}

@@ -1,0 +1,3 @@
+C:\Users\Elijah\AppData\Roaming\Python\Python314\site-packages\pydantic\_internal\_config.py:386: UserWarning: Valid config keys have changed in V2:
+* 'schema_extra' has been renamed to 'json_schema_extra'
+  warnings.warn(message, UserWarning)

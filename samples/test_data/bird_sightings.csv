@@ -1,0 +1,7 @@
+event_id,date,time,species,count,observer,location
+1001,2025-03-15,07:30:00,Red-tailed Hawk,1,Alice,North Ridge
+1002,2025-03-15,08:15:00,American Robin,5,Bob,North Ridge
+1003,2025-04-02,06:50:00,Canadian Goose,12,Charlie,Lake Shore
+1004,2025-05-10,09:00:00,Blue Jay,3,Dana,Pine Flats
+1005,2025-06-21,18:20:00,Swainson's Thrush,2,Erin,Meadow
+1006,2025-07-04,19:45:00,Common Loon,1,Frank,Lake Shore

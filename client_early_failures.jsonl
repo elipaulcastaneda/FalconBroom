@@ -1,0 +1,2 @@
+{"ts": 1790098719.20024, "remote": "127.0.0.1", "entry": {"msg": "test-from-agent", "level": "debug"}}
+{"ts": 1790103957.0940635, "remote": "127.0.0.1", "entry": {"msg": "simulated-fallback", "level": "error"}}

@@ -11,6 +11,120 @@
   <body>
     <div id="root"></div>
     <script src="https://cdn.jsdelivr.net/npm/cookieconsent@3/build/cookieconsent.min.js"></script>
-    <script type="module" src="/src/main.jsx"></script>
+    <!-- Preload loader: show blocking UI until host sets runtime backend URL and /health is reachable -->
+    <style>
+      #fb-loader-overlay{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:#0b1220;color:#fff;z-index:9999}
+      #fb-loader-box{max-width:480px;padding:24px;border-radius:8px;text-align:center}
+      .fb-spinner{width:36px;height:36px;border:4px solid rgba(255,255,255,0.15);border-top-color:#fff;border-radius:50%;animation:fbspin 1s linear infinite;margin:0 auto 12px}
+      @keyframes fbspin{to{transform:rotate(360deg)}}
+    </style>
+    <div id="fb-loader-overlay">
+      <div id="fb-loader-box">
+        <div class="fb-spinner" aria-hidden="true"></div>
+        <div id="fb-loader-text">Starting backend, please wait...</div>
+      </div>
+    </div>
+    <script>
+      (function(){
+        const MAX_WAIT_MS = 30000;
+        const POLL_MS = 250;
+        const start = Date.now();
+
+        function removeLoader(){
+          try{ const o=document.getElementById('fb-loader-overlay'); if(o) o.remove(); }catch(e){}
+        }
+
+        async function probeHealth(base){
+          try{
+            const res = await fetch((base||'') + '/health', {method:'GET', credentials:'include'});
+            return res && res.status === 200;
+          }catch(e){return false}
+        }
+
+        // Wait for host to set the runtime override, then probe health
+        // capture early network failures and XHR/fetch errors
+        window.__fb_early_network_failures = window.__fb_early_network_failures || [];
+
+        (function instrumentFetch(){
+          const _fetch = window.fetch;
+          window.fetch = async function(){
+            try{
+              const res = await _fetch.apply(this, arguments);
+              if (!res || (res.status && res.status >= 400)) {
+                window.__fb_early_network_failures.push({type:'fetch', args: Array.from(arguments), status: res && res.status});
+              }
+              return res;
+            }catch(e){
+              window.__fb_early_network_failures.push({type:'fetch', args: Array.from(arguments), error: String(e)});
+              throw e;
+            }
+          }
+        })();
+
+        (function instrumentXHR(){
+          const _XMLHttpRequest = window.XMLHttpRequest;
+          function WrappedXHR(){
+            const xhr = new _XMLHttpRequest();
+            const origOpen = xhr.open;
+            xhr.open = function(method, url){
+              this._fb_url = url;
+              return origOpen.apply(this, arguments);
+            };
+            xhr.addEventListener('error', function(){
+              window.__fb_early_network_failures.push({type:'xhr', url: this._fb_url, status: this.status, readyState: this.readyState});
+            });
+            xhr.addEventListener('load', function(){
+              if (this.status >= 400) {
+                window.__fb_early_network_failures.push({type:'xhr', url: this._fb_url, status: this.status});
+              }
+            });
+            return xhr;
+          }
+          window.XMLHttpRequest = WrappedXHR;
+        })();
+
+        async function flushEarlyFailures(){
+          try{
+            const payload = JSON.stringify(window.__fb_early_network_failures || []);
+            if (window.__TAURI__ && window.__TAURI__.invoke) {
+              try{ await window.__TAURI__.invoke('frontend_log', payload); }catch(e){ /* ignore */ }
+            } else if (window.__fb_early_network_failures.length){
+              // As a fallback, POST to /_client_log if backend reachable
+              try{ await fetch((window.__FALCONBROOM_BACKEND_URL||'') + '/_client_log', {method:'POST', headers:{'Content-Type':'application/json'}, body:payload}); }catch(e){}
+            }
+          }catch(e){}
+        }
+
+        (async function waitLoop(){
+          while(true){
+            const now = Date.now();
+            if (now - start > MAX_WAIT_MS) break;
+            const base = window.__FALCONBROOM_BACKEND_URL || (typeof window !== 'undefined' && window.__FALCONBROOM_BACKEND_URL) || null;
+            if (base) {
+              const ok = await probeHealth(base);
+              if (ok) {
+                // flush any early failures to host and then load main app
+                await flushEarlyFailures();
+                removeLoader();
+                const s = document.createElement('script');
+                s.type = 'module';
+                s.src = '/src/main.jsx';
+                document.body.appendChild(s);
+                return;
+              }
+            }
+            await new Promise(r=>setTimeout(r,POLL_MS));
+          }
+          // fallback: remove loader and still load app (so dev doesn't hang forever)
+          // on fallback, flush captured failures then load app
+          await flushEarlyFailures();
+          removeLoader();
+          const s = document.createElement('script');
+          s.type = 'module';
+          s.src = '/src/main.jsx';
+          document.body.appendChild(s);
+        })();
+      })();
+    </script>
   </body>
 </html>

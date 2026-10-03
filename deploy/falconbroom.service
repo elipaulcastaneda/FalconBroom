@@ -1,21 +1,15 @@
 [Unit]
-Description=FalconBroom FastAPI app (Uvicorn)
+Description=FalconBroom FastAPI app
 After=network.target
 
 [Service]
-# Edit these paths to match your installation
-User=youruser
-Group=yourgroup
-WorkingDirectory=/opt/falconbroom
-
-# ExecStart runs the app using the venv python. Adjust to your venv path and port.
-ExecStart=/opt/falconbroom/.venv/bin/python -m uvicorn fbroom.main:app --host 127.0.0.1 --port 8000 --workers 2 --log-level info
-
-# Optional environment file (create /etc/default/falconbroom to set env vars)
-EnvironmentFile=-/etc/default/falconbroom
-
-Restart=on-failure
-RestartSec=5s
+User=fbuser
+Group=www-data
+WorkingDirectory=/srv/falconbroom
+EnvironmentFile=/etc/falconbroom.env
+# Activate venv and run uvicorn
+ExecStart=/srv/falconbroom/.venv/bin/python -m uvicorn fbroom.main:app --host 127.0.0.1 --port 3009
+RestartSec=5
 LimitNOFILE=65536
 
 [Install]

@@ -59,8 +59,39 @@ Example quick test:
 1. Start backend:
 
 ```bash
-python -m uvicorn fbroom.main:app --reload --port 3008
+python -m uvicorn fbroom.main:app --reload --port 3009
 ```
+
+Alternative runner and helper scripts
+
+If running via the `uvicorn` CLI fails to bind on your machine, use the programmatic entrypoint added for development (it respects the `PORT` environment variable). The repo also includes two helper PowerShell scripts under `scripts/`:
+
+- `scripts/run_dev.ps1` — runs the backend in development mode (hot reload) on port `3009` (dev-only features).
+- `scripts/run_prod.ps1` — runs the backend in production-like mode (programmatic runner) on port `3010`.
+
+Usage (PowerShell):
+
+```powershell
+# Development (dev-only features, hot reload)
+.\scripts\run_dev.ps1
+
+# Production-like (no reload, programmatic runner)
+.\scripts\run_prod.ps1
+```
+
+If the default dev port `3009` is already in use on your system, change the `PORT` env var in the script or pass a different port explicitly (for example `3010`).
+
+Running the packaged Tauri app against a specific backend port
+
+When launching the packaged native app you can point it at a backend running on a non-default port by setting the `FALCONBROOM_BACKEND_URL` environment variable before starting the native executable. Example (PowerShell):
+
+```powershell
+$env:FALCONBROOM_BACKEND_URL='http://127.0.0.1:3010'
+$env:RUST_LOG='debug'
+.\src-tauri\target\release\falconbroom-tauri.exe 2>&1 | Tee-Object tauri_run.log
+```
+
+This is useful when `3009` is unavailable or you prefer to run the backend on a different port for testing.
 
 2. Start frontend (in another terminal):
 
@@ -70,7 +101,7 @@ npm install
 npm run dev
 ```
 
-3. Open the Vite UI at `http://127.0.0.1:5173` (or run the Tauri app which points to that dev path). Use the file picker or enter `data/demo/customers.csv`, click `Suggest` to populate the recipe editor, then `Preview` and `Apply`.
+3. Open the Vite UI at `http://127.0.0.1:5174` (or run the Tauri app which points to that dev path). Use the file picker or enter `data/demo/customers.csv`, click `Suggest` to populate the recipe editor, then `Preview` and `Apply`.
 
 Running the packaged Tauri app (native)
 --------------------------------------
@@ -120,7 +151,7 @@ npm run tauri:dev
 ```
 
 Notes:
- - The Tauri Rust binary spawns the Python backend using the bundled venv if present, or falls back to a system Python: it runs `python -m uvicorn fbroom.main:app --port 3008` in the bundled `python_app` working directory.
+- The Tauri Rust binary spawns the Python backend using the bundled venv if present, or falls back to a system Python: it runs `python -m uvicorn fbroom.main:app --port 3009` in the bundled `python_app` working directory.
 
 Packaging a self-contained installer
 ----------------------------------

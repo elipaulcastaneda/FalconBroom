@@ -1,0 +1,201 @@
+id,ocr_text
+1,Th1s is a sarnple tex1 with OCR err0rs.
+2,Invoice N0: 000123 - Am0unt: $1,234.5O
+3,Acct: 4l23-5O67-89
+4,Deliv3ry 4ddress: 123 Main St., Sprngfield
+5,Totai Due: OOO.OO
+6,Ref: INV-OO1
+7,Name: John D0e
+8,Phone: (O12) 345-6789
+9,Qty: l0 Price: $5.OO
+10,Sh1p to: 56B Elm St, Apt #2
+11,Date: 2O2l-08-1O
+12,SSN: 12O-45-6789
+13,Order#: 00l234
+14,Amount: $99,99
+15,Adres: 78 North Rd.
+16,Email: user@@example,com
+17,Subtotal: $1OO.O0
+18,Totai: $120.OO
+19,Bank: B@nk of Example
+20,Pay to: Mista J0nes
+21,Descrlption: Svc ch4rge
+22,Qty: 2O
+23,Total Items: tw0
+24,Shiping: Standard
+25,Del1v3red: Y
+26,Item: C0DE-1234
+27,Cusromer ID: 000-12-345
+28,Amount: $5O.OO
+29,Discount: l0%
+30,Notes: Ple@se call
+31,Recieved: 2021/08/10
+32,B1lling Addr: 9 Pine Ave
+33,Ref no: 1OOO
+34,Authorlzed signature
+35,Transactlon ID: trxn-OOl
+36,Card: **** **** **** 1234
+37,Exp: 08/2O
+38,CVV: O1O
+39,Amount USD: $45.OO
+40,P0stcode: 12345
+41,Country: USA/
+42,Customer: M0lly
+43,Qty: l
+44,Discounted: N
+45,Item: Widget
+46,Location: Warehouse #2
+47,Received: 10-Aug-2O21
+48,Ref: A-OO2
+49,Invoice: inv-1OO1
+50,Price: $15.OO
+51,Name: Pet3r
+52,Address: 2000 Elm St.
+53,Phone: 555-0123
+54,Email: name at domain dot com
+55,Total USD: $200,0O
+56,Order Date: 1O/08/2O21
+57,Invoice No.: lNV-1
+58,Amount Due: $0.OO
+59,Check#: 0O123
+60,Payee: The Co,mpany
+61,Receipt#: RCPT-OO1
+62,Service: Cleaning
+63,Duration: 2hrs
+64,Start: 09:O0
+65,End: 11:00
+66,Price/hr: $25.OO
+67,Sub-total: $50.00
+68,Tax: $4.5O
+69,Grand Total: $54.5O
+70,Attn: M. Smith
+71,OrderID: 000345
+72,Addr: 77 King's Road
+73,Country: UK
+74,Postal: SW1A 1AA
+75,Name: Luisa
+76,Amount: OOO.OO
+77,Qty: 5
+78,Weight: lkg
+79,Color: Blu3
+80,Model: X1-200
+81,Serial: SN-OOl23
+82,Note: Deliv3ry delayed
+83,Refund: $0.0O
+84,Store: Main St.
+85,Payment: c@sh
+86,Balance: $1O.OO
+87,Account no: 00l234567
+88,Branch: Centra1
+89,Swift: AB C D E
+90,Routing: 000000
+91,Transaction: successfui
+92,Phone: +44 O712345678
+93,Customer ref: xyz-OOl
+94,PO#: PO-1234
+95,Delivery: express
+96,Packed: yes
+97,Shipped: no
+98,Arrived: N/A
+99,Location: Dock 3
+100,Signed: -
+101,Name: Anna
+102,Invoice Amt: $1,000.OO
+103,Discount appl: NO
+104,Tax ID: 12-3456789
+105,Total Paid: $1,000.00
+106,Due Date: 2021-09-01
+107,Order#: A12345
+108,Customer: O'Connor
+109,Note: handwritten
+110,Ref: 000-ABC
+111,Addr: 12B Baker St.
+112,Zip: 90210
+113,State: CA
+114,Country: US
+115,Qty recvd: ten
+116,Reason: Damaged
+117,Retailer: St0re One
+118,SKU: sku-001
+119,Location: Backroom
+120,Price: $9.99
+121,Qty sold: 3
+122,Sale Date: Aug 10 2021
+123,Method: CASH
+124,Employee: J.D.
+125,TTL: 100
+126,Desc: Sample item
+127,Origin: Mainland
+128,Dest: Island
+129,Carrier: FastShip
+130,ETA: 2 days
+131,Paid: y
+132,Refunded: n
+133,Adjust: +$5
+134,Fee: $2.OO
+135,Platform: WEB
+136,Channel: mobile
+137,IP: 192.168.O.1
+138,MAC: 00:1A:2B:3C:4D:5E
+139,User: test_user
+140,Pwd: p@ssw0rd
+141,Auth: token
+142,Session: abc123
+143,Status: pending
+144,Processed: no
+145,Verified: yes
+146,Signature: illegible
+147,Form: A-1
+148,Ref2: 99999
+149,Code: XYZ
+150,Label: Fragile
+151,Barcode: 0123456789012
+152,Lot: L-001
+153,Batch: B-01
+154,Expiry: 2023-12-31
+155,Made in: CountryX
+156,Manufacturer: ACME
+157,Warranty: 12 months
+158,Serial No: SN123456
+159,Packaging: Box
+160,Condition: New
+161,Remark: OK
+162,Inspect: Passed
+163,QC: 001
+164,Temp: 4C
+165,Humidity: 50%
+166,Voltage: 220V
+167,Power: 50W
+168,Cable: Type-C
+169,Connector: USB
+170,Qty left: 15
+171,Min order: l
+172,Max order: 100
+173,Reorder: yes
+174,Lead time: 14 days
+175,MOQ: 10
+176,Discount code: SAVE10
+177,Coupon: NONE
+178,Gift wrap: no
+179,Rush: no
+180,Assembly: required
+181,Instruction: see manual
+182,Language: EN
+183,Currency: USD
+184,Rate: 1.OO
+185,Amount incl tax: $110.OO
+186,Delivery note: leave at door
+187,Alt contact: 555-9999
+188,Preferred: phone
+189,Secondary: email
+190,Referral: web
+191,Campaign: SUMMER21
+192,Feedback: good
+193,Rating: 5
+194,Complaint: none
+195,Resolution: n/a
+196,Followup: none
+197,Supervisor: S.M.
+198,Manager: T.L.
+199,CO: 0001
+200,PO status: open

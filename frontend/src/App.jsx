@@ -165,6 +165,7 @@ export default function App() {
   const [sourceInspection, setSourceInspection] = useState(null)
   const [showAsTable, setShowAsTable] = useState(true)
   const [diagnostics, setDiagnostics] = useState(null)
+  const [plainLanguageSuggestions, setPlainLanguageSuggestions] = useState(null)
   const [inspectOffset, setInspectOffset] = useState(0)
   const [preview, setPreview] = useState(null)
   const [applyRes, setApplyRes] = useState(null)
@@ -1272,7 +1273,34 @@ export default function App() {
     // show custom revisions box after upload
     setShowCustomRevisions(true)
 
-    await doProfileForPath(payload.path)
+    // If the upload response included immediate metadata, use it to populate UI
+    try {
+      if (payload.profile) {
+        setProfile(payload.profile)
+      }
+      if (payload.inspect_preview) {
+        const sanitized = sanitizeInspection(payload.inspect_preview)
+        setSourceInspection(sanitized)
+        setDiagnostics(sanitized?.diagnostics || null)
+      }
+      if (payload.suggestions) {
+        setCleaningSuggestions(payload.suggestions)
+      }
+      if (payload.plain_language_suggestions) {
+        setPlainLanguageSuggestions(payload.plain_language_suggestions)
+        try {
+          const first = Array.isArray(payload.plain_language_suggestions) && payload.plain_language_suggestions.length ? payload.plain_language_suggestions[0].text : ''
+          if (first && (!instruction || instruction.trim().length === 0)) setInstruction(first)
+        } catch (e) {}
+      }
+      // only fall back to server-side profile/inspect if payload lacked them
+      if (!payload.profile && !payload.inspect_preview) {
+        await doProfileForPath(payload.path)
+      }
+    } catch (e) {
+      // fallback to existing behavior
+      await doProfileForPath(payload.path)
+    }
   }
 
   async function fetchUploads() {
@@ -4396,6 +4424,18 @@ export default function App() {
                   rows={3}
                   placeholder="e.g. fill missing age values, lowercase email, and remove duplicate customers"
                 />
+                              {plainLanguageSuggestions && Array.isArray(plainLanguageSuggestions) && plainLanguageSuggestions.length > 0 && (
+                                <div style={{marginTop:8, display:'flex', flexDirection:'column', gap:6}}>
+                                  <small style={{color:'var(--muted)'}}>Suggested plain-English instructions (click to use):</small>
+                                  <div style={{display:'flex', gap:8, flexWrap:'wrap'}}>
+                                    {plainLanguageSuggestions.map((s, idx) => (
+                                      <button key={idx} onClick={() => setInstruction(s.text)} style={{padding:'6px 10px'}}>
+                                        {s.text.length > 80 ? s.text.slice(0,80)+'…' : s.text}
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
                 <div style={{marginTop:8, display:'flex', gap:8, alignItems:'center', flexWrap:'wrap'}}>
                   <small style={{color:'var(--muted)'}}>Regression options:</small>
                   <label style={{fontSize:'0.85rem'}}>Model

@@ -107,6 +107,13 @@ def _log_startup_ready():
         logger.info('fbroom: startup event fired — application ready')
         # also print to stdout to ensure the external runner sees it in logs
         print('fbroom: startup event fired — application ready', flush=True)
+        # start background outputs watcher to auto-ingest join outputs
+        try:
+            t = threading.Thread(target=_outputs_watcher, args=(5.0,), daemon=True)
+            t.start()
+            logger.info('Started outputs watcher thread')
+        except Exception:
+            logger.exception('Failed to start outputs watcher')
     except Exception:
         pass
 
@@ -379,6 +386,86 @@ JOBS_DIR = Path("data") / "jobs"
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 PRIVACY_DIR = Path("data") / "privacy"
 PRIVACY_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _create_join_history_for_file(out_path: Path):
+    """Create a minimal join history record for an existing output file if none exists.
+    This is used by the background watcher to automatically ingest externally-created join files.
+    """
+    try:
+        # only create for files that look like join exports
+        name = out_path.name.lower()
+        if 'join' not in name:
+            return False
+        # avoid duplicate history for same output_path
+        resolved = str(out_path.resolve())
+        for p in HISTORY_DIR.glob('join_*.json'):
+            try:
+                j = json.loads(p.read_text(encoding='utf-8'))
+                if j.get('output_path') and str(Path(j.get('output_path')).resolve()) == resolved:
+                    return False
+            except Exception:
+                continue
+
+        now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        rec = {
+            'id': f"join_{uuid4().hex}",
+            'type': 'join',
+            'status': 'success',
+            'created_at': now,
+            'finished_at': now,
+            'export_format': out_path.suffix.lstrip('.'),
+            'output_path': str(out_path),
+            'filename': out_path.name,
+            # unknown provenance when ingested from filesystem
+            'left_path': None,
+            'right_path': None,
+            'left_on': None,
+            'right_on': None,
+            'join_type': None,
+        }
+        dest = HISTORY_DIR / f"{rec['id']}.json"
+        dest.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding='utf-8')
+        logger.info('Created join history record for %s as %s', out_path, dest)
+        return True
+    except Exception:
+        logger.exception('Failed to create join history for file: %s', out_path)
+        return False
+
+
+def _outputs_watcher(poll_interval: float = 5.0):
+    """Background thread that polls OUTPUTS_DIR for new join-like files and ingests them into HISTORY_DIR.
+    Runs in a daemon thread started at app startup.
+    """
+    try:
+        seen = set()
+        # initialize seen set from existing outputs
+        for p in OUTPUTS_DIR.iterdir():
+            try:
+                if p.is_file():
+                    seen.add(str(p.resolve()))
+            except Exception:
+                continue
+        while True:
+            try:
+                for p in OUTPUTS_DIR.iterdir():
+                    try:
+                        if not p.is_file():
+                            continue
+                        rp = str(p.resolve())
+                        if rp in seen:
+                            continue
+                        # new file found
+                        _create_join_history_for_file(p)
+                        seen.add(rp)
+                    except Exception:
+                        continue
+            except Exception:
+                logger.exception('Error scanning outputs directory')
+            time.sleep(poll_interval)
+    except Exception:
+        logger.exception('Outputs watcher exiting unexpectedly')
+
 
 
 def _privacy_file(name: str) -> Path:
@@ -703,7 +790,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
                 pass
         except Exception:
             pass
-        return {
+        resp = {
             "path": conversion["path"],
             "normalized_path": conversion["normalized_path"],
             "source_path": conversion["source_path"],
@@ -713,6 +800,17 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
             "row_count": conversion["row_count"],
             "warnings": conversion["warnings"],
         }
+        # include immediate diagnostics if present (profile, inspect_preview, suggestions)
+        try:
+            if conversion.get('profile') is not None:
+                resp['profile'] = conversion.get('profile')
+            if conversion.get('inspect_preview') is not None:
+                resp['inspect_preview'] = conversion.get('inspect_preview')
+            if conversion.get('suggestions') is not None:
+                resp['suggestions'] = conversion.get('suggestions')
+        except Exception:
+            pass
+        return resp
     except HTTPException:
         raise
     except Exception as e:

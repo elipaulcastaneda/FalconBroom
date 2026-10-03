@@ -1,0 +1,60 @@
+﻿curl.exe : *   Trying 127.0.0.1:3009...
+At line:1 char:1
++ curl.exe -v http://127.0.0.1:3009/health 2>&1 | Out-File -FilePath cu ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (*   Trying 127.0.0.1:3009...:Stri 
+   ng) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+* Established connection to 127.0.0.1 (127.0.0.1 port 3009) from 127.0.0.1 
+port 52682 
+  % Total    % Received % Xferd  Average Speed  Time    Time    Time   Current
+                                 Dload  Upload  Total   Spent   Left   Speed
+
+  0      0   0      0   0      0      0      0                              0* 
+using HTTP/1.x
+> GET /health HTTP/1.1
+
+> Host: 127.0.0.1:3009
+
+> User-Agent: curl/8.21.0
+
+> Accept: */*
+
+> 
+
+* Request completely sent off
+< HTTP/1.1 200 OK
+
+< date: Tue, 22 Sep 2026 04:05:35 GMT
+
+< server: uvicorn
+
+< content-length: 15
+
+< content-type: application/json
+
+< strict-transport-security: max-age=63072000; includeSubDomains; preload
+
+< x-frame-options: DENY
+
+< x-content-type-options: nosniff
+
+< referrer-policy: no-referrer-when-downgrade
+
+< permissions-policy: interest-cohort=()
+
+< content-security-policy: default-src 'self'; connect-src 'self'; script-src 
+'self'; style-src 'self'; img-src 'self'
+
+< access-control-expose-headers: X-Delete-Token
+
+< 
+
+{ [15 bytes data]
+
+100     15 100     15   0      0    637      0                              0
+100     15 100     15   0      0    631      0                              0
+100     15 100     15   0      0    627      0                              0
+* Connection #0 to host 127.0.0.1:3009 left intact
+{"status":"ok"}

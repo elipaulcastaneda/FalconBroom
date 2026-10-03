@@ -23,6 +23,9 @@ __pycache__/
 .env
 .env.*
 !.env.sample
+# Frontend env (keep local secrets out of git)
+frontend/.env
+frontend/.env.*
 
 # Editor/IDE
 .vscode/

@@ -17,6 +17,12 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     Document = None
 
+from .engine import Cleaner, _read_table, _is_polars_df, _fuzzy_dedupe, _spell_correct_column
+from .workflow_rules import suggest_columns_to_clean
+import threading
+import traceback
+from datetime import datetime
+
 try:
     from openpyxl import load_workbook
 except Exception:  # pragma: no cover - optional dependency
@@ -65,12 +71,12 @@ def _safe_stem(name: str) -> str:
 
 
 def _decode_bytes(raw_bytes: bytes) -> str:
-    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
-      try:
-        return raw_bytes.decode(encoding)
-      except Exception:
-        continue
-    return raw_bytes.decode("utf-8", errors="replace")
+        for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin-1"):
+                try:
+                        return raw_bytes.decode(encoding)
+                except Exception:
+                        continue
+        return raw_bytes.decode("utf-8", errors="replace")
 
 
 def _stringify(value: Any) -> str:
@@ -536,6 +542,178 @@ def _extract_google_shortcut_rows(source_path: Path, output_dir: Path, rows: lis
     _extract_text_rows(source_path, "google_shortcut", rows)
 
 
+def compute_extended_diags(norm_path: str, meta_path: str) -> None:
+    try:
+        diag = {"path": norm_path, "computed_at": None, "columns": {}}
+        df = None
+        try:
+            df = _read_table(norm_path)
+        except Exception:
+            return
+        # choose candidate text columns
+        cols = list(df.columns if _is_polars_df(df) else list(df.columns))
+        text_cols: list[str] = []
+        for c in cols:
+            try:
+                if _is_polars_df(df):
+                    ser = df.select(c).to_series().to_list()
+                else:
+                    ser = list(df[c].astype(str).tolist()) if hasattr(df, 'astype') else []
+                non_num = 0
+                total = 0
+                for v in ser[:500]:
+                    total += 1
+                    s = '' if v is None else str(v)
+                    s2 = s.strip()
+                    if s2 == '':
+                        continue
+                    if not re.match(r'^[-+]?\d+(?:[\.,]\d+)?$', s2):
+                        non_num += 1
+                if total > 0 and (non_num / max(1, total)) > 0.5:
+                    text_cols.append(c)
+            except Exception:
+                continue
+
+        diag['computed_at'] = datetime.now().isoformat()
+        for c in text_cols:
+            try:
+                info: dict[str, Any] = {}
+                try:
+                    sample_df = df.head(1000) if _is_polars_df(df) else (df.head(1000) if hasattr(df, 'head') else df)
+                except Exception:
+                    sample_df = df
+                try:
+                    _, finfo = _fuzzy_dedupe(sample_df, subset=c, threshold=0.85)
+                    info['fuzzy_dedupe'] = finfo
+                except Exception:
+                    info['fuzzy_dedupe'] = None
+                try:
+                    if _is_polars_df(df):
+                        uvals = list({str(x) for x in df.select(c).to_series().to_list()[:500]})
+                    else:
+                        uvals = list({str(x) for x in (df[c].astype(str).tolist()[:500] if c in df.columns else [])})
+                except Exception:
+                    uvals = []
+                try:
+                    corrected: dict[str, str] = {}
+                    if uvals:
+                        for v in uvals[:200]:
+                            if v is None:
+                                continue
+                            lv = v.strip()
+                            if not lv:
+                                continue
+                            canon = lv.strip().title() if lv.lower() != lv else lv
+                            if canon != lv:
+                                corrected[lv] = canon
+                    info['spell_suggestions'] = corrected
+                except Exception:
+                    info['spell_suggestions'] = None
+                diag['columns'][c] = info
+            except Exception:
+                diag['columns'][c] = {'error': 'failed_column_diag'}
+        try:
+            # include plain language suggestions derived from extended diags
+            try:
+                diag['plain_language_suggestions'] = []
+                for col, info in diag.get('columns', {}).items():
+                    try:
+                        # fuzzy clusters
+                        if info.get('fuzzy_dedupe'):
+                            diag['plain_language_suggestions'].append({
+                                'text': f"Values in '{col}' contain near-duplicates (clusters detected). Suggest merging similar variants and normalizing whitespace/case.",
+                                'source': 'extended_fuzzy'
+                            })
+                        # spell suggestions
+                        if info.get('spell_suggestions'):
+                            examples = list(info.get('spell_suggestions').items())[:3]
+                            ex_txt = ', '.join(f"{k}→{v}" for k, v in examples)
+                            diag['plain_language_suggestions'].append({
+                                'text': f"Column '{col}' has spelling/variant suggestions ({ex_txt}). Suggest applying canonical mappings.",
+                                'source': 'extended_spell'
+                            })
+                    except Exception:
+                        continue
+            except Exception:
+                diag['plain_language_suggestions'] = []
+            diag_path = Path(meta_path).with_suffix('.diag.json')
+            diag_path.write_text(json.dumps(diag, indent=2, ensure_ascii=False), encoding='utf-8')
+        except Exception:
+            try:
+                dpath = Path(norm_path).with_suffix('.diag.json')
+                dpath.write_text(json.dumps(diag, indent=2, ensure_ascii=False), encoding='utf-8')
+            except Exception:
+                pass
+    except Exception:
+        traceback.print_exc()
+
+
+def generate_plain_language_suggestions(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+    """Create short, editable plain-English suggestions from metadata/diagnostics.
+
+    Returns a list of {text: str, source: str} entries.
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        # Use quick suggestions from convert-time suggestions if present
+        for s in (metadata.get("suggestions") or []):
+            try:
+                col = s.get("column") if isinstance(s, dict) else None
+                reason = s.get("reason") if isinstance(s, dict) else None
+                text = None
+                if col and reason:
+                    text = f"Column '{col}' may need cleaning: {reason}. Suggested action: normalize values (trim, lowercase), dedupe similar values, and merge variants."
+                elif col:
+                    text = f"Review column '{col}' for cleanliness and duplicates; consider normalization and deduplication."
+                else:
+                    text = f"Data cleansing suggested: {s}."
+                out.append({"text": text, "source": "suggestions"})
+            except Exception:
+                continue
+
+        # Diagnostics-based prompts (profile/inspect)
+        diag = metadata.get("diagnostics") or (metadata.get("inspect_preview") or {}).get("diagnostics") if isinstance(metadata.get("inspect_preview"), dict) else None
+        if isinstance(diag, dict):
+            for col, info in diag.items():
+                try:
+                    if isinstance(info, dict):
+                        if info.get("missing_count"):
+                            out.append({"text": f"Column '{col}' has {info.get('missing_count')} missing/empty values. Suggestion: impute missing values (mean/median/mode) or mark as unknown; review policy.", "source": "diagnostics"})
+                        if info.get("mixed_type"):
+                            out.append({"text": f"Column '{col}' contains mixed types. Suggestion: coerce to the intended type (e.g., numeric) and coerce unparsable values to null for review.", "source": "diagnostics"})
+                        if info.get("unique_count") is not None and info.get("unique_count") <= 3 and info.get("row_count", 0) > 10:
+                            out.append({"text": f"Column '{col}' appears nearly-constant (unique={info.get('unique_count')}). Consider dropping or treating as a categorical flag.", "source": "diagnostics"})
+                except Exception:
+                    continue
+
+        # Fallback: short summary from profile
+        prof = metadata.get("profile")
+        if isinstance(prof, dict):
+            # e.g., detect many nulls across dataset
+            try:
+                total_rows = prof.get("row_count") or metadata.get("row_count") or 0
+                for col, cinfo in (prof.get("columns") or {}).items():
+                    try:
+                        if cinfo.get("nulls", 0) and cinfo.get("nulls", 0) / max(1, total_rows) > 0.25:
+                            out.append({"text": f"Column '{col}' has >25% missing values. Suggestion: consider dropping the column or imputing after discussion.", "source": "profile"})
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+    except Exception:
+        traceback.print_exc()
+    # dedupe identical texts and preserve order
+    seen = set()
+    uniq: list[dict[str, Any]] = []
+    for e in out:
+        t = e.get("text")
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        uniq.append(e)
+    return uniq
+
+
 def convert_uploaded_file(source_path: str | Path, output_dir: str | Path) -> dict[str, Any]:
     source_path = Path(source_path)
     output_dir = Path(output_dir)
@@ -582,8 +760,72 @@ def convert_uploaded_file(source_path: str | Path, output_dir: str | Path) -> di
         "row_count": len(rows),
         "warnings": warnings,
     }
+    # Attempt to compute lightweight profile/inspect/suggestions synchronously.
+    # If any step fails, record a warning but proceed with the original metadata.
+    try:
+        cleaner = Cleaner()
+    except Exception as e:
+        cleaner = None
+        warnings.append(f"cleaner_init_failed: {e}")
+
+    if cleaner:
+        try:
+            prof = cleaner.profile(str(target))
+            metadata["profile"] = prof
+        except Exception as e:
+            warnings.append(f"profile_failed: {e}")
+        try:
+            insp = cleaner.inspect_source(str(target), offset=0, limit=20)
+            # attach diagnostics summary and a short preview
+            metadata["inspect_preview"] = insp
+            try:
+                metadata["diagnostics"] = insp.get("diagnostics") if isinstance(insp, dict) else None
+            except Exception:
+                pass
+        except Exception as e:
+            warnings.append(f"inspect_failed: {e}")
+        try:
+            # suggestions operate on profile; guard if profile missing
+            try:
+                prof_for_sugg = metadata.get("profile") or prof
+            except Exception:
+                prof_for_sugg = None
+            if prof_for_sugg:
+                suggs = [
+                    {"column": col, "score": score, "reason": reason}
+                    for col, score, reason in suggest_columns_to_clean(prof_for_sugg)
+                ]
+                metadata["suggestions"] = suggs
+        except Exception as e:
+            warnings.append(f"suggestions_failed: {e}")
+
     metadata_path = target.with_suffix(".json")
-    metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+    # persist metadata (including any added profile/inspect/suggestions)
+    try:
+        # generate plain-language suggestions for immediate UI use
+        try:
+            metadata["plain_language_suggestions"] = generate_plain_language_suggestions(metadata)
+        except Exception:
+            metadata["plain_language_suggestions"] = []
+        metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        # fallback: attempt to write minimal metadata
+        try:
+            fallback = {k: metadata[k] for k in ("source_path", "normalized_path", "source_kind", "source_name", "row_count", "warnings") if k in metadata}
+            metadata_path.write_text(json.dumps(fallback, indent=2, ensure_ascii=False), encoding="utf-8")
+            warnings.append("metadata_write_fallback_used")
+        except Exception:
+            pass
+
     metadata["metadata_path"] = str(metadata_path.resolve())
     metadata["path"] = metadata["normalized_path"]
+    # spawn background worker to compute expensive diagnostics (fuzzy clusters, spell analysis)
+    try:
+        try:
+            t = threading.Thread(target=compute_extended_diags, args=(metadata['normalized_path'], metadata_path), daemon=True)
+            t.start()
+        except Exception:
+            pass
+    except Exception:
+        pass
     return metadata

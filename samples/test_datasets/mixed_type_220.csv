@@ -1,0 +1,221 @@
+id,mixed_col
+1,12345
+2,2021-08-10
+3,john@example.com
+4,123 Main St, Springfield
+5,Hello world
+6,67890
+7,10/12/2020
+8,jane.smith@domain.co
+9,500 Broadway, Apt 2
+10,Sample text entry
+11,98765
+12,15 Aug 2021
+13,user+alias@mail.com
+14,42 Elmwood Ave
+15,Another free-form note
+16,24680
+17,2020/01/05
+18,foo.bar@example.org
+19,PO Box 123
+20,Notes: follow up
+21,55555
+22,01-Jan-2020
+23,contact@company.com
+24,1600 Amphitheatre Pkwy
+25,Quick brown fox
+26,11111
+27,31/12/2019
+28,name.surname@mail.uk
+29,12 Downing St
+30,Free text
+31,22222
+32,2022-02-02
+33,test+filter@domain.io
+34,77 Sunset Blvd
+35,Random note
+36,33333
+37,July 4, 2020
+38,alpha.beta@service.com
+39,88 River Road
+40,Some description
+41,44444
+42,1999-12-31
+43,sample@local
+44,1000 Market St
+45,Text with numbers 123
+46,55500
+47,06/15/2021
+48,user123@mail.com
+49,200 Wall Street
+50,Yet another note
+51,66666
+52,2018-07-07
+53,name@company.co
+54,45 King St
+55,Comment field
+56,77777
+57,Sep 10 2019
+58,contact-us@org.net
+59,9 High St
+60,Some other text
+61,88888
+62,2017-11-11
+63,first.last@domain.com
+64,22 Baker St
+65,Additional notes
+66,99999
+67,10-10-2010
+68,info@website.com
+69,5000 Oak Lane
+70,Random remarks
+71,10101
+72,04/01/2021
+73,hello+world@mail.org
+74,3 Cherry Tree Lane
+75,Short note
+76,20202
+77,2016/04/04
+78,customer.service@biz.com
+79,11 Down Lane
+80,A longer paragraph of text for testing mixed types
+81,30303
+82,2015-05-05
+83,help@support.com
+84,7 Ocean Drive
+85,Some multi-line
+86,40404
+87,2014.06.06
+88,newsletter@newsletter.com
+89,55 Park Ave
+90,Extra info
+91,50505
+92,2013/03/03
+93,alerts@service.co
+94,12 Riverbend
+95,Notes: urgent
+96,60606
+97,02 Feb 2012
+98,team+ops@company.com
+99,1 Station Road
+100,Samples & tests
+101,70707
+102,2011/01/01
+103,reply@domain.com
+104,10 Kingsway
+105,Metadata field
+106,80808
+107,2009-09-09
+108,postmaster@site.org
+109,88 Hilltop
+110,Informational text
+111,90909
+112,2008/08/08
+113,service@domain.net
+114,6 Cross Street
+115,Notes: review
+116,12121
+117,2007-07-07
+118,contact@example.org
+119,18 Broad St
+120,Some extra commentary
+121,13131
+122,2006-06-06
+123,info@helpdesk.com
+124,99 Beacon Ave
+125,Customer requested callback
+126,14141
+127,2005-05-05
+128,office@company.net
+129,3 Mill Road
+130,Internal note
+131,15151
+132,2004-04-04
+133,support@service.io
+134,27 Lakeview
+135,Follow-up required
+136,16161
+137,2003-03-03
+138,team@mail.co
+139,44 West End
+140,General comment
+141,17171
+142,2002-02-02
+143,feedback@site.com
+144,8 Meadow Lane
+145,Customer sent image
+146,18181
+147,2001-01-01
+148,helpdesk@company.org
+149,2 River St
+150,Note with punctuation!
+151,19191
+152,2000-12-31
+153,post@office.com
+154,70 Ridgeway
+155,Some trailing text
+156,20202
+157,1999-11-11
+158,alerts@news.org
+159,16 Grove Rd
+160,Structured text example
+161,21212
+162,1998-10-10
+163,info@portal.com
+164,23 Market Place
+165,Short description
+166,22222
+167,1997-09-09
+168,service@shop.com
+169,100 High St
+170,Sentence with commas, periods.
+171,23232
+172,1996-08-08
+173,contact@brand.com
+174,2 Kings Road
+175,Notes: privileged
+176,24242
+177,1995-07-07
+178,team@corp.com
+179,40 Station Ave
+180,End of sample
+181,25252
+182,1994-06-06
+183,reply@service.net
+184,12 Orchard St
+185,Extra metadata
+186,26262
+187,1993-05-05
+188,info@help.me
+189,33 Boulevard
+190,Some free text
+191,27272
+192,1992-04-04
+193,contact@site.co
+194,14 Bridge St
+195,Logging sample
+196,28282
+197,1991-03-03
+198,admin@service.org
+199,6 Front St
+200,Final note
+201,29292
+202,1990-02-02
+203,hello@world.com
+204,44 Canal St
+205,Testing mix types
+206,30303
+207,1989-01-01
+208,noreply@domain.org
+209,7 Church Lane
+210,Some random
+211,31313
+212,1988-12-12
+213,contact@agency.com
+214,90 Long Rd
+215,Notes: confidential
+216,32323
+217,1987-11-11
+218,service@platform.io
+219,2 Short St
+220,End of file
