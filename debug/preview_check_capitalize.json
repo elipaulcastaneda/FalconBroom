@@ -1,0 +1,112 @@
+{
+  "instruction": "capitalize species column",
+  "recipe": {
+    "sources": [
+      {
+        "path": "samples/test_data/badger_sightings.csv"
+      }
+    ],
+    "cleaning_steps": [
+      {
+        "action": "normalize",
+        "column": "species",
+        "params": {
+          "case": "capitalize"
+        }
+      }
+    ],
+    "joins": [],
+    "outputs": [
+      {
+        "path": "out.csv"
+      }
+    ]
+  },
+  "preview": {
+    "before": [
+      {
+        "event_id": "EVT0001",
+        "species": "badger",
+        "lat": 51.0,
+        "lon": -0.1,
+        "count": 1,
+        "observed_at": "2025-01-01 06:00:00"
+      },
+      {
+        "event_id": "EVT0002",
+        "species": "badger",
+        "lat": 51.00543,
+        "lon": -0.10421,
+        "count": 2,
+        "observed_at": "2025-01-01 06:10:00"
+      },
+      {
+        "event_id": "EVT0003",
+        "species": "badger",
+        "lat": 51.01086,
+        "lon": -0.10842,
+        "count": 3,
+        "observed_at": "2025-01-01 06:20:00"
+      },
+      {
+        "event_id": "EVT0004",
+        "species": "badger",
+        "lat": 51.01629,
+        "lon": -0.11263,
+        "count": 4,
+        "observed_at": "2025-01-01 06:30:00"
+      },
+      {
+        "event_id": "EVT0005",
+        "species": "badger",
+        "lat": 51.02172,
+        "lon": -0.11684,
+        "count": 1,
+        "observed_at": "2025-01-01 06:40:00"
+      }
+    ],
+    "after": [
+      {
+        "event_id": "EVT0001",
+        "species": "badger",
+        "lat": 51.0,
+        "lon": -0.1,
+        "count": 1,
+        "observed_at": "2025-01-01 06:00:00"
+      },
+      {
+        "event_id": "EVT0002",
+        "species": "badger",
+        "lat": 51.00543,
+        "lon": -0.10421,
+        "count": 2,
+        "observed_at": "2025-01-01 06:10:00"
+      },
+      {
+        "event_id": "EVT0003",
+        "species": "badger",
+        "lat": 51.01086,
+        "lon": -0.10842,
+        "count": 3,
+        "observed_at": "2025-01-01 06:20:00"
+      },
+      {
+        "event_id": "EVT0004",
+        "species": "badger",
+        "lat": 51.01629,
+        "lon": -0.11263,
+        "count": 4,
+        "observed_at": "2025-01-01 06:30:00"
+      },
+      {
+        "event_id": "EVT0005",
+        "species": "badger",
+        "lat": 51.02172,
+        "lon": -0.11684,
+        "count": 1,
+        "observed_at": "2025-01-01 06:40:00"
+      }
+    ],
+    "warnings": []
+  }
+}

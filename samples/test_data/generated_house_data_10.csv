@@ -1,0 +1,501 @@
+building_id,address,city,state,construction_year,floors,area_sqft,bedrooms,bathrooms,material,contractor,permit_status,zipcode
+B100000,5343 Oak St,Augusta,ga,2008,3,1195,4,4,Wood,BuildRight LLC,issued,44790
+B100001,1811 Market St,Harrisburg,PA,1952,5,1884,3,2,Wood,Acme Constructions,issued,60679
+B100002,881 Maple St,Bellevue,WA,1970,3,607,3,2,Concrete,NorthStar Builders,issued,96295
+B100003,7747 Pine St,Bellevue,WA,1989,2,5352,4,3,Wood,Acme Constructions,pending,GOPZK
+B100004,3306 Pine St,Houston,TX,1984,1,849,4,3,Concrete,PrimeConstruct,denied,78070-4312
+B100005,5904 Cedar St,Syracuse,ny,2018,1,2861,1,1,Mixed,Homestead Co,pending,49437-1462
+B100006,369 Pine St,Warren,MI,1999,2,7167,4,4,Concrete,Acme Constructions,unknown,83326
+B100007,3807 Elm St,New York,NY,2014,1,7159,1,1,Steel,PrimeConstruct,issued,40391
+B100008,6751 Maple St,Detroit,MI,2008,2,4435,4,4,Brick,BuildRight LLC,issued,15344
+B100009,3740 Main St,Harrisburg,PA,1964,4,2289,2,2,Brick,C-434,denied,91295
+B100010,9759 Main St,Lansing,mi,1988,4,7811,2,2,Concrete,Homestead Co,unknown,PSPGL
+B100011,482 Maple St,San Diego,CA,2019,2,7222,3,3,Steel,PrimeConstruct,denied,94457-7757
+B100012,9071 Oak St,Pittsburgh,PA,1966,2,2556,4,3,Brick,NorthStar Builders,pending,42246
+B100013,387 Cedar St,Cleveland,OH,2013,2,6438,4,3,Concrete,BuildRight LLC,denied,68470
+B100014,6941 Pine St,Fresno,CA,1960,1,4486,4,3,Brick,PrimeConstruct,pending,92781X
+B100015,81922 1344 Elm St Apt 622,Akron,OH,1983,2,7085,3,3,Mixed,NorthStar Builders,denied,
+B100016,8539 Oak St,Toledo,OH,2021,2,5494,3,2,Brick,PrimeConstruct,denied,40837
+B100017,9568 Elm St,Athens,GA,1985,2,1191,4,3,Wood,NorthStar Builders,pending,16723
+B100018,5547 Elm St,Toledo,OH,1955,3,7907,2,2,Concrete,NorthStar Builders,pending,56554
+B100019,6454 Pine St,Los Angeles,CA,2017,2,3174,3,2,Concrete,PrimeConstruct,pending,Grand Rapids
+B100020,6016 Oak St,Spokane,WA,1971,1,3150,3,2,Mixed,NorthStar Builders,unknown,99942-2410
+B100021,7651 Oak St,El Paso,TX,1991,4,3959,3,2,Brick,Homestead Co,pending,78894
+B100022,4549 Maple St,Orlando,FL,1989,2,1087,4,4,Concrete,Acme Constructions,unknown,73892
+B100023,2939 Elm St,Syracuse,NY,1980,2,4757,2,1,Brick,4757,issued,28174
+B100024,6144 Maple St,Albany,NY,1973,2,3967,2,2,Brick,PrimeConstruct,pending,92445-5918
+B100025,8698 Pine St,Peoria,IL,1967,3,6732,1,1,Steel,BuildRight LLC,denied,90106
+B100026,1623 Market St,Vancouver,WA,2009,3,3018,4,4,Concrete,Homestead Co,unknown,JZPUK
+B100027,9271 Oak St,Sacramento,CA,2022,1,6534,2,1,Steel,BuildRight LLC,pending,81725
+B100028,9408 Pine St,Rochester,NY,1951,1,7831,2,1,Concrete,PrimeConstruct,pending,76655
+B100029,3576 Market St,Tacoma,WA,1971,2,1236,2,2,Concrete,NorthStar Builders,issued,80286
+B100030,6948 Maple St,Spokane,WA,2002,1,4590,1,1,Mixed,Homestead Co,issued,27836
+B100031,5581 Cedar St,Philadelphia,PA,2001,2,1963,3,2,Steel,NorthStar Builders,denied,HRCBE
+B100032,1237 Pine St,Jacksonville,FL,1950,3,3656,2,1,Concrete,Homestead Co,issued,64332
+B100033,5543 Cedar St,Lansing,MI,1989,2,3227,3,3,Steel,Acme Constructions,unknown,68258
+B100034,9958 Cedar St,New York,NY,1965yrs,2,742,2,1,Wood,Acme Constructions,denied,40620
+B100035,4587 Market St,Savannah,GA,2000,1,3977,5,4,Wood,Homestead Co,pending,Dallas
+B100036,7337 Oak St,Erie,PA,1985yrs,3,5091,3,3,Mixed,PrimeConstruct,issued,82369
+B100037,9931 Pine St,Vancouver,WA,1983,2,1073,3,2,Concrete,Acme Constructions,unknown,92886
+B100038,4223 Elm St,Buffalo,NY,2005,2,5027,4,3,Steel,NorthStar Builders,issued,55042
+B100039,6293 Cedar St,Chicago,IL,1969,2,5514,2,1,Wood,NorthStar Builders,unknown,56030
+B100040,179 Oak St,Albany,NY,1974,1,4196,4,4,Mixed,Homestead Co,issued,79604
+B100041,6287 Oak St,San Antonio,TX,2021,3,2743,3,3,Concrete,NorthStar Builders,issued,AUIKU
+B100042,2369 Market St,Tampa,FL,1994,2,2399,2,2,Wood,2399,issued,MAMXP
+B100043,5524 Main St,Vancouver,WA,2001yrs,2,2041,2,2,Brick,Acme Constructions,unknown,86966
+B100044,2237 Market St,Akron,OH,1981,3,5272,3,3,Steel,5272,pending,46304
+B100045,6513 Main St,Tallahassee,FL,2001,2,7582,3,3,Brick,BuildRight LLC,denied,26713
+B100046,8650 Cedar St,Seattle,WA,2008,1,7084,2,2,Wood,NorthStar Builders,issued,66175
+B100047,5413 Pine St,Sacramento,CA,2015,5,1117,2,1,Steel,PrimeConstruct,denied,19416
+B100048,8103 Oak St,Aurora,IL,1990,3,2375,2,1,Steel,PrimeConstruct,pending,73991
+B100049,1470 Pine St,Spokane,WA,1954,2,7870,4,3,Steel,BuildRight LLC,unknown,11540
+B100050,980 Pine St,Pittsburgh,PA,1960,2,6481,2,1,Mixed,BuildRight LLC,unknown,60911
+B100051,7403 Main St,Tallahassee,FL,2012,1,3803,3,3,Brick,Homestead Co,issued,89946
+B100052,7977 Pine St,Tacoma,WA,1999,1,6617,2,1,Brick,NorthStar Builders,pending,3280
+B100053,1043 Oak St,Orlando,FL,1965,1,3160,4,4,Brick,Acme Constructions,pending,43845
+B100054,4254 Elm St,Syracuse,NY,1974,2,7525,1,1,Brick,NorthStar Builders,issued,38442-1313
+B100055,3074 Pine St,Jacksonville,FL,2008,2,5879,2,2,Brick,NorthStar Builders,unknown,87167
+B100056,2023 Market St,Sacramento,CA,1955,2,6970,2,1,Mixed,NorthStar Builders,pending,96505
+B100057,3021 Oak St,Tampa,FL,1976,2,1773,3,3,Concrete,BuildRight LLC,issued,8430X
+B100058,7261 Oak St,Houston,TX,2017,2,3028,3,2,Wood,Homestead Co,issued,2453
+B100059,4351 Oak St,Springfield,IL,1972,1,7705,3,3,Mixed,Homestead Co,unknown,Springfield
+B100060,3403 Pine St,Houston,TX,2022,4,2367,2,2,Brick,Homestead Co,pending,IFQBX
+B100061,8150 Main St,Aurora,IL,1996,1,7740,2,1,Brick,NorthStar Builders,pending,29387
+B100062,9798 Market St,Chicago,IL,2019,1,7468,2,1,Concrete,PrimeConstruct,issued,94676
+B100063,3867 Market St,El Paso,TX,1950,3,4858,3,2,Wood,PrimeConstruct,pending,37673
+B100064,1860 Pine St,Toledo,OH,1983,3,2776,2,1,Wood,Acme Constructions,pending,Aurora
+B100065,9181 Oak St,San Antonio,TX,2012,2,5219,1,1,Mixed,Acme Constructions,issued,92272
+B100066,5545 Market St,Vancouver,WA,1957,2,2398,1,1,Wood,BuildRight LLC,pending,28743
+B100067,3948 Elm St,Cincinnati,OH,1974,2,4403,2,2,Brick,NorthStar Builders,unknown,16899
+B100068,1593 Oak St,Chicago,IL,1988,1,7642,2,2,Steel,BuildRight LLC,unknown,69849
+B100069,7340 Elm St,Tacoma,WA,2018,2,4164,4,4,Concrete,NorthStar Builders,denied,4456
+B100070,1785 Maple St,Detroit,MI,1972,3,7718,4,3,Steel,Acme Constructions,denied,23295
+B100071,712 Cedar St,Pittsburgh,PA,1961,1,5789,1,1,Wood,Acme Constructions,issued,
+B100072,7309 Maple St,Rochester,NY,1951,2,2229,2,1,Brick,Acme Constructions,unknown,92883
+B100073,5064 Maple St,Sacramento,CA,1998,3,7693,1,1,Brick,NorthStar Builders,issued,29975
+B100074,530 Market St,Bellevue,WA,1986,2,2527,2,1,Brick,NorthStar Builders,unknown,
+B100075,8506 Market St,San Francisco,CA,1982,3,768,4,3,Brick,BuildRight LLC,unknown,52468
+B100076,9916 Main St,Syracuse,NY,1958,1,7167,2,2,Wood,PrimeConstruct,denied,78780
+B100077,4196 Market St,El Paso,TX,1973,2,6885,3,2,Mixed,BuildRight LLC,issued,45188-9810
+B100078,166 Market St,Grand Rapids,MI,2000,3,7749,2,2,Wood,Acme Constructions,issued,
+B100079,26193 498 Oak St Apt 3,Los Angeles,CA,1989,3,7869,3,2,Mixed,NorthStar Builders,denied,
+B100080,9174 Oak St,Tacoma,WA,1971,1,7496,2,1,Mixed,BuildRight LLC,denied,73781
+B100081,9688 Elm St,Cincinnati,OH,1953,4,6941,3,3,Wood,NorthStar Builders,pending,71512
+B100082,354 Maple St,Tallahassee,FL,1978,2,6623,4,4,Concrete,PrimeConstruct,unknown,10329X
+B100083,2659 Market St,Seattle,WA,1993,2,6071,2,2,Wood,BuildRight LLC,unknown,11074
+B100084,1127 Pine St,Columbus,OH,1986,4,7518,4,3,Wood,PrimeConstruct,unknown,43377
+B100085,4213 Oak St,San Francisco,CA,2020,1,2905,4,4,Steel,PrimeConstruct,issued,38194X
+B100086,695 Market St,Springfield,IL,1975,1,825,2,2,Mixed,Acme Constructions,pending,27772
+B100087,2904 Oak St,25038-3856,TX,2013,2,7825,3,2,Concrete,Homestead Co,pending,Houston
+B100088,5467 Elm St,27245,TX,1969,2,2216,3,3,Brick,Homestead Co,pending,Austin
+B100089,4112 Maple St,Syracuse,NY,1995,2,2937,2,1,Mixed,Acme Constructions,issued,69880
+B100090,5984 Pine St,Albany,NY,1958,2,900,3,3,Mixed,BuildRight LLC,pending,81181
+B100091,3350 Cedar St,Pittsburgh,PA,1960,1,6778,1,1,Mixed,NorthStar Builders,unknown,37100
+B100092,1843 Maple St,Warren,MI,2009,2,7609,4,3,Concrete,Homestead Co,issued,85091
+B100093,1209 Market St,Tampa,FL,1983,2,5018,3,2,Concrete,Acme Constructions,issued,Cleveland
+B100094,8147 Pine St,New York,NY,1992,2,2722,5,3,Brick,NorthStar Builders,denied,64380
+B100095,3292 Pine St,Warren,MI,2010,3,5283,3,2,Wood,NorthStar Builders,issued,94083
+B100096,4514 Pine St,Orlando,FL,1950,4,4363,2,2,Brick,Acme Constructions,unknown,26197
+B100097,2560 Elm St,Toledo,OH,2016,3,3324,2,2,Concrete,Acme Constructions,issued,31829
+B100098,4500 Elm St,Buffalo,NY,2014,2,6616,3,2,Concrete,Acme Constructions,pending,75836
+B100099,9702 Elm St,San Antonio,TX,1964,1,5867,3,2,Brick,Acme Constructions,denied,44756
+B100100,1181 Maple St,Aurora,IL,1990,2,5869,2,2,Brick,Acme Constructions,denied,76500-2199
+B100101,2664 Pine St,Savannah,GA,1957,4,4568,3,2,Wood,BuildRight LLC,unknown,7615
+B100102,213 Oak St,New York,NY,2002,3,6423,3,3,Concrete,NorthStar Builders,unknown,New York
+B100103,5875 Maple St,Spokane,WA,1979,1,6267,2,2,Concrete,PrimeConstruct,pending,76518
+B100104,70600-7943 2966 Pine St Apt 5,Cincinnati,OH,2013,1,4937,2,1,Wood,Acme Constructions,denied,
+B100105,8640 Oak St,Cincinnati,OH,1962,5,755,4,4,Steel,Acme Constructions,pending,44632-5537
+B100106,1545 Market St,Grand Rapids,MI,1975,3,6285,3,2,Concrete,BuildRight LLC,denied,6503
+B100107,6364 Elm St,San Antonio,TX,2022,2,5670,3,3,Mixed,BuildRight LLC,denied,62606
+B100108,3814 Elm St,El Paso,TX,2009,2,6891,3,3,Steel,NorthStar Builders,issued,25528
+B100109,1083 Market St,Flint,MI,2003,2,7989,4,3,Brick,BuildRight LLC,pending,12904
+B100110,8244 Oak St,Erie,PA,1952,3,7861,4,3,Concrete,Homestead Co,unknown,46543
+B100111,5103 Cedar St,Naperville,IL,1999,2,885,2,2,Brick,PrimeConstruct,unknown,19097
+B100112,51468 694 Maple St Apt 106,Naperville,IL,2000,2,2566,3,3,Mixed,Homestead Co,issued,
+B100113,7240 Market St,Tallahassee,FL,2017,2,1801,2,1,Mixed,NorthStar Builders,denied,27180
+B100114,578 Oak St,Lansing,MI,1955,1,1002,3,3,Brick,PrimeConstruct,unknown,66542
+B100115,6883 Oak St,Tampa,FL,1987,2,4196,3,2,Mixed,Homestead Co,pending,33282
+B100116,7852 Maple St,Miami,FL,1980,1,3000,2,1,Brick,PrimeConstruct,denied,
+B100117,5084 Main St,Atlanta,GA,2016,1,4783,3,2,Concrete,BuildRight LLC,pending,21239
+B100118,4732 Elm St,Tallahassee,FL,1990,1,7937,4,3,Concrete,Acme Constructions,pending,58770
+B100119,3367 Elm St,Austin,TX,1985,2,1617,4,3,Wood,PrimeConstruct,denied,Austin
+B100120,4857 Market St,Augusta,GA,1956,3,1021,2,2,Concrete,NorthStar Builders,denied,27078
+B100121,6006 Cedar St,Houston,TX,1950,1,7285,3,2,Wood,Acme Constructions,denied,Augusta
+B100122,1306 Market St,Orlando,fl,2010,1,3577,2,1,Brick,PrimeConstruct,issued,
+B100123,711 Market St,San Antonio,TX,1967,4,7176,2,2,Mixed,Acme Constructions,unknown,78872
+B100124,7587 Oak St,Miami,FL,1984,4,6889,2,1,Steel,NorthStar Builders,issued,39781
+B100125,6751 Cedar St,Syracuse,NY,1964,3,4358,4,3,Steel,Homestead Co,unknown,San Diego
+B100126,6255 Oak St,San Francisco,CA,1999,3,1151,3,2,Concrete,BuildRight LLC,denied,68464
+B100127,4590 Oak St,Albany,NY,1984,3,5948,1,1,Brick,Homestead Co,unknown,19584
+B100128,1740 Market St,Austin,TX,2000,2,7834,3,3,Wood,BuildRight LLC,pending,99073
+B100129,748 Market St,Augusta,GA,1964,1,2935,3,2,Steel,Acme Constructions,unknown,53949
+B100130,7479 Main St,Buffalo,NY,1971,2,6913,3,3,Sttel,NorthStar Builders,pending,98466-1131
+B100131,5088 Cedar St,Spokane,WA,1969,1,3125,2,1,Steel,Acme Constructions,unknown,99758
+B100132,4166 Maple St,Cleveland,OH,2001,2,7933,5,3,Brick,PrimeConstruct,unknown,11383
+B100133,7852 Maple St,Sacramento,CA,2014,2,1844,1,1,Concrete,PrimeConstruct,unknown,24697
+B100134,4897 Cedar St,Atlanta,GA,1964,2,3501,2,1,Brick,Acme Constructions,denied,61402-2460
+B100135,9049 Cedar St,Naperville,IL,1986,4,1536,2,1,Concrete,Homestead Co,denied,73623
+B100136,8866 Oak St,Fresno,CA,1983,5,2716,2,2,Brick,Acme Constructions,pending,14501
+B100137,8318 Cedar St,Tacoma,WA,2017,2,2522,1,1,Concrete,Acme Constructions,pending,72994-6908
+B100138,3091 Main St,Harrisburg,PA,1951,1,4020,3,3,Steel,PrimeConstruct,unknown,Columbus
+B100139,3287 Cedar St,Pittsburgh,PA,1953,3,3768,2,1,Concrete,BuildRight LLC,denied,7401
+B100140,1503 Maple St,Houston,TX,1987,3,4565,2,1,Concrete,Acme Constructions,pending,
+B100141,402 Pine St,Peoria,IL,1986,3,1781,2,1,Steel,Acme Constructions,denied,71700
+B100142,4476 Oak St,Akron,OH,1988,1,7789,3,2,Concrete,Homestead Co,denied,53329
+B100143,9945 Oak St,Philadelphia,PA,1951,1,2863,4,3,Wood,PrimeConstruct,pending,83147
+B100144,682 Cedar St,Chicago,IL,2006,1,6270,1,1,Concrete,Acme Constructions,pending,78082
+B100145,7771 Oak St,Columbus,OH,1962,2,2603,3,2,Brick,BuildRight LLC,issued,27320
+B100146,7005 Market St,Vancouver,WA,1982,2,3633,2,1,Brick,NorthStar Builders,pending,30950
+B100147,513 Pine St,Miami,FL,1977,1,4210,4,4,Mixed,Acme Constructions,unknown,83833-3788
+B100148,8570 Pine St,Albany,NY,1996,3,3779,2,1,Brick,BuildRight LLC,issued,31095
+B100149,9300 Maple St,Buffalo,NY,2018,3,2044,4,3,Mixed,Acme Constructions,denied,36706
+B100150,7533 Main St,Augusta,GA,1997,2,4890,3,3,Wood,PrimeConstruct,issued,69640
+B100151,959 Maple St,Houston,TX,1997,1,5878,2,2,Steel,NorthStar Builders,unknown,88196X
+B100152,5783 Elm St,Los Angeles,CA,1955,2,4016,3,2,Concrete,BuildRight LLC,issued,66977
+B100153,9429 Market St,Syracuse,NY,1975,1,3789,2,1,Brick,PrimeConstruct,issued,33754
+B100154,7368 Oak St,Aurora,IL,2021,1,4706,2,2,Steel,PrimeConstruct,denied,44661
+B100155,114 Main St,San Antonio,TX,1963,3,1322,3,3,Steel,Acme Constructions,denied,74372X
+B100156,9087 Maple St,Grand Rapids,MI,2017,3,7010,1,1,Mixed,BuildRight LLC,issued,48190
+B100157,1942 Oak St,Austin,TX,1986yrs,2,6187,2,1,Brick,NorthStar Builders,unknown,60490
+B100158,3503 Maple St,Aurora,IL,1975,1,2703,2,2,Wood,BuildRight LLC,issued,39430
+B100159,8408 Oak St,Naperville,IL,1992,2,6663,3,2,Concrete,Acme Constructions,unknown,31425
+B100160,7342 Main St,Savannah,GA,2005,2,4214,2,2,Mixed,BuildRight LLC,issued,4339
+B100161,2960 Pine St,Los Angeles,CA,2010,1,1529,3,3,Concrete,NorthStar Builders,pending,1549
+B100162,4847 Oak St,Buffalo,NY,1971,2,6643,3,3,Wood,PrimeConstruct,denied,8128X
+B100163,7119 Market St,San Diego,CA,1999,1,1828,4,4,Wood,BuildRight LLC,unknown,80169
+B100164,6284 Oak St,Warren,MI,2011,2,1986,0,1,Steel,Homestead Co,pending,43812
+B100165,8975 Maple St,Athens,GA,1993,2,3355,3,2,Brick,PrimeConstruct,denied,65267
+B100166,4888 Cedar St,Miami,FL,1985,2,665,4,4,Concrete,NorthStar Builders,unknown,17180
+B100167,8127 Main St,Orlando,FL,1952,3,2130,2,1,Wood,Acme Constructions,pending,77671
+B100168,3310 Elm St,Cleveland,OH,1971,3,1719,3,2,Steel,BuildRight LLC,pending,78814-1513
+B100169,6587 Maple St,Aurora,il,2004,1,944,1,1,Mixed,Acme Constructions,denied,5489
+B100170,427 Cedar St,Lansing,MI,2013,1,965,2,2,Concrete,NorthStar Builders,pending,8184
+B100171,3813 Main St,Cleveland,OH,1993,1,2721,2,2,Wood,Homestead Co,pending,10136
+B100172,7239 Oak St,Seattle,WA,2022,2,1945,5,3,Wood,Acme Constructions,denied,64314
+B100173,7287 Market St,Aurora,IL,1972,2,4770,2,2,Concrete,Homestead Co,issued,98598X
+B100174,5506 Market St,Akron,OH,1984,5,925,2,1,Concrete,NorthStar Builders,denied,
+B100175,78015 6086 Elm St Apt 870,Orlando,FL,1953,3,4298,2,1,Steel,Acme Constructions,pending,
+B100176,5540 Pine St,San Antonio,TX,1962,1,5685,3,3,Concrete,NorthStar Builders,pending,7118
+B100177,1155 Maple St,San Antonio,TX,2017,2,3414,2,2,Wood,Acme Constructions,pending,31081
+B100178,7102 Oak St,Detroit,MI,1951,1,1121,3,3,Mixed,Homestead Co,pending,13135
+B100179,7344 Elm St,Harrisburg,PA,1985,2,1527,2,2,Mixed,BuildRight LLC,denied,50667
+B100180,4736 Oak St,Naperville,IL,2003,4,4852,2,2,Wood,PrimeConstruct,unknown,67017
+B100181,8057 Cedar St,El Paso,TX,1995,1,3051,2,2,Mixed,BuildRight LLC,pending,95209
+B100182,2578 Oak St,Buffalo,NY,1952,3,7356,4,3,Brick,Acme Constructions,denied,93527
+B100183,9370 Cedar St,Harrisburg,PA,1989,2,2096,2,1,Wood,Homestead Co,pending,14435-5499
+B100184,7721 Main St,Buffalo,NY,2011,2,6777,2,1,Mixed,NorthStar Builders,unknown,45966
+B100185,9507 Cedar St,Augusta,GA,1950,1,2722,2,1,Wood,BuildRight LLC,issued,74383
+B100186,5945 Oak St,Aurora,IL,1974,3,2288,5,3,Steel,PrimeConstruct,unknown,86610
+B100187,2210 Main St,Bellevue,WA,2003,1,2384,3,3,Concrete,PrimeConstruct,issued,28310
+B100188,7237 Pine St,Harrisburg,PA,1956,2,7791,5,3,Steel,NorthStar Builders,unknown,12088
+B100189,8154 Market St,Harrisburg,PA,2019,2,4763,3,3,Concrete,Acme Constructions,issued,95944
+B100190,6819 Maple St,New York,NY,1953,2,4752,2,1,Brick,Homestead Co,unknown,90425
+B100191,1355 Maple St,Grand Rapids,MI,1981,1,915,3,3,Brick,BuildRight LLC,pending,49921
+B100192,4381 Pine St,San Francisco,CA,2007,2,3526,1,1,Brick,Homestead Co,unknown,29065
+B100193,6862 Elm St,Miami,FL,2006,2,7861,2,1,Concrete,BuildRight LLC,issued,78511
+B100194,1343 Main St,Erie,PA,1975,2,1382,4,4,Wood,PrimeConstruct,issued,44471
+B100195,2398 Main St,Harrisburg,PA,1966,2,4251,3,3,Steel,Acme Constructions,denied,63997
+B100196,7241 Market St,Springfield,IL,1956,4,1563,3,3,Wood,BuildRight LLC,denied,New York
+B100197,3946 Oak St,Pittsburgh,PA,1973,2,2960,1,1,Steel,Homestead Co,unknown,67492
+B100198,7201 Cedar St,Warren,MI,1978,2,6562,3,2,Concrete,Acme Constructions,pending,60794
+B100199,4864 Market St,Chicago,IL,2023,2,5474,3,2,Brick,Acme Constructions,pending,Tampa
+B100200,6798 Pine St,San Diego,CA,1968,2,4469,2,1,Concrete,PrimeConstruct,pending,13976
+B100201,3403 Elm St,Aurora,IL,1982,3,5019,3,3,Concrete,NorthStar Builders,denied,78819
+B100202,2228 Main St,Atlanta,GA,2002,1,918,2,2,Steel,PrimeConstruct,issued,23414
+B100203,1499 Market St,Atlanta,GA,2023,2,2147,2,2,Wood,PrimeConstruct,unknown,14198
+B100204,8357 Pine St,Lansing,MI,2023,4,1163,2,1,Mixed,PrimeConstruct,pending,9102
+B100205,9277 Oak St,Dallas,TX,1996,1,3402,2,2,Concrete,PrimeConstruct,issued,Lansing
+B100206,8349 Maple St,Albany,NY,1952,2,7489,2,2,Steel,PrimeConstruct,unknown,47325
+B100207,1884 Main St,Philadelphia,PA,1999,3,5191,2,1,Steel,PrimeConstruct,unknown,16390-8772
+B100208,8581 Cedar St,25199,IL,1988,4,2492,3,3,Steel,NorthStar Builders,pending,Peoria
+B100209,8352 Elm St,Spokane,WA,1978,1,2672,3,2,Wood,BuildRight LLC,denied,80256-1307
+B100210,770 Elm St,Flint,MI,1963,3,1584,1,1,Mixed,Acme Constructions,unknown,Springfield
+B100211,502 Market St,Augusta,GA,2006,2,1900,2,1,Wood,Homestead Co,unknown,90322
+B100212,505 Cedar St,Peoria,IL,1982,3,5472,1,1,Brick,PrimeConstruct,denied,
+B100213,6481 Cedar St,Spokane,WA,1953,3,5343,2,1,Brick,Acme Constructions,denied,43517
+B100214,3012 Maple St,Albany,NY,1987,2,7297,4,3,Concrete,BuildRight LLC,issued,52737
+B100215,9727 Main St,Cincinnati,OH,1977,2,2896,3,3,Mixed,Homestead Co,pending,98769-4973
+B100216,8884 Oak St,Atlanta,GA,1989,2,4403,1,1,Mixed,PrimeConstruct,unknown,62150
+B100217,6861 Main St,Fresno,CA,1978,2,2571,1,1,Steel,PrimeConstruct,unknown,74612
+B100218,305 Market St,San Antonio,TX,1997,3,6890,2,1,Steel,NorthStar Builders,unknown,23477
+B100219,6850 Maple St,Bellevue,WA,1965,2,4071,2,1,Concrete,NorthStar Builders,denied,97473
+B100220,5318 Oak St,Erie,PA,1984,4,7284,2,2,Brick,C-371,denied,83673
+B100221,4543 Main St,San Antonio,TX,2005,2,4006,2,2,Brick,NorthStar Builders,pending,70726
+B100222,2605 Oak St,Akron,OH,1979,3,7720,3,2,Concrete,PrimeConstruct,issued,29107
+B100223,7296 Elm St,Seattle,WA,1976,1,4019,3,3,Brick,Homestead Co,unknown,18694X
+B100224,4391 Elm St,Naperville,IL,1987,2,5133,1,1,Concrete,BuildRight LLC,pending,66959
+B100225,6988 Cedar St,Cincinnati,OH,2023,2,6468,2,1,Steel,NorthStar Builders,unknown,13352
+B100226,981 Pine St,Erie,PA,1969,3,7494,3,2,Mixed,NorthStar Builders,unknown,12074
+B100227,8717 Oak St,San Diego,CA,1975,2,3085,2,1,Wood,NorthStar Builders,issued,72896
+B100228,7970 Pine St,Naperville,IL,1966,2,657,5,3,Mixed,NorthStar Builders,denied,42177-8562
+B100229,5416 Market St,El Paso,TX,1995,2,1642,2,1,Brick,NorthStar Builders,issued,El Paso
+B100230,313 Cedar St,New York,NY,1964,1,4439,3,2,Brick,4439,pending,1321
+B100231,8522 Main St,New York,NY,1966,2,4474,3,3,Concrete,PrimeConstruct,denied,61488-7802
+B100232,2685 Cedar St,San Diego,CA,1996,2,5269,1,1,Brick,Homestead Co,unknown,18053
+B100233,8014 Oak St,Aurora,IL,1986,2,5646,3,2,Steel,BuildRight LLC,issued,13717
+B100234,5169 Oak St,Albany,NY,2014,2,6035,2,1,Steel,Acme Constructions,issued,30736
+B100235,1933 Maple St,Cincinnati,OH,2021,2,2707,2,2,Wood,Homestead Co,unknown,20034
+B100236,5860 Maple St,Houston,TX,1965,2,2542,2,2,Brick,NorthStar Builders,issued,23274
+B100237,9790 Cedar St,Tacoma,WA,2022,3,7774,3,2,Concrete,BuildRight LLC,denied,98888
+B100238,9921 Maple St,Lansing,MI,1993,1,4006,2,2,Wood,PrimeConstruct,issued,69566-7651
+B100239,9692 Cedar St,Savannah,GA,1953,2,1050,1,1,Steel,Acme Constructions,pending,1760
+B100240,9747 Maple St,Dallas,TX,1977,3,5884,4,4,Concrete,BuildRight LLC,pending,81671
+B100241,2468 Main St,Tallahassee,FL,1999,2,5528,2,1,Brick,PrimeConstruct,pending,92524
+B100242,4916 Pine St,Buffalo,NY,1984,2,7783,2,1,Mixed,Acme Constructions,issued,24914
+B100243,9225 Elm St,Chicago,IL,2023,1,4560,2,1,Mixed,Acme Constructions,denied,87722
+B100244,7890 Pine St,6873,WA,1977,2,7242,4,3,Mixed,Homestead Co,unknown,Spokane
+B100245,175 Oak St,Sacramento,CA,2012,2,5065,3,2,Concrete,BuildRight LLC,issued,81553
+B100246,6541 Maple St,Athens,GA,2002,1,6866,4,4,Wood,PrimeConstruct,issued,68667-2793
+B100247,2132 Market St,Buffalo,NY,2007,1,5154,2,2,Concrete,PrimeConstruct,denied,Buffalo
+B100248,2218 Elm St,Pittsburgh,PA,2008,1,777,5,3,Mixed,Acme Constructions,unknown,37591X
+B100249,237 Main St,Spokane,WA,2006,2,4892,1,1,Wod,PrimeConstruct,pending,20079
+B100250,548 Elm St,Akron,OH,1987,2,2787,4,3,Wood,PrimeConstruct,issued,34204
+B100251,8728 Main St,Tallahassee,FL,1965,2,2744,5,3,Mixed,Acme Constructions,denied,67919
+B100252,7258 Cedar St,Orlando,fl,1957,2,3497,3,2,Mixed,BuildRight LLC,unknown,69082
+B100253,3932 Market St,Naperville,IL,1980,1,1452,3,2,Concrete,PrimeConstruct,pending,93495-6511
+B100254,3612 Pine St,Bellevue,WA,1961,5,4224,1,1,Concrete,PrimeConstruct,denied,HNSFA
+B100255,9244 Pine St,Warren,MI,1969,4,764,2,2,Brick,Acme Constructions,pending,31695
+B100256,7269 Cedar St,Houston,TX,2016,2,871,2,2,Brick,Homestead Co,issued,34671
+B100257,5633 Pine St,Chicago,IL,1997,2,2879,2,2,Brick,Acme Constructions,issued,68026
+B100258,5243 Cedar St,San Antonio,TX,1965,1,4920,2,1,Steel,PrimeConstruct,issued,28358
+B100259,5443 Market St,Allentown,PA,1988,3,3009,3,3,Concrete,BuildRight LLC,denied,90909
+B100260,6022 Oak St,Tampa,FL,1989,2,6100,3,2,Steel,NorthStar Builders,unknown,46425
+B100261,572 Main St,Tacoma,WA,1960,2,4885,4,3,Concrete,Homestead Co,denied,57674
+B100262,6444 Cedar St,Columbus,GA,1975,2,3342,2,2,Wood,C-750,denied,72671
+B100263,4184 Market St,Flint,MI,2001,1,5292,2,2,Steel,PrimeConstruct,denied,74055
+B100264,3673 Pine St,Cincinnati,OH,1953,5,2833,3,2,Mixed,BuildRight LLC,issued,40230
+B100265,3218 Market St,Allentown,PA,1968,2,1071,3,3,Brick,PrimeConstruct,pending,70203
+B100266,7931 Pine St,El Paso,TX,1963,3,6908,3,2,Brick,BuildRight LLC,unknown,71685
+B100267,206 Elm St,Atlanta,GA,1988,2,4049,2,2,Wood,PrimeConstruct,issued,30375
+B100268,9909 Pine St,Jacksonville,FL,2012,2,2443,3,2,Wood,Homestead Co,denied,14768
+B100269,9338 Cedar St,El Paso,TX,1956,1,7282,1,1,Concrete,PrimeConstruct,issued,Spokane
+B100270,6834 Market St,Akron,OH,1957,3,3362,3,3,Concrete,BuildRight LLC,pending,23875
+B100271,6129 Oak St,Fresno,CA,1986,2,2783,2,1,Mixed,NorthStar Builders,denied,15032
+B100272,7037 Elm St,Tallahassee,FL,1997,2,1034,3,3,Mixed,Homestead Co,denied,Flint
+B100273,453 Maple St,Augusta,GA,1991,2,5474,2,1,Concrete,Acme Constructions,pending,14785
+B100274,9002 Oak St,Aurora,IL,1996,2,4500,1,1,Concrete,BuildRight LLC,issued,
+B100275,9191 Oak St,10217,PA,2011,2,6507,2,1,Steel,Homestead Co,issued,Philadelphia
+B100276,8258 Elm St,Cleveland,OH,1989,2,2742,2,2,Steel,Homestead Co,pending,39253-2722
+B100277,5343 Elm St,Chicago,IL,1983,2,3632,3,2,Concrete,Acme Constructions,issued,17100
+B100278,7951 Cedar St,El Paso,TX,2022,5,4974,1,1,Wood,Acme Constructions,unknown,18518
+B100279,8333 Oak St,Savannah,GA,1996,1,5166,1,1,Brick,5166,denied,LICYJ
+B100280,7998 Maple St,El Paso,TX,1986,3,1206,4,4,Steel,BuildRight LLC,issued,67156
+B100281,8758 Maple St,Spokane,WA,1960,4,7400,1,1,Brick,BuildRight LLC,unknown,27130
+B100282,3956 Main St,Rochester,NY,2021,2,3695,2,2,Concrete,BuildRight LLC,denied,13542
+B100283,3928 Market St,Savannah,GA,2020,1,1690,3,3,Steel,PrimeConstruct,unknown,28271
+B100284,8535 Elm St,Vancouver,WA,2003,2,4616,2,1,Wood,BuildRight LLC,issued,
+B100285,10070 5088 Maple St Apt 535,Akron,OH,2005,1,5803,4,3,Concrete,PrimeConstruct,issued,
+B100286,8713 Pine St,Augusta,GA,2019,3,7220,3,3,Mixed,BuildRight LLC,issued,50688
+B100287,2832 Cedar St,Warren,MI,2000,1,3863,3,2,Mixed,Homestead Co,pending,Albany
+B100288,18125 3066 Main St Apt 796,Fresno,CA,2005,2,3196,3,3,Mixed,PrimeConstruct,unknown,
+B100289,9912 Main St,San Francisco,CA,1980,2,3176,3,2,Brick,Homestead Co,denied,13273
+B100290,3972 Oak St,San Antonio,TX,1970,1,5833,2,2,Mixed,Acme Constructions,pending,Harrisburg
+B100291,3580 Market St,Columbus,GA,1995,1,742,2,2,Mixed,Homestead Co,denied,Orlando
+B100292,6988 Oak St,Chicago,IL,2008,2,1273,2,1,Mixed,Acme Constructions,unknown,34569
+B100293,3132 Cedar St,Naperville,IL,1994,2,5101,2,1,Steel,PrimeConstruct,unknown,Savannah
+B100294,1379 Main St,Cincinnati,OH,1983,2,772,2,1,Concrete,NorthStar Builders,unknown,51279
+B100295,1909 Maple St,Toledo,OH,1955,1,3153,3,3,Concrete,NorthStar Builders,denied,23605
+B100296,9045 Main St,Warren,MI,1950,1,4756,1,1,Wood,Homestead Co,unknown,
+B100297,8451 Market St,San Antonio,TX,1957,3,5611,1,1,Mixed,PrimeConstruct,issued,38164
+B100298,2807 Maple St,Fresno,CA,1979,1,5003,2,2,Brick,BuildRight LLC,pending,24729
+B100299,244 Oak St,Vancouver,WA,2009,2,6238,2,2,Mixed,PrimeConstruct,pending,35975
+B100300,1533 Market St,Buffalo,NY,1973,1,6670,2,2,Concrete,PrimeConstruct,pending,34517
+B100301,5421 Pine St,Spokane,WA,1977,3,6185,4,3,Steel,Homestead Co,issued,40702
+B100302,4712 Pine St,Fresno,CA,1976,1,3484,3,2,Brick,Homestead Co,denied,35964-5883
+B100303,6411 Maple St,Warren,MI,2023,2,3152,2,2,Mixed,PrimeConstruct,issued,63959
+B100304,9939 Oak St,Columbus,OH,1962,4,3005,3,2,Wood,Homestead Co,issued,91438
+B100305,8557 Main St,Seattle,WA,1979,3,2735,2,1,Mixed,Acme Constructions,issued,66980
+B100306,5830 Maple St,San Antonio,TX,1964,1,1195,3,2,Steel,Homestead Co,issued,19698
+B100307,1734 Cedar St,Albany,NY,2021,2,4445,3,3,Concrete,Acme Constructions,denied,40916-4594
+B100308,9343 Market St,Syracuse,NY,2011,2,1136,3,3,Concrete,PrimeConstruct,issued,71008
+B100309,862 Maple St,Los Angeles,CA,1990,1,5220,4,4,Wood,BuildRight LLC,pending,19196
+B100310,5691 Oak St,Atlanta,GA,1996,2,1335,4,3,Concrete,Acme Constructions,denied,74491
+B100311,3695 Cedar St,Houston,TX,1966,2,1523,2,2,Steel,NorthStar Builders,pending,Rochester
+B100312,818 Market St,Buffalo,NY,2002,1,1134,3,2,Steel,Acme Constructions,denied,27972
+B100313,1681 Maple St,Tallahassee,FL,1998,2,1775,2,2,Steel,Homestead Co,unknown,72326
+B100314,5563 Market St,Peoria,IL,1974,1,1821,4,3,Wod,Acme Constructions,pending,90324
+B100315,2329 Main St,Allentown,PA,1968,2,3458,4,4,Steel,BuildRight LLC,pending,1679
+B100316,2564 Elm St,Tampa,FL,2002yrs,2,7217,2,2,Steel,PrimeConstruct,unknown,73211
+B100317,820 Market St,Sacramento,CA,2015,1,1057,2,1,Brick,BuildRight LLC,unknown,98470
+B100318,3113 Cedar St,Atlanta,GA,1990,3,4475,4,4,Steel,PrimeConstruct,pending,57291
+B100319,7167 Pine St,Fresno,CA,2010,1,4129,3,3,Steel,BuildRight LLC,issued,Warren
+B100320,8949 Market St,San Antonio,TX,1983,3,4732,5,3,Mixed,PrimeConstruct,issued,94983-7477
+B100321,8332 Pine St,Springfield,il,2008,1,3519,3,2,Steel,NorthStar Builders,issued,43933
+B100322,9453 Maple St,San Francisco,CA,1974,2,911,4,4,Mixed,Homestead Co,unknown,11625
+B100323,7650 Market St,Chicago,IL,2014,2,6324,3,2,Brick,Acme Constructions,unknown,20459
+B100324,4539 Oak St,Athens,GA,2016,1,6645,4,4,Wood,Homestead Co,pending,72775X
+B100325,9280 Pine St,Houston,TX,2019,1,1397,2,2,Wood,Homestead Co,denied,74746
+B100326,6918 Maple St,El Paso,TX,2020,2,3023,4,3,Steel,Homestead Co,unknown,34739
+B100327,6903 Oak St,Syracuse,NY,2001,2,3678,2,1,Concrete,NorthStar Builders,issued,97179
+B100328,8315 Cedar St,Warren,MI,1978,1,7636,3,3,Brick,PrimeConstruct,denied,84778
+B100329,9864 Cedar St,Columbus,OH,1970,1,1651,3,2,Mixed,NorthStar Builders,unknown,41023-2815
+B100330,3317 Maple St,Detroit,MI,1984,2,4591,2,2,Wood,Acme Constructions,denied,88960
+B100331,4901 Pine St,Syracuse,NY,1958,4,5915,2,2,Steel,PrimeConstruct,pending,82632
+B100332,2955 Market St,Buffalo,NY,1977,2,7474,2,2,Concrete,BuildRight LLC,unknown,53843
+B100333,5790 Market St,61293,CA,1979,1,4821,2,2,Concrete,Homestead Co,unknown,Fresno
+B100334,5371 Main St,Vancouver,WA,1950,2,2397,3,3,Steel,Acme Constructions,issued,40945
+B100335,1168 Oak St,Columbus,GA,2004,2,7597,4,4,Concrete,NorthStar Builders,pending,65377
+B100336,8756 Elm St,Peoria,IL,2006,2,3769,5,3,Sttel,Homestead Co,unknown,31479
+B100337,2605 Maple St,Bellevue,WA,2023,1,5211,3,2,Concrete,NorthStar Builders,issued,29333
+B100338,6883 Cedar St,Chicago,IL,1991,1,5664,3,3,Mixed,PrimeConstruct,unknown,94583
+B100339,1333 Elm St,San Francisco,CA,1986,1,1961,3,2,Concrete,NorthStar Builders,issued,5933
+B100340,2076 Elm St,Sacramento,CA,2013,3,2000,5,4,Brick,PrimeConstruct,unknown,23238
+B100341,4425 Pine St,Columbus,GA,1994,1,7897,3,3,Wood,Homestead Co,issued,19669
+B100342,9433 Cedar St,Tampa,FL,1960,2,3104,2,1,Brick,PrimeConstruct,denied,18336
+B100343,8206 Maple St,Atlanta,GA,1979,2,7692,3,2,Wod,PrimeConstruct,pending,77200
+B100344,5848 Oak St,Pittsburgh,PA,2021,2,5371,2,2,Concrete,Acme Constructions,pending,29655
+B100345,3895 Oak St,Orlando,FL,1984,1,1411,1,1,Concrete,PrimeConstruct,denied,77663-2046
+B100346,7512 Maple St,San Francisco,CA,1992,2,4797,0,1,Brick,Acme Constructions,denied,50218
+B100347,9644 Oak St,Cleveland,OH,2019,2,6668,2,1,Concrete,BuildRight LLC,denied,74526
+B100348,1885 Market St,Houston,TX,1979,3,7674,4,3,Steel,Homestead Co,issued,73769
+B100349,9916 Oak St,Miami,FL,2016,1,3125,3,3,Mixed,NorthStar Builders,issued,2369
+B100350,5332 Elm St,Harrisburg,PA,2015,4,2133,1,1,Wood,Acme Constructions,pending,73384-6281
+B100351,1349 Pine St,Athens,GA,2001,1,4567,4,4,Concrete,PrimeConstruct,unknown,96821-2124
+B100352,3311 Elm St,Springfield,IL,1964,2,3338,4,3,Brick,Acme Constructions,unknown,95117-6721
+B100353,6908 Cedar St,Vancouver,WA,1958,1,1096,2,1,Steel,Homestead Co,pending,39161
+B100354,9607 Pine St,Tacoma,WA,1976,2,6834,4,3,Concrete,NorthStar Builders,denied,Chicago
+B100355,6277 Market St,Augusta,GA,1976,1,6981,2,1,Mixed,PrimeConstruct,pending,San Diego
+B100356,8617 Main St,Buffalo,NY,2010,2,7846,2,1,Brick,NorthStar Builders,issued,42854
+B100357,5741 Pine St,Harrisburg,PA,2023,3,3943,3,2,Concrete,Acme Constructions,issued,22000
+B100358,1241 Maple St,Peoria,IL,1979,1,1972,3,3,Mixed,Acme Constructions,issued,92550
+B100359,6744 Oak St,Atlanta,GA,1987,1,5581,2,1,Mixed,Acme Constructions,unknown,Atlanta
+B100360,9092 Maple St,Springfield,IL,2003,2,4234,3,3,Steel,Acme Constructions,denied,47364
+B100361,1269 Oak St,Syracuse,NY,1982,2,1079,0,1,Wood,Acme Constructions,issued,43909-8430
+B100362,687 Market St,Dallas,TX,1962,2,6352,3,2,Mixed,NorthStar Builders,pending,80351
+B100363,8905 Oak St,San Diego,CA,1990,3,2443,1,1,Mixed,BuildRight LLC,denied,San Diego
+B100364,3528 Main St,Naperville,IL,1988,1,3955,2,1,Wood,PrimeConstruct,issued,14078
+B100365,5849 Pine St,Athens,GA,1962,1,4806,3,2,Wod,Homestead Co,pending,55386
+B100366,1267 Market St,Houston,TX,1970,3,2607,3,2,Wood,Acme Constructions,issued,FFADJ
+B100367,4049 Pine St,Erie,PA,1996,1,3364,5,4,C0ncrete,NorthStar Builders,issued,14660
+B100368,7110 Oak St,Syracuse,NY,2007,2,6044,2,2,Concrete,NorthStar Builders,issued,51418
+B100369,834 Elm St,San Diego,CA,2008,2,7695,4,3,Wood,BuildRight LLC,issued,LNILL
+B100370,9950 Oak St,Houston,TX,1986,1,3194,3,3,Wood,PrimeConstruct,unknown,54781
+B100371,4884 Pine St,Tampa,FL,1971,1,2326,4,4,Brick,Acme Constructions,unknown,47354
+B100372,5111 Pine St,Orlando,FL,2008,2,6493,2,1,Wood,Acme Constructions,unknown,54392-3964
+B100373,8425 Pine St,San Francisco,CA,1956,1,2647,1,1,Wood,Acme Constructions,pending,54717
+B100374,6699 Oak St,Athens,GA,1995,2,4673,2,1,Concrete,BuildRight LLC,unknown,XFMWN
+B100375,1804 Maple St,Syracuse,NY,1982,3,7312,2,2,Wood,Homestead Co,unknown,83011
+B100376,5550 Pine St,New York,NY,2015,1,7435,3,3,Mixed,PrimeConstruct,denied,Akron
+B100377,424 Pine St,El Paso,TX,1963,2,6684,2,1,Mixed,Acme Constructions,pending,52794
+B100378,9688 Main St,Rochester,NY,1994,2,3546,3,3,Wood,NorthStar Builders,unknown,
+B100379,8425 Maple St,San Antonio,TX,2009,2,1485,2,2,Wood,Homestead Co,issued,84108
+B100380,8646 Oak St,Aurora,IL,1978,2,5576,1,1,Mixed,PrimeConstruct,unknown,92291
+B100381,7236 Maple St,Peoria,IL,1958,3,7838,2,2,Concrete,BuildRight LLC,issued,Savannah
+B100382,6736 Market St,Springfield,IL,1980,1,4869,5,3,Wod,BuildRight LLC,unknown,49886X
+B100383,1433 Oak St,Springfield,IL,2019,1,6716,2,1,Concrete,BuildRight LLC,unknown,26966
+B100384,5246 Pine St,Peoria,IL,1960yrs,2,7820,3,2,Concrete,PrimeConstruct,denied,Jacksonville
+B100385,2094 Cedar St,Springfield,il,2001,2,6075,2,1,Steel,BuildRight LLC,denied,12823
+B100386,5593 Main St,San Francisco,CA,1998,2,1361,5,3,Steel,Acme Constructions,unknown,77634
+B100387,6755 Pine St,Peoria,IL,2019,2,1460,4,4,Brick,Acme Constructions,issued,23722
+B100388,2211 Elm St,Tampa,FL,1976,2,4497,4,4,Steel,PrimeConstruct,issued,80462
+B100389,7949 Oak St,Rochester,ny,1962,2,6883,3,3,Concrete,BuildRight LLC,issued,12867-3414
+B100390,3256 Cedar St,Buffalo,NY,1971,1,3670,2,2,Mixed,PrimeConstruct,unknown,18920
+B100391,1013 Elm St,Naperville,IL,1950,2,6572,2,2,Steel,BuildRight LLC,pending,21736
+B100392,1540 Oak St,New York,NY,1976,4,6761,4,4,Wood,PrimeConstruct,issued,19439
+B100393,1291 Maple St,Athens,GA,1979,1,1974,4,3,Brick,Homestead Co,issued,17409
+B100394,2816 Pine St,Philadelphia,PA,2000,4,1996,1,1,Concrete,NorthStar Builders,unknown,78515
+B100395,6089 Maple St,Augusta,GA,2003,2,3916,4,3,Concrete,BuildRight LLC,issued,50134
+B100396,8553 Cedar St,Miami,FL,1983,2,7273,2,2,Steel,Acme Constructions,unknown,85073
+B100397,8781 Main St,Austin,TX,1994,2,5278,2,2,Brick,PrimeConstruct,pending,92681
+B100398,5288 Oak St,Spokane,WA,1964,4,1245,2,2,Wood,PrimeConstruct,issued,Athens
+B100399,7598 Oak St,Cleveland,OH,1955,2,2692,2,1,Concrete,Acme Constructions,denied,3110
+B100400,5998 Pine St,Tallahassee,FL,1964,2,1923,3,3,Mixed,NorthStar Builders,issued,54739-4685
+B100401,5803 Maple St,Lansing,MI,2013,2,5203,2,1,Wood,Acme Constructions,unknown,14798X
+B100402,5551 Maple St,Fresno,CA,2003,2,4062,2,1,Brick,Acme Constructions,denied,97867
+B100403,777 Cedar St,Columbus,GA,1967,2,3118,2,1,Concrete,BuildRight LLC,pending,Columbus
+B100404,3993 Maple St,Toledo,OH,2004,1,4661,2,2,Concrete,Homestead Co,denied,25814
+B100405,4486 Elm St,Orlando,FL,2009,1,1888,2,1,Sttel,Homestead Co,issued,62072
+B100406,3888 Main St,Tacoma,WA,1971,4,7891,2,2,Concrete,Acme Constructions,pending,8389
+B100407,3384 Elm St,Peoria,IL,1980,2,4796,2,2,Wood,BuildRight LLC,issued,5760
+B100408,8998 Maple St,San Francisco,CA,1978,2,4756,2,1,Concrete,Homestead Co,issued,77638
+B100409,2788 Oak St,Detroit,MI,2018,1,2163,4,4,Mixed,Homestead Co,denied,40232-4427
+B100410,1750 Oak St,Vancouver,WA,1951,2,6390,0,1,Mixed,NorthStar Builders,unknown,31776
+B100411,5336 Oak St,Bellevue,WA,2015,4,1935,2,1,Steel,NorthStar Builders,pending,43475
+B100412,7668 Cedar St,Columbus,GA,2013,3,2706,3,3,Concrete,BuildRight LLC,unknown,68203
+B100413,3525 Cedar St,Pittsburgh,PA,1957,4,4284,3,3,Concrete,Homestead Co,pending,85445
+B100414,4704 Market St,San Francisco,CA,1959,2,5879,0,1,Wood,Acme Constructions,issued,64694
+B100415,664 Maple St,El Paso,tx,1994,1,3794,4,3,Concrete,PrimeConstruct,pending,74955
+B100416,8675 Maple St,Miami,FL,1980,2,1380,2,2,Steel,Acme Constructions,unknown,51404
+B100417,4011 Elm St,Fresno,CA,1977,1,1606,2,1,Wood,Homestead Co,unknown,74930
+B100418,7576 Market St,San Antonio,TX,1961,1,1134,1,1,Concrete,Acme Constructions,issued,90093
+B100419,2298 Maple St,Pittsburgh,PA,1995,4,3054,1,1,Wood,PrimeConstruct,denied,Augusta
+B100420,483 Pine St,Philadelphia,PA,1959,1,2189,2,1,Brick,C-938,issued,28483
+B100421,136 Market St,Savannah,GA,1961,1,3901,3,3,Mixed,Homestead Co,denied,
+B100422,9910 Main St,Grand Rapids,MI,1952,1,6368,3,3,Steel,Acme Constructions,pending,43273-6747
+B100423,4197 Oak St,Cincinnati,OH,2020,1,6763,2,2,Concrete,NorthStar Builders,denied,75766
+B100424,3333 Main St,Buffalo,NY,2023,3,1166,1,1,Concrete,BuildRight LLC,unknown,28722
+B100425,894 Cedar St,Naperville,IL,1973,2,1395,3,3,Steel,Acme Constructions,issued,91798
+B100426,7171 Maple St,Chicago,IL,1953,2,5333,3,2,Concrete,PrimeConstruct,issued,91038-2166
+B100427,570 Elm St,Sacramento,CA,2010,1,1549,4,3,Concrete,PrimeConstruct,issued,Detroit
+B100428,1004 Main St,Bellevue,WA,2015,1,1918,5,3,Concrete,NorthStar Builders,pending,94749
+B100429,4606 Pine St,Savannah,GA,1976,5,1367,2,1,Brick,Acme Constructions,pending,18987
+B100430,5521 Cedar St,Vancouver,WA,1986,3,5073,3,3,Wood,NorthStar Builders,pending,29482
+B100431,403 Market St,Naperville,IL,1985,2,920,3,2,Steel,Acme Constructions,issued,90500
+B100432,2794 Elm St,Erie,PA,1998,2,1036,3,3,Concrete,BuildRight LLC,pending,53732
+B100433,4889 Cedar St,Tallahassee,FL,1994,4,6295,4,3,Mixed,PrimeConstruct,unknown,Flint
+B100434,1607 Cedar St,Naperville,IL,1984,1,4050,2,2,Concrete,Acme Constructions,issued,48492
+B100435,153 Oak St,Athens,GA,2011,1,7426,2,1,Concrete,BuildRight LLC,issued,31304-7849
+B100436,8282 Oak St,Philadelphia,PA,2005,4,7662,2,2,Wood,Homestead Co,pending,Flint
+B100437,2840 Market St,Akron,OH,1982,2,1916,2,2,Brick,Homestead Co,denied,70399
+B100438,7326 Maple St,Cleveland,OH,1973,1,4274,3,3,Brick,NorthStar Builders,pending,39670
+B100439,675 Market St,Aurora,IL,1988,2,7562,3,2,Wood,Acme Constructions,pending,Miami
+B100440,5144 Cedar St,Erie,PA,1996,3,6427,3,3,Mixed,NorthStar Builders,issued,Houston
+B100441,1912 Oak St,Los Angeles,CA,2006,3,1512,1,1,Steel,NorthStar Builders,pending,27838
+B100442,7226 Cedar St,Tallahassee,FL,1970,2,4140,4,4,Wood,NorthStar Builders,issued,43101
+B100443,4825 Oak St,Jacksonville,FL,1996,2,911,2,1,Concrete,NorthStar Builders,pending,11333
+B100444,8126 Elm St,Warren,MI,1970,1,5699,3,3,Steel,NorthStar Builders,issued,90058
+B100445,5375 Oak St,Aurora,IL,1996,1,3821,4,3,Concrete,Homestead Co,denied,XLRCZ
+B100446,1405 Market St,Philadelphia,PA,1953,1,3194,0,1,Brick,BuildRight LLC,denied,31176
+B100447,9653 Cedar St,Cincinnati,OH,1989,1,4732,3,3,Concrete,BuildRight LLC,denied,27748
+B100448,6057 Cedar St,Detroit,MI,2006,2,5812,2,1,Wood,Homestead Co,pending,17010
+B100449,8741 Cedar St,Naperville,IL,2014,1,1056,2,2,Brick,Homestead Co,denied,32838-6601
+B100450,8362 Main St,Tampa,FL,2013,5,5453,4,4,Concrete,BuildRight LLC,denied,1087
+B100451,9583 Pine St,Grand Rapids,MI,1952,2,4153,4,3,Wood,Homestead Co,pending,16772
+B100452,8735 Market St,San Antonio,TX,1967yrs,2,1075,1,1,Mixed,NorthStar Builders,unknown,59381
+B100453,3467 Pine St,Seattle,WA,2011,1,1736,3,3,Steel,NorthStar Builders,issued,77646
+B100454,8999 Pine St,Athens,GA,2016,1,4516,3,2,Brick,PrimeConstruct,unknown,60105
+B100455,6772 Cedar St,Springfield,IL,2001,2,7366,2,1,Steel,Homestead Co,issued,33895
+B100456,528 Maple St,Aurora,IL,2007,1,6362,2,2,Brick,Acme Constructions,pending,Columbus
+B100457,6297 Elm St,Naperville,IL,1962,1,5807,2,2,Steel,PrimeConstruct,unknown,Tallahassee
+B100458,4491 Oak St,Philadelphia,PA,1960,3,4948,4,3,Steel,Homestead Co,unknown,42627
+B100459,9255 Elm St,Harrisburg,PA,1991,2,4045,2,2,Concrete,Homestead Co,unknown,32992X
+B100460,6503 Oak St,New York,NY,1977,3,2468,5,4,Wood,PrimeConstruct,pending,Athens
+B100461,9907 Market St,Pittsburgh,PA,2023,2,6504,2,2,Concrete,BuildRight LLC,issued,58006
+B100462,2016 Market St,Flint,MI,1952,2,6475,2,1,Mixed,PrimeConstruct,denied,18837-4219
+B100463,4703 Market St,Naperville,IL,1980,3,5669,3,2,Steel,PrimeConstruct,denied,7471
+B100464,7978 Main St,Spokane,WA,1980,2,682,3,3,Wood,NorthStar Builders,unknown,Spokane
+B100465,6883 Maple St,San Francisco,CA,1953yrs,1,7013,3,3,Wood,BuildRight LLC,denied,86829
+B100466,3021 Elm St,Philadelphia,PA,1992,4,3300,1,1,Concrete,PrimeConstruct,unknown,76999
+B100467,1958 Elm St,San Francisco,CA,1962,5,1561,2,2,Concrete,Homestead Co,denied,
+B100468,5928 Oak St,Orlando,FL,2010,2,3992,3,3,Brick,Acme Constructions,unknown,82469-7073
+B100469,413 Market St,Savannah,GA,1978,2,979,2,1,Concrete,NorthStar Builders,unknown,82713
+B100470,9561 Main St,Springfield,IL,1984,2,4891,4,4,Concrete,4891,issued,28784-5922
+B100471,3846 Maple St,Toledo,OH,1979,1,6836,3,3,Steel,BuildRight LLC,pending,98448
+B100472,391 Oak St,Bellevue,WA,1986,3,5362,2,1,Mixed,Acme Constructions,pending,Peoria
+B100473,1851 Cedar St,Houston,TX,1961,3,7711,2,2,Steel,PrimeConstruct,issued,57914
+B100474,6348 Elm St,San Francisco,CA,2017,3,1968,2,2,Wood,NorthStar Builders,unknown,Pittsburgh
+B100475,8430 Oak St,Warren,MI,1960,1,4538,3,2,Brick,Acme Constructions,issued,87948-7105
+B100476,8009 Maple St,Atlanta,GA,1955,3,7834,3,3,Mixed,PrimeConstruct,issued,Spokane
+B100477,5090 Oak St,Miami,FL,1967,2,2015,1,1,Steel,BuildRight LLC,unknown,Atlanta
+B100478,9196 Maple St,Naperville,IL,2000,3,6780,2,2,Steel,BuildRight LLC,pending,90855
+B100479,826 Market St,Warren,MI,1961,2,2618,5,3,Steel,BuildRight LLC,pending,70862
+B100480,8433 Main St,Columbus,OH,1986,2,1148,4,3,Steel,BuildRight LLC,pending,
+B100481,5378 Elm St,Fresno,CA,1997,1,4799,3,2,Concrete,Acme Constructions,issued,91214
+B100482,300 Cedar St,Springfield,IL,1974,3,3497,4,4,Steel,BuildRight LLC,issued,98935
+B100483,2459 Maple St,Spokane,WA,1951,2,5945,3,3,Concrete,Acme Constructions,denied,
+B100484,481 Oak St,Houston,TX,1986,2,5673,3,2,Wood,Homestead Co,pending,9837
+B100485,22195 9967 Elm St Apt 895,Chicago,IL,2013,2,2636,3,3,Brick,BuildRight LLC,unknown,
+B100486,4423 Oak St,Naperville,IL,1957,1,2700,3,3,Concrete,Homestead Co,denied,Toledo
+B100487,8735 Pine St,Syracuse,NY,1977,2,3102,3,2,Mixed,BuildRight LLC,issued,38919
+B100488,6210 Maple St,Augusta,GA,1986,1,6479,3,3,Brick,Homestead Co,denied,36363
+B100489,8654 Elm St,Bellevue,WA,1959,2,7866,4,3,Concrete,NorthStar Builders,denied,41198
+B100490,4655 Elm St,Toledo,OH,1959,1,3823,4,3,Steel,Acme Constructions,issued,86482
+B100491,2186 Elm St,Buffalo,NY,2005,1,6289,3,3,Steel,Acme Constructions,pending,66765
+B100492,9959 Oak St,Austin,TX,2002,1,1411,3,2,Brick,Acme Constructions,issued,39074
+B100493,5756 Oak St,Tallahassee,FL,1994,4,4580,4,3,Brick,Homestead Co,issued,22987
+B100494,7185 Oak St,Erie,PA,1992,3,4613,3,3,Steel,Homestead Co,unknown,OJSAJ
+B100495,3401 Pine St,Seattle,WA,2005,1,7581,2,1,Steel,Acme Constructions,issued,31805
+B100496,609 Oak St,Albany,NY,2002,2,5113,2,2,Concrete,NorthStar Builders,pending,14853
+B100497,3518 Elm St,El Paso,TX,1995,1,4281,2,2,Steel,NorthStar Builders,issued,
+B100498,5925 Oak St,Grand Rapids,MI,2023,1,6084,4,4,Wood,PrimeConstruct,pending,Grand Rapids
+B100499,9048 Pine St,Syracuse,NY,2002,1,7170,2,2,Brick,BuildRight LLC,unknown,18865

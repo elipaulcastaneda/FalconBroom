@@ -8,11 +8,11 @@ import fbroom.main as main
 main._require_admin = lambda req: {'id':'admin','is_admin':True}
 main._consent_audit = lambda *a, **k: None
 async def fake_call(path, method='GET', json_body=None):
-	class R:
-		status_code = 200
-		def json(self):
-			return [{'id':'u1','email':'a@b.com','aud':'authenticated','created_at':'t'}]
-	return R()
+    class R:
+        status_code = 200
+        def json(self):
+            return [{'id':'u1','email':'a@b.com','aud':'authenticated','created_at':'t'}]
+    return R()
 main._call_supabase_service_role = fake_call
 
 client = TestClient(main.app)

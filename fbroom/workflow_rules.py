@@ -19,6 +19,7 @@ from difflib import SequenceMatcher
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .recipe_schema import CleaningStep, JoinSpec, Recipe
+from .step_catalog import parse_instruction
 
 
 ACTION_ALIASES = {
@@ -107,54 +108,95 @@ def infer_action(text: str) -> Optional[str]:
                     if neg and typ in ('numeric', 'numerical', 'number', 'numbers'):
                         typ_out = 'string'
                     elif neg and typ in ('string', 'text', 'letters'):
-                        typ_out = 'numeric'
-                    else:
-                        typ_out = 'numeric' if typ in ('numeric', 'numerical', 'number', 'numbers') else 'string'
-                    params = {"source": src, "target": tgt, "type": typ_out, "exceptions": [], "replacement": ""}
-                    all_steps.append(CleaningStep(action="move_by_type", column=None, params=params))
-                    parsed = True
+                        # First, handle explicit coercion/cast-like phrases such as
+                        # 'coerce ... to numeric' or 'coerce ... to datetime' and map them
+                        # to `cast` steps rather than accidental map pairs.
+                        try:
+                            m_coerce = re.search(r"coerce\s+(?:the\s+)?(?:values\s+in\s+)?([a-zA-Z0-9_ ]+)?\s*(?:to|into)\s+(numeric|number|int|integer|float|decimal|datetime|date)", t, flags=re.IGNORECASE)
+                            if m_coerce:
+                                col_raw = (m_coerce.group(1) or "").strip()
+                                typ = (m_coerce.group(2) or "").lower()
+                                col = None
+                                if col_raw:
+                                    if col_raw in profile:
+                                        col = col_raw
+                                    else:
+                                        matches = infer_columns_from_text(col_raw, profile, top_n=1)
+                                        if matches:
+                                            col = matches[0][0]
+                                # fallback: pick a string-like column if none resolved
+                                if not col:
+                                    for c, m in profile.items():
+                                        try:
+                                            dtype = _norm(str(m.get('dtype', '') or ''))
+                                        except Exception:
+                                            dtype = ''
+                                        if any(tok in dtype for tok in ('str', 'utf', 'object')):
+                                            col = c
+                                            break
+                                if col:
+                                    if typ in ('numeric', 'number', 'int', 'integer', 'float', 'decimal'):
+                                        steps.append(CleaningStep(action='cast', column=col, params={'to': 'numeric', 'errors': 'coerce'}))
+                                        return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
+                                    if typ in ('datetime', 'date'):
+                                        steps.append(CleaningStep(action='cast', column=col, params={'to': 'datetime', 'errors': 'coerce'}))
+                                        return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
+                        except Exception:
+                            pass
 
-                # 2) move all values (no type) -> emit two moves to capture numeric and string variants
-                if not parsed:
-                    # accept variants like 'move values from A to B', 'move A to B', or 'move all values from A to B'
-                    m_all = re.search(r"(?i)(?:move|put|copy)\s+(?:all\s+)?(?:values\s*)?(?:in|from|of)?\s*(?P<src>[A-Za-z0-9_]+)\s*(?:column)?\s*(?:to|into|in)\s*(?P<tgt>[A-Za-z0-9_]+)", p)
-                    if m_all:
-                        src = m_all.group('src')
-                        tgt = m_all.group('tgt')
-                        all_steps.append(CleaningStep(action="move_by_type", column=None, params={"source": src, "target": tgt, "type": "string", "exceptions": [], "replacement": ""}))
-                        all_steps.append(CleaningStep(action="move_by_type", column=None, params={"source": src, "target": tgt, "type": "numeric", "exceptions": [], "replacement": ""}))
-                        parsed = True
-
-                # 3) drop column shorthand: 'drop col_6' or 'drop column col_6'
-                if not parsed:
-                    m_drop = re.search(r"(?i)drop\s+(?:column\s+)?(?P<col>[A-Za-z0-9_]+)", p)
-                    if m_drop:
-                        col = m_drop.group('col')
-                        all_steps.append(CleaningStep(action="drop_column", column=col, params={}))
-                        parsed = True
-
-                # 4) fallback: attempt to parse the clause recursively
-                if not parsed:
-                    try:
-                        sub = recipe_from_plain_english(p, profile, source_path, output_path, regression_options)
-                        if sub and getattr(sub, 'cleaning_steps', None):
-                            all_steps.extend([s for s in sub.cleaning_steps])
-                    except Exception:
-                        continue
-
-            if all_steps:
-                print('DEBUG: combined steps count ->', len(all_steps))
-                # ensure steps are plain dicts for Pydantic consumption
-                serial_steps = []
-                for s in all_steps:
-                    try:
-                        if hasattr(s, 'model_dump'):
-                            serial_steps.append(s.model_dump())
-                        elif hasattr(s, 'dict'):
-                            serial_steps.append(s.dict())
-                        else:
-                            serial_steps.append(dict(s))
-                    except Exception:
+                        # map pattern: accept explicit arrow forms or quoted 'A to B' pairs only.
+                        arrows = re.findall(r"([\w\+\-\.]+)\s*(?:->|=>)\s*([\w\+\-\.]+)", t)
+                        quoted_to = re.findall(r"['\"]([^'\"]+?)['\"]\s+to\s+['\"]([^'\"]+?)['\"]", t, flags=re.IGNORECASE)
+                        pairs = arrows + quoted_to
+                        mcol = re.search(r"(?:in|on)\s+([a-zA-Z0-9_ ]+)", t)
+                        if pairs and mcol:
+                            forbidden_verbs = set(['coerce', 'convert', 'cast', 'set', 'make', 'move', 'copy', 'put'])
+                            clean_pairs = []
+                            for a, b in pairs:
+                                a_s = a.strip().lower()
+                                b_s = b.strip().lower()
+                                if (a_s in forbidden_verbs) or (b_s in forbidden_verbs):
+                                    continue
+                                if len(a_s) <= 1 or len(b_s) <= 1:
+                                    continue
+                                clean_pairs.append((a.strip(), b.strip()))
+                            if not clean_pairs:
+                                clean_pairs = []
+                            mapping = {k: v for k, v in clean_pairs}
+                            try:
+                                col_raw = mcol.group(1).strip()
+                                col_clean = re.sub(r"\b(common|text|string|numeric|number|numbers|values|entries|column|columns|the|a|an)\b", "", col_raw, flags=re.IGNORECASE).strip()
+                                col_clean = re.sub(r"\s+", " ", col_clean).strip()
+                                resolved_col = None
+                                if col_clean in profile:
+                                    resolved_col = col_clean
+                                else:
+                                    infer = infer_columns_from_text(col_clean, profile, top_n=1)
+                                    if infer:
+                                        resolved_col = infer[0][0]
+                                if not resolved_col:
+                                    for c, m in profile.items():
+                                        try:
+                                            dtype = _norm(str(m.get('dtype', '') or ''))
+                                        except Exception:
+                                            dtype = ''
+                                        if any(tok in dtype for tok in ('str', 'utf', 'object')):
+                                            resolved_col = c
+                                            break
+                                    if not resolved_col:
+                                        for preferred in ('address','city','state','zip','postal','name'):
+                                            for c in profile.keys():
+                                                if preferred in c.lower():
+                                                    resolved_col = c
+                                                    break
+                                            if resolved_col:
+                                                break
+                                target_col = resolved_col or None
+                            except Exception:
+                                target_col = None
+                            if target_col and mapping:
+                                steps.append(CleaningStep(action='map', column=target_col, params={'mapping': mapping}))
+                                return Recipe(sources=[{'path': source_path}], cleaning_steps=steps, joins=[], outputs=[{'path': output_path}])
                         try:
                             serial_steps.append(dict(s))
                         except Exception:
@@ -289,6 +331,9 @@ def _default_strategy_for_column(meta: Dict[str, Any]) -> str:
 
 def recipe_from_plain_english(text: str, profile: Dict[str, Dict[str, Any]], source_path: str, output_path: str, regression_options: Optional[dict] = None) -> Recipe:
     """Map a plain-English instruction into a deterministic recipe when possible."""
+    catalog_steps = parse_instruction(text, _profile_column_names(profile))
+    if catalog_steps:
+        return Recipe(sources=[{"path": source_path}], cleaning_steps=catalog_steps, joins=[], outputs=[{"path": output_path}])
     action = infer_action(text)
     # If infer_action returned a pre-serialized list of steps for multi-clause inputs, build Recipe
     try:
@@ -732,13 +777,80 @@ def recipe_from_plain_english(text: str, profile: Dict[str, Dict[str, Any]], sou
             steps.append(CleaningStep(action="bucketize", column=colname, params={"buckets": buckets}))
             return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
 
-    # map pattern
-    pairs = re.findall(r"([\w\+\-\.]+)\s*(?:->|to)\s*([\w\+\-\.]+)", t)
+    # map pattern: only accept explicit arrow forms or quoted 'A to B' pairs
+    # Be conservative: avoid interpreting verbs like 'coerce', 'convert', 'cast'
+    # as mapping keys by filtering out verb-like captures and require a
+    # resolved target column in the profile before emitting a map step.
+    arrows = re.findall(r"([\w\+\-\.]+)\s*(?:->|=>)\s*([\w\+\-\.]+)", t)
+    quoted_to = re.findall(r"['\"]([^'\"]+?)['\"]\s+to\s+['\"]([^'\"]+?)['\"]", t, flags=re.IGNORECASE)
+    pairs = arrows + quoted_to
     mcol = re.search(r"(?:in|on)\s+([a-zA-Z0-9_ ]+)", t)
     if pairs and mcol:
-        mapping = {k: v for k, v in pairs}
-        steps.append(CleaningStep(action="map", column=mcol.group(1).strip(), params={"mapping": mapping}))
-        return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
+        # filter out accidental captures that are verbs or short tokens
+        forbidden_verbs = set(['coerce', 'convert', 'cast', 'set', 'make', 'move', 'copy', 'put'])
+        clean_pairs = []
+        for a, b in pairs:
+            a_s = a.strip().lower()
+            b_s = b.strip().lower()
+            if (a_s in forbidden_verbs) or (b_s in forbidden_verbs):
+                continue
+            if len(a_s) <= 1 or len(b_s) <= 1:
+                # skip extremely short tokens (likely noise)
+                continue
+            clean_pairs.append((a.strip(), b.strip()))
+
+        if not clean_pairs:
+            # nothing safe to map
+            clean_pairs = []
+
+        mapping = {k: v for k, v in clean_pairs}
+
+        # sanitize target column captured by the regex which can include
+        # descriptive words (e.g., 'text column'). Attempt to resolve to
+        # an actual profile column name; require resolution to avoid
+        # emitting spurious map steps.
+        try:
+            col_raw = mcol.group(1).strip()
+            # strip descriptor words
+            col_clean = re.sub(r"\b(common|text|string|numeric|number|numbers|values|entries|column|columns|the|a|an)\b", "", col_raw, flags=re.IGNORECASE).strip()
+            col_clean = re.sub(r"\s+", " ", col_clean).strip()
+            resolved_col = None
+            if col_clean in profile:
+                resolved_col = col_clean
+            else:
+                try:
+                    infer = infer_columns_from_text(col_clean, profile, top_n=1)
+                    if infer:
+                        resolved_col = infer[0][0]
+                except Exception:
+                    resolved_col = None
+            # fallback: choose a first string-like column from profile
+            if not resolved_col:
+                for c, m in profile.items():
+                    try:
+                        dtype = _norm(str(m.get('dtype', '') or ''))
+                    except Exception:
+                        dtype = ''
+                    if any(tok in dtype for tok in ('str', 'utf', 'object')):
+                        resolved_col = c
+                        break
+                # prefer address/city-like names if none matched by dtype
+                if not resolved_col:
+                    for preferred in ('address','city','state','zip','postal','name'):
+                        for c in profile.keys():
+                            if preferred in c.lower():
+                                resolved_col = c
+                                break
+                        if resolved_col:
+                            break
+            target_col = resolved_col or None
+        except Exception:
+            target_col = None
+
+        # Only emit a map step when we have a resolved column and at least one mapping pair
+        if target_col and mapping:
+            steps.append(CleaningStep(action="map", column=target_col, params={"mapping": mapping}))
+            return Recipe(sources=[{"path": source_path}], cleaning_steps=steps, joins=[], outputs=[{"path": output_path}])
 
     # Detect requests to remove values of a certain data type within a column
     # e.g. "remove all string entries from host_since" or
@@ -1430,9 +1542,7 @@ def recipe_from_plain_english(text: str, profile: Dict[str, Dict[str, Any]], sou
             if "ffill" in t or "forward" in t:
                 strategy = "forward_fill"
             steps.append(CleaningStep(action="impute", column=column, params={"strategy": strategy}))
-        if pairs and colm:
-            mapping = {k: v for k, v in pairs}
-            steps.append(CleaningStep(action="map", column=colm.group(1).strip(), params={"mapping": mapping}))
+        # note: map emission handled in dedicated map-detection branch above
     elif action == "regex_replace":
         # replace regex 'pattern' with 'repl' in column
         rex = re.findall(r"(?:replace\s+)?(?:regex|regular expression)\s+[\'\"](.+?)[\'\"]\s+with\s+[\'\"](.+?)[\'\"]\s+(?:in|on)\s+([a-zA-Z0-9_ ]+)", t)
@@ -1499,6 +1609,94 @@ def recipe_from_plain_english(text: str, profile: Dict[str, Dict[str, Any]], sou
                 if case != 'trim' and any(k in t for k in ['trim', 'strip', 'whitespace']):
                     steps.append(CleaningStep(action="normalize", column=c, params={"case": "trim"}))
                 steps.append(CleaningStep(action="normalize", column=c, params={"case": case}))
+    except Exception:
+        pass
+
+    # Post-process parsed steps: sanitize loosely-captured column names that
+    # may include descriptive tokens (e.g., 'common text column') which can
+    # produce invalid column references not present in the profile. Strip
+    # common descriptors and attempt a fuzzy match back to a real column name
+    # before returning the final Recipe. If fuzzy-matching fails and the
+    # candidate clearly looks descriptive (contains tokens like 'text'/'column'),
+    # choose a conservative fallback: the top string-like column (prefer
+    # address/city/state/zip-like names) from the profile.
+    try:
+        def _clean_candidate(name: str) -> str:
+            if not name or not isinstance(name, str):
+                return name
+            cleaned = re.sub(r"\b(common|text|string|numeric|number|numbers|values|entries|column|columns|the|a|an)\b", "", name, flags=re.IGNORECASE).strip()
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            return cleaned or name
+
+        def _pick_fallback_string_column(profile: Dict[str, Dict[str, Any]]) -> Optional[str]:
+            if not profile:
+                return None
+            # priority keywords to pick a human-friendly string column
+            priority = ['address', 'street', 'city', 'state', 'zip', 'postal', 'name']
+            # collect string-like columns
+            string_cols = []
+            for c, m in profile.items():
+                try:
+                    dtype = _norm(str(m.get('dtype', '') or ''))
+                except Exception:
+                    dtype = ''
+                if any(tok in dtype for tok in ('str', 'utf', 'object')) or any(p in c.lower() for p in priority):
+                    string_cols.append(c)
+            # prefer priority matches first
+            for p in priority:
+                for c in string_cols:
+                    if p in c.lower():
+                        return c
+            # otherwise return the first string-like column
+            if string_cols:
+                return string_cols[0]
+            # last resort: return first non-meta column
+            for c in profile.keys():
+                if not c.startswith('_') and c not in ('text', 'notes', 'style_json'):
+                    return c
+            return None
+
+        cleaned_steps = []
+        for s in steps:
+            try:
+                col = s.column if hasattr(s, 'column') else (s.get('column') if isinstance(s, dict) else None)
+            except Exception:
+                col = None
+            if isinstance(col, str) and col not in profile:
+                candidate = _clean_candidate(col)
+                resolved = None
+                try:
+                    # exact match after cleaning
+                    if candidate in profile:
+                        resolved = candidate
+                    else:
+                        # try fuzzy inference from cleaned candidate
+                        infer = infer_columns_from_text(candidate, profile, top_n=1)
+                        if infer:
+                            resolved = infer[0][0]
+                except Exception:
+                    resolved = None
+
+                # stronger fallback: if candidate still unresolved but looks
+                # descriptive (contains words like 'text' or 'column'), pick
+                # a top string-like column from the profile.
+                if not resolved:
+                    low = (col or '').lower()
+                    if any(tok in low for tok in ('text', 'column', 'common', 'string')):
+                        fb = _pick_fallback_string_column(profile)
+                        if fb:
+                            resolved = fb
+
+                if resolved:
+                    try:
+                        if hasattr(s, 'column'):
+                            s.column = resolved
+                        elif isinstance(s, dict):
+                            s['column'] = resolved
+                    except Exception:
+                        pass
+            cleaned_steps.append(s)
+        steps = cleaned_steps
     except Exception:
         pass
 
@@ -1626,6 +1824,32 @@ def explain_recipe(recipe: Recipe, profile: Optional[Dict[str, Dict[str, Any]]] 
                         confidence = 0.3
 
             # attach explanation; include column information in the step for clarity
+            # If no reason was generated above (e.g., step targets dataset-level or has no specific column),
+            # provide generic explanations for actions that are not column-scoped.
+            if not reason:
+                if step.action == "move_by_type":
+                    p = step.params or {}
+                    reason = f"Move values of type {p.get('type','string')} from {p.get('source')} to {p.get('target')}."
+                    confidence = 0.7
+                elif step.action == "swap_by_types":
+                    reason = f"Swap/move values between columns as specified by types in the step."
+                    confidence = 0.75
+                elif step.action == "conditional":
+                    reason = "Conditionally set values based on the provided predicate."
+                    confidence = 0.6
+                elif step.action == "join":
+                    reason = "Join datasets using keys; this step may be fuzzy if requested."
+                    confidence = 0.75
+                elif step.action == "deduplicate":
+                    reason = "Remove duplicate rows using the specified keys or heuristics."
+                    confidence = 0.8
+                elif step.action == "rename":
+                    reason = "Rename columns as specified in the recipe."
+                    confidence = 0.9
+                elif step.action == "move_by_type":
+                    reason = "Move values between columns based on inferred types."
+                    confidence = 0.7
+
             s_copy = step
             if col is not None:
                 # ensure the explained step references the specific column

@@ -1021,6 +1021,14 @@ def _is_polars_df(df):
         return False
 
 
+def _json_safe_records(records):
+    # NaN/inf are not valid JSON and make the API response fail with a 500.
+    out = []
+    for rec in records:
+        out.append({k: (None if isinstance(v, float) and (v != v or v in (float('inf'), float('-inf'))) else v) for k, v in rec.items()})
+    return out
+
+
 def _df_head_records(df, n=None):
     """Return up to `n` records from dataframe as list of dicts.
     If `n` is None or n <= 0, return all records.
@@ -1029,16 +1037,16 @@ def _df_head_records(df, n=None):
     try:
         if n is None or (isinstance(n, int) and n <= 0):
             if _is_polars_df(df):
-                return df.to_dicts()
+                return _json_safe_records(df.to_dicts())
             try:
-                return df.to_dict("records")
+                return _json_safe_records(df.to_dict("records"))
             except Exception:
                 return []
         # otherwise return head(n)
         if _is_polars_df(df):
-            return df.head(n).to_dicts()
+            return _json_safe_records(df.head(n).to_dicts())
         try:
-            return df.head(n).to_dict("records")
+            return _json_safe_records(df.head(n).to_dict("records"))
         except Exception:
             return []
     except Exception:
@@ -1072,28 +1080,60 @@ def _fill_null_column(df, col, value, strategy=None):
 def _string_transform_column(df, col, case="lower"):
     if _is_polars_df(df):
         try:
-            if case == "upper":
-                return df.with_columns(df[col].str.to_uppercase().alias(col))
-            if case == "trim":
-                return df.with_columns(df[col].str.strip_chars().alias(col))
-            return df.with_columns(df[col].str.to_lowercase().alias(col))
+            # Some Polars string APIs vary between versions; do a safe per-value transform
+            vals = df.select(pl.col(col)).to_series().to_list()
+            out = []
+            for v in vals:
+                if v is None:
+                    out.append(None)
+                    continue
+                s = str(v).strip()
+                if case == "upper":
+                    out.append(s.upper())
+                elif case == "trim":
+                    out.append(s)
+                elif case == "capitalize":
+                    out.append(s.capitalize())
+                elif case == "title":
+                    out.append(s.title())
+                else:
+                    out.append(s.lower())
+            try:
+                return df.with_columns(pl.Series(col, out).alias(col))
+            except Exception:
+                # older polars versions may prefer with_column
+                try:
+                    return df.with_column(pl.Series(col, out).alias(col))
+                except Exception:
+                    return df
         except Exception:
             try:
+                # Fallback to per-row Python apply when expression API fails
                 if case == "upper":
-                    return df.with_column(df[col].str.to_uppercase().alias(col))
+                    return df.with_column(pl.col(col).apply(lambda v: (str(v).strip().upper() if v is not None else v)).alias(col))
                 if case == "trim":
-                    return df.with_column(df[col].str.strip_chars().alias(col))
-                return df.with_column(df[col].str.to_lowercase().alias(col))
+                    return df.with_column(pl.col(col).apply(lambda v: (str(v).strip() if v is not None else v)).alias(col))
+                if case == "capitalize":
+                    return df.with_column(pl.col(col).apply(lambda v: (str(v).strip().capitalize() if v is not None else v)).alias(col))
+                if case == "title":
+                    return df.with_column(pl.col(col).apply(lambda v: (str(v).strip().title() if v is not None else v)).alias(col))
+                return df.with_column(pl.col(col).apply(lambda v: (str(v).strip().lower() if v is not None else v)).alias(col))
             except Exception:
                 return df
     else:
         df2 = df.copy()
+        # trim whitespace first
+        df2[col] = df2[col].astype(str).str.strip()
         if case == "upper":
-            df2[col] = df2[col].astype(str).str.upper()
+            df2[col] = df2[col].str.upper()
         elif case == "trim":
-            df2[col] = df2[col].astype(str).str.strip()
+            pass
+        elif case == "capitalize":
+            df2[col] = df2[col].str.capitalize()
+        elif case == "title":
+            df2[col] = df2[col].str.title()
         else:
-            df2[col] = df2[col].astype(str).str.lower()
+            df2[col] = df2[col].str.lower()
         return df2
 
 
@@ -1120,10 +1160,13 @@ def _unicode_normalize_column(df, col, form: str = "NFKC", remove_diacritics: bo
 
     if _is_polars_df(df):
         try:
-            return df.with_columns(pl.col(col).apply(lambda v: _normalize_val(v)).alias(col))
+            return df.with_columns(
+                pl.col(col).map_elements(_normalize_val, return_dtype=pl.Utf8).alias(col)
+            )
         except Exception:
             try:
-                return df.with_column(pl.col(col).apply(lambda v: _normalize_val(v)).alias(col))
+                values = [_normalize_val(v) for v in df[col].to_list()]
+                return df.with_columns(pl.Series(col, values, dtype=pl.Utf8))
             except Exception:
                 return df
     else:
@@ -1497,19 +1540,24 @@ def _parse_regex_flags(flags):
     return f
 
 
+def _py_to_polars_repl(repl):
+    # Recipes use Python-style \1 backrefs; polars (Rust regex) expects ${1} and a literal $ as $$.
+    return re.sub(r"\\(\d+)", r"${\1}", str(repl).replace("$", "$$"))
+
+
 def _regex_replace(df, col, pattern, repl, flags=None):
     rf = _parse_regex_flags(flags)
     if _is_polars_df(df):
         try:
             if rf == 0:
-                return df.with_columns(pl.col(col).str.replace_all(pattern, repl).alias(col))
+                return df.with_columns(pl.col(col).str.replace_all(pattern, _py_to_polars_repl(repl)).alias(col))
             # if flags set, fall back to Python-level substitution to respect flags
             prog = re.compile(pattern, flags=rf)
-            return df.with_columns(pl.col(col).apply(lambda v: prog.sub(repl, str(v) if v is not None else "")).alias(col))
+            return df.with_columns(pl.col(col).map_elements(lambda v: prog.sub(repl, v), return_dtype=pl.Utf8).alias(col))
         except Exception:
             try:
                 prog = re.compile(pattern, flags=rf)
-                return df.with_columns(df[col].apply(lambda v: prog.sub(repl, str(v) if v is not None else "")).alias(col))
+                return df.with_columns(pl.Series(col, [None if v is None else prog.sub(repl, str(v)) for v in df[col].to_list()]))
             except Exception:
                 return df
     else:
@@ -2244,6 +2292,17 @@ def _conditional_transform(df, col, value, condition):
             return df
 
 
+def _clean_to_numeric(series, errors="coerce"):
+    # Strip currency symbols, thousands separators and (negative) parentheses before parsing.
+    import pandas as _pd
+    if _pd.api.types.is_numeric_dtype(series):
+        return _pd.to_numeric(series, errors=errors)
+    s = series.astype(str).str.strip()
+    s = s.str.replace(r"^\((.*)\)$", r"-\1", regex=True)
+    s = s.str.replace(r"[\$£€¥₹,\s]", "", regex=True)
+    return _pd.to_numeric(s, errors=errors)
+
+
 def _cast_column(df, col, to_type: str, fmt: str = None, errors: str = "coerce"):
     """Cast column `col` to `to_type`.
     to_type: 'int','float','str','datetime','bool','category'
@@ -2260,12 +2319,18 @@ def _cast_column(df, col, to_type: str, fmt: str = None, errors: str = "coerce")
             try:
                 # Polars-first expression-based casting
                 if to_type in ("int", "integer"):
-                    clean = pl.col(col).cast(pl.Utf8).str.replace_all(r"[\$\,\s\(\)]", "")
+                    raw = pl.col(col).cast(pl.Utf8).str.strip_chars()
+                    negative = raw.str.starts_with("(") & raw.str.ends_with(")")
+                    clean = raw.str.replace_all(r"[\$£€¥₹,\s()]", "")
+                    clean = pl.when(negative).then(pl.concat_str([pl.lit("-"), clean])).otherwise(clean)
                     num = clean.cast(pl.Float64)
                     expr = pl.when(clean.str.lengths() > 0).then(num.cast(pl.Int64)).otherwise(pl.lit(None)).alias(col)
                     df_new = df.with_columns(expr)
                 elif to_type in ("float", "double"):
-                    clean = pl.col(col).cast(pl.Utf8).str.replace_all(r"[\$\,\s\(\)]", "")
+                    raw = pl.col(col).cast(pl.Utf8).str.strip_chars()
+                    negative = raw.str.starts_with("(") & raw.str.ends_with(")")
+                    clean = raw.str.replace_all(r"[\$£€¥₹,\s()]", "")
+                    clean = pl.when(negative).then(pl.concat_str([pl.lit("-"), clean])).otherwise(clean)
                     expr = pl.when(clean.str.lengths() > 0).then(clean.cast(pl.Float64)).otherwise(pl.lit(None)).alias(col)
                     df_new = df.with_columns(expr)
                 elif to_type in ("str", "string"):
@@ -2335,11 +2400,11 @@ def _cast_column(df, col, to_type: str, fmt: str = None, errors: str = "coerce")
                         import pandas as _pd
                         pd_df = df.to_pandas()
                         df2 = pd_df.copy()
-                        before_non_null = df2[col].notnull().sum() if col in df2.columns else None
+                        before_non_null = (df2[col].notnull() & (df2[col].astype(str).str.strip() != "")).sum() if col in df2.columns else None
                         if to_type in ("int", "integer"):
-                            df2[col] = _pd.to_numeric(df2[col], errors=errors).astype('Int64')
+                            df2[col] = _clean_to_numeric(df2[col], errors).astype('Int64')
                         elif to_type in ("float", "double"):
-                            df2[col] = _pd.to_numeric(df2[col], errors=errors).astype(float)
+                            df2[col] = _clean_to_numeric(df2[col], errors).astype(float)
                         elif to_type in ("str", "string"):
                             df2[col] = df2[col].astype(str)
                         elif to_type in ("datetime", "date", "ts"):
@@ -2444,15 +2509,15 @@ def _cast_column(df, col, to_type: str, fmt: str = None, errors: str = "coerce")
             df2 = df.copy()
             before_non_null = None
             try:
-                before_non_null = df2[col].notnull().sum()
+                before_non_null = (df2[col].notnull() & (df2[col].astype(str).str.strip() != "")).sum()
             except Exception:
                 before_non_null = None
 
             try:
                 if to_type in ("int", "integer"):
-                    df2[col] = _pd.to_numeric(df2[col], errors=errors).astype('Int64')
+                    df2[col] = _clean_to_numeric(df2[col], errors).astype('Int64')
                 elif to_type in ("float", "double"):
-                    df2[col] = _pd.to_numeric(df2[col], errors=errors).astype(float)
+                    df2[col] = _clean_to_numeric(df2[col], errors).astype(float)
                 elif to_type in ("str", "string"):
                     df2[col] = df2[col].astype(str)
                 elif to_type in ("datetime", "date", "ts"):
@@ -3629,15 +3694,24 @@ class Cleaner:
         # fallback: return head records
         return _df_head_records(df, limit if limit is not None else None)
 
-    def suggest_fixes(self, profile: dict):
+    def suggest_fixes(self, profile: dict, sample_rows=None, **kwargs):
+        """Return simple suggestions based on a profile.
+
+        Backwards-compatible: accepts legacy `sample_rows` kwarg and ignores
+        unknown additional kwargs.
+        """
         suggestions = []
-        for col, meta in profile.items():
-            if "int" in meta["dtype"] and meta["nulls"] > 0:
-                suggestions.append({"column": col, "action": "impute", "strategy": "median"})
-            if meta["unique"] == 1:
-                suggestions.append({"column": col, "action": "drop_constant"})
-            if "str" in meta["dtype"] and meta["nulls"] > 0:
-                suggestions.append({"column": col, "action": "impute", "strategy": "empty_string"})
+        try:
+            for col, meta in (profile or {}).items():
+                if "int" in (meta.get("dtype") or "") and int(meta.get("nulls") or 0) > 0:
+                    suggestions.append({"column": col, "action": "impute", "strategy": "median"})
+                if int(meta.get("unique") or 0) == 1:
+                    suggestions.append({"column": col, "action": "drop_constant"})
+                if "str" in (meta.get("dtype") or "") and int(meta.get("nulls") or 0) > 0:
+                    suggestions.append({"column": col, "action": "impute", "strategy": "empty_string"})
+        except Exception:
+            # keep suggest_fixes robust; return whatever collected so far
+            pass
         return suggestions
 
     def cleanup_snapshots(self, retention_days: int = 30):
@@ -3810,6 +3884,38 @@ class Cleaner:
                     mapping = (step.params or {}).get("mapping") or {}
                     if mapping:
                         df = _map_values(df, col, mapping)
+                elif step.action == "numeric_transform" and col:
+                    params = step.params or {}
+                    op = (params.get("operation") or "").lower()
+                    factor = float(params.get("factor", params.get("value", 1)))
+                    if op in ("multiply", "divide", "scale"):
+                        if op == "divide" and factor == 0:
+                            continue
+                        numeric = pl.col(col).cast(pl.Float64, strict=False) if _is_polars_df(df) else None
+                        if _is_polars_df(df):
+                            expr = numeric * factor if op != "divide" else numeric / factor
+                            df = df.with_columns(expr.alias(col))
+                        else:
+                            import pandas as _pd
+                            df = df.copy()
+                            parsed = _pd.to_numeric(df[col], errors="coerce")
+                            df[col] = parsed * factor if op != "divide" else parsed / factor
+                        continue
+                    if op == "abs":
+                        if _is_polars_df(df):
+                            df = df.with_columns(pl.col(col).abs().alias(col))
+                        else:
+                            import pandas as _pd
+                            df = df.copy()
+                            df[col] = _pd.to_numeric(df[col], errors="coerce").abs()
+                    elif op == "round":
+                        ndigits = int(params.get("ndigits", params.get("digits", 0) or 0))
+                        if _is_polars_df(df):
+                            df = df.with_columns(pl.col(col).round(ndigits).alias(col))
+                        else:
+                            import pandas as _pd
+                            df = df.copy()
+                            df[col] = _pd.to_numeric(df[col], errors="coerce").round(ndigits)
                 elif step.action == "regex_replace" and col:
                     pat = (step.params or {}).get("pattern")
                     repl = (step.params or {}).get("replace")
@@ -3878,8 +3984,8 @@ class Cleaner:
                         df = res
                 elif step.action == "cast" and col:
                     params = step.params or {}
-                    to_type = params.get("to_type") or params.get("type")
-                    fmt = params.get("format")
+                    to_type = params.get("to") or params.get("to_type") or params.get("type")
+                    fmt = params.get("fmt") or params.get("format")
                     res = _cast_column(df, col, to_type, fmt)
                     if isinstance(res, tuple):
                         df = res[0]
@@ -4088,11 +4194,43 @@ class Cleaner:
             # If any file operations failed, surface write failure but do not crash silently
             raise
 
-    def preview_recipe(self, recipe, n=None):
+    def preview_recipe(self, recipe, n=None, source_path=None, **kwargs):
         """Run recipe transforms in-memory and return first `n` rows before and after as dicts.
 
         If `n` is None or <= 0, the full dataset is returned (use with care for large files).
         """
+        # Backwards-compatibility: accept plain dict recipes and legacy `source_path`
+        if isinstance(recipe, dict):
+            srcs = recipe.get('sources') or []
+            if not srcs and source_path:
+                srcs = [{'path': source_path}]
+
+            class _RecipeObj:
+                pass
+
+            r = _RecipeObj()
+            r.sources = srcs
+            steps = recipe.get('cleaning_steps') or recipe.get('cleaningSteps') or []
+            wrapped = []
+            for s in steps:
+                if isinstance(s, dict):
+                    class _Step:
+                        def __init__(self, d):
+                            self.action = d.get('action')
+                            self.params = d.get('params') or {}
+                            # allow `column` or `columns`
+                            self.column = d.get('column') or d.get('columns')
+                    wrapped.append(_Step(s))
+                else:
+                    wrapped.append(s)
+            r.cleaning_steps = wrapped
+            recipe = r
+        else:
+            try:
+                if (not getattr(recipe, 'sources', None)) and source_path:
+                    recipe.sources = [{'path': source_path}]
+            except Exception:
+                pass
         if not recipe.sources:
             raise ValueError("Recipe must contain at least one source")
         src = recipe.sources[0]["path"]
@@ -4120,6 +4258,27 @@ class Cleaner:
             except Exception:
                 return rows
         before = _strip_meta_rows(before)
+        # capture column types before applying any steps
+        types_before = {}
+        try:
+            cols_for_types = [c for c in (df_for_ops.columns if _is_polars_df(df_for_ops) else list(df_for_ops.columns)) if c not in self.META_KEYS and not (isinstance(c, str) and c.startswith('_'))]
+            if _is_polars_df(df_for_ops):
+                for c in cols_for_types:
+                    try:
+                        types_before[c] = str(df_for_ops.select(pl.col(c)).to_series().dtype)
+                    except Exception:
+                        try:
+                            types_before[c] = str(type(df_for_ops[c][0]).__name__)
+                        except Exception:
+                            types_before[c] = 'unknown'
+            else:
+                for c in cols_for_types:
+                    try:
+                        types_before[c] = str(df_for_ops[c].dtype)
+                    except Exception:
+                        types_before[c] = 'unknown'
+        except Exception:
+            types_before = {}
         df_after = df_for_ops
         warnings = []
         # run dataset-level pre-processing steps for preview (non-destructive)
@@ -4224,16 +4383,75 @@ class Cleaner:
                         df_after = _string_transform_column(df_after, col, case=case)
                     except Exception:
                         pass
+                elif step.action == "unicode_normalize" and col:
+                    params = step.params or {}
+                    df_after = _unicode_normalize_column(
+                        df_after,
+                        col,
+                        form=params.get("form", "NFKC"),
+                        remove_diacritics=bool(params.get("remove_diacritics", False)),
+                    )
                 elif step.action == "map" and col:
                     mapping = (step.params or {}).get("mapping") or {}
                     if mapping:
                         df_after = _map_values(df_after, col, mapping)
+                elif step.action == "numeric_transform" and col:
+                    try:
+                        params = step.params or {}
+                        op = (params.get("operation") or "").lower()
+                        factor = float(params.get("factor", params.get("value", 1)))
+                        if op in ("multiply", "divide", "scale"):
+                            if op == "divide" and factor == 0:
+                                continue
+                            if _is_polars_df(df_after):
+                                numeric = pl.col(col).cast(pl.Float64, strict=False)
+                                expr = numeric * factor if op != "divide" else numeric / factor
+                                df_after = df_after.with_columns(expr.alias(col))
+                            else:
+                                import pandas as _pd
+                                df_after = df_after.copy()
+                                parsed = _pd.to_numeric(df_after[col], errors="coerce")
+                                df_after[col] = parsed * factor if op != "divide" else parsed / factor
+                        elif op == "abs":
+                            if _is_polars_df(df_after):
+                                try:
+                                    df_after = df_after.with_columns(pl.col(col).abs().alias(col))
+                                except Exception:
+                                    pass
+                            else:
+                                import pandas as _pd
+                                df_after = df_after.copy()
+                                try:
+                                    df_after[col] = _pd.to_numeric(df_after[col], errors="coerce").abs()
+                                except Exception:
+                                    pass
+                        elif op == "round":
+                            nd = int(params.get("ndigits", params.get("digits", 0) or 0))
+                            if _is_polars_df(df_after):
+                                try:
+                                    df_after = df_after.with_columns(pl.col(col).round(nd).alias(col))
+                                except Exception:
+                                    pass
+                            else:
+                                import pandas as _pd
+                                df_after = df_after.copy()
+                                try:
+                                    df_after[col] = _pd.to_numeric(df_after[col], errors="coerce").round(nd)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
                 elif step.action == "regex_replace" and col:
                     pat = (step.params or {}).get("pattern")
                     repl = (step.params or {}).get("replace")
                     if pat is not None:
                         flags = (step.params or {}).get("flags")
                         df_after = _regex_replace(df_after, col, pat, repl or "", flags=flags)
+                elif step.action in ("ocr_cleanup", "ocr_clean") and col:
+                    try:
+                        df_after = _clean_ocr_column(df_after, col, step.params or {})
+                    except Exception:
+                        pass
                 elif step.action == "bucketize" and col:
                     buckets = (step.params or {}).get("buckets", [])
                     if buckets:
@@ -4284,8 +4502,10 @@ class Cleaner:
                         pass
                 elif step.action == "cast" and col:
                     params = step.params or {}
-                    to_type = params.get("to_type") or params.get("type")
-                    fmt = params.get("format")
+                    # accept multiple common param names: 'to', 'to_type', 'type'
+                    to_type = params.get("to") or params.get("to_type") or params.get("type")
+                    # accept 'fmt' or 'format'
+                    fmt = params.get("fmt") or params.get("format")
                     res = _cast_column(df_after, col, to_type, fmt)
                     info = None
                     if isinstance(res, tuple):
@@ -4407,4 +4627,38 @@ class Cleaner:
                         except Exception:
                             pass
         after = _df_head_records(df_after, n)
-        return {"before": before, "after": after, "warnings": warnings}
+        # capture column types after applying steps
+        types_after = {}
+        try:
+            cols_for_types = [c for c in (df_after.columns if _is_polars_df(df_after) else list(df_after.columns)) if c not in self.META_KEYS and not (isinstance(c, str) and c.startswith('_'))]
+            if _is_polars_df(df_after):
+                for c in cols_for_types:
+                    try:
+                        types_after[c] = str(df_after.select(pl.col(c)).to_series().dtype)
+                    except Exception:
+                        try:
+                            types_after[c] = str(type(df_after[c][0]).__name__)
+                        except Exception:
+                            types_after[c] = 'unknown'
+            else:
+                for c in cols_for_types:
+                    try:
+                        types_after[c] = str(df_after[c].dtype)
+                    except Exception:
+                        types_after[c] = 'unknown'
+        except Exception:
+            types_after = {}
+
+        # compute type changes
+        type_changes = {}
+        try:
+            all_cols = set(list(types_before.keys()) + list(types_after.keys()))
+            for c in all_cols:
+                b = types_before.get(c)
+                a = types_after.get(c)
+                if b != a:
+                    type_changes[c] = {"before": b, "after": a}
+        except Exception:
+            type_changes = {}
+
+        return {"before": before, "after": after, "warnings": warnings, "types_before": types_before, "types_after": types_after, "type_changes": type_changes}

@@ -166,6 +166,8 @@ export default function App() {
   const [showAsTable, setShowAsTable] = useState(true)
   const [diagnostics, setDiagnostics] = useState(null)
   const [plainLanguageSuggestions, setPlainLanguageSuggestions] = useState(null)
+  const [selectedSuggestionSteps, setSelectedSuggestionSteps] = useState([])
+  const [showAllPlainSuggestions, setShowAllPlainSuggestions] = useState(false)
   const [inspectOffset, setInspectOffset] = useState(0)
   const [preview, setPreview] = useState(null)
   const [applyRes, setApplyRes] = useState(null)
@@ -348,12 +350,20 @@ export default function App() {
   const [applyLoading, setApplyLoading] = useState(false)
   const [recipeGenerating, setRecipeGenerating] = useState(false)
   const [generatedPreview, setGeneratedPreview] = useState(null)
+  const displayPreview = generatedPreview || preview
   const [prevRecipeText, setPrevRecipeText] = useState(null)
   const [rowsToShow, setRowsToShow] = useState(6)
   const [selectedColumns, setSelectedColumns] = useState(null) // null = all
   const [showColumnPicker, setShowColumnPicker] = useState(false)
   const [selectedCells, setSelectedCells] = useState({})
   const [tooltip, setTooltip] = useState(null)
+  const previewColumns = (() => {
+    const seen = []
+    const rows = [...((displayPreview && displayPreview.before) || []), ...((displayPreview && displayPreview.after) || [])]
+    rows.forEach((r) => Object.keys(r || {}).forEach((c) => { if (!seen.includes(c)) seen.push(c) }))
+    return seen
+  })()
+  const visibleColumns = selectedColumns ? previewColumns.filter((c) => selectedColumns.includes(c)) : previewColumns
   const [showFullPreview, setShowFullPreview] = useState(false)
   const [showRecipeJson, setShowRecipeJson] = useState(false)
   const [showConfirmModal, setShowConfirmModal] = useState(false)
@@ -711,6 +721,17 @@ export default function App() {
       const profilePayload = await profileRes.json()
       setProfile(profilePayload.profile)
       await doInspectSource(nextPath, 0)
+      // fetch metadata (suggestions) to populate plain-language suggestions
+      try {
+        const mdRes = await fetch(`${BACKEND}/metadata`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: nextPath }) })
+        if (mdRes.ok) {
+          const md = await mdRes.json()
+          const pls = md?.metadata?.plain_language_suggestions || []
+          if (pls && Array.isArray(pls)) setPlainLanguageSuggestions(pls)
+        }
+      } catch (e) {
+        // ignore
+      }
       try {
         if (typeof window !== 'undefined' && window.dispatchEvent) {
           window.dispatchEvent(new CustomEvent('fbroom:documentProcessed', { detail: { path: nextPath } }))
@@ -1235,6 +1256,7 @@ export default function App() {
 
   async function uploadSelectedFile(file) {
     if (!file) return
+    setSelectedSuggestionSteps([])
 
     const form = new FormData()
     form.append("file", file)
@@ -1287,11 +1309,8 @@ export default function App() {
         setCleaningSuggestions(payload.suggestions)
       }
       if (payload.plain_language_suggestions) {
+        // store suggestions for user to apply explicitly via the "Use" button
         setPlainLanguageSuggestions(payload.plain_language_suggestions)
-        try {
-          const first = Array.isArray(payload.plain_language_suggestions) && payload.plain_language_suggestions.length ? payload.plain_language_suggestions[0].text : ''
-          if (first && (!instruction || instruction.trim().length === 0)) setInstruction(first)
-        } catch (e) {}
       }
       // only fall back to server-side profile/inspect if payload lacked them
       if (!payload.profile && !payload.inspect_preview) {
@@ -1512,6 +1531,16 @@ export default function App() {
     try {
       copy.before = (p.before || []).map((r) => _stripMeta(r))
       copy.after = (p.after || []).map((r) => _stripMeta(r))
+      // preserve type information if backend provided it
+      try {
+        copy.types_before = p.types_before || {}
+        copy.types_after = p.types_after || {}
+        copy.type_changes = p.type_changes || {}
+      } catch (e) {
+        copy.types_before = {}
+        copy.types_after = {}
+        copy.type_changes = {}
+      }
     } catch (e) {
       // if unexpected shape, return original
       return p
@@ -1586,12 +1615,13 @@ export default function App() {
 
   async function applySelectedChanges() {
     const patches = []
-    if (!generatedPreview) {
-      addToast('No generated preview to apply selected changes from', 'warn')
+    const usePreview = generatedPreview || preview
+    if (!usePreview) {
+      addToast('No preview to apply selected changes from', 'warn')
       return
     }
-    const before = generatedPreview.before || []
-    const after = generatedPreview.after || []
+    const before = (usePreview && usePreview.before) || []
+    const after = (usePreview && usePreview.after) || []
     Object.keys(selectedCells || {}).forEach((k) => {
       const [r, col] = k.split('|')
       const ri = Number(r)
@@ -1647,6 +1677,7 @@ export default function App() {
 
   async function openUploadItem(item) {
     // item: {name, path, ...}
+    setSelectedSuggestionSteps([])
     setPath(item.path)
     // show custom revisions when opening an upload
     setShowCustomRevisions(true)
@@ -1690,6 +1721,17 @@ export default function App() {
         setInspectOffset(sanitized?.offset || 0)
         setInspectionLoading(false)
         setInspectingPath(null)
+        // fetch metadata to populate plain-language suggestions
+        try {
+          const mdRes = await fetch(`${BACKEND}/metadata`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: item.path }) })
+          if (mdRes.ok) {
+            const md = await mdRes.json()
+            const pls = md?.metadata?.plain_language_suggestions || []
+            if (pls && Array.isArray(pls)) setPlainLanguageSuggestions(pls)
+          }
+        } catch (e) {
+          // ignore metadata failures
+        }
         return
       }
     } catch (e) {
@@ -1834,6 +1876,7 @@ export default function App() {
           regression_features: regressionFeatures ? regressionFeatures.split(/\s*,\s*/) : null,
           regression_group_by: regressionGroupBy || null,
           treat_as_missing: sentinelsArr,
+          suggested_steps: selectedSuggestionSteps,
         }),
       })
       const j = await res.json()
@@ -2799,12 +2842,13 @@ export default function App() {
   }
 
   function downloadPreviewCsv() {
-    if (!generatedPreview || !generatedPreview.after) {
+    const usePreview = generatedPreview || preview
+    if (!usePreview || !usePreview.after) {
       addToast('No preview available to download. Run Preview or generate a recipe.', 'warn')
       return
     }
     try {
-      const rows = generatedPreview.after || []
+      const rows = usePreview.after || []
       if (rows.length === 0) {
         addToast('Preview is empty; nothing to download.', 'warn')
         return
@@ -4400,18 +4444,142 @@ export default function App() {
                       <div className="diagnostics-panel" style={{marginTop:8}}>
                         <h4>Data diagnostics summary</h4>
                         <div className="column-meta-grid">
-                          {Object.entries(diagnostics)
-                            .filter(([col, info]) => (info.missing_count || info.mixed_type || info.constant))
-                            .slice(0, 12)
-                            .map(([col, info]) => (
-                              <div key={col} className="column-meta-item">
-                                <strong>{col}</strong>
-                                <small>Missing: {info.missing_count ?? '—'}</small>
-                                <small>Unique: {info.unique_count ?? '—'}</small>
-                                {info.mixed_type ? <small style={{color:'#f59e0b'}}>Mixed types</small> : null}
-                                {info.constant ? <small style={{color:'#fb7185'}}>Constant</small> : null}
-                              </div>
-                            ))}
+                              {Object.entries(diagnostics)
+                                .filter(([col, info]) => (info.missing_count || info.mixed_type || info.constant))
+                                .slice(0, 12)
+                                .map(([col, info]) => {
+                                  // compute simple type counts from the inspection sample when available
+                                  const rows = (sourceInspection && Array.isArray(sourceInspection.rows)) ? sourceInspection.rows.slice(0, 500) : [];
+                                  let numeric = 0, dateCnt = 0, empty = 0, text = 0, other = 0;
+                                  for (let i = 0; i < rows.length; i++) {
+                                    try {
+                                      const v = rows[i][col];
+                                      if (v === null || v === undefined || (typeof v === 'string' && v.trim() === '')) { empty++; continue; }
+                                      const s = String(v).trim();
+                                      // integer
+                                      if (/^[+-]?\d+$/.test(s)) { numeric++; continue; }
+                                      // float-ish
+                                      if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(s)) { numeric++; continue; }
+                                      // ISO-ish date detection
+                                      const dt = Date.parse(s);
+                                      if (!isNaN(dt)) { dateCnt++; continue; }
+                                      // otherwise treat as text
+                                      text++;
+                                    } catch (e) { other++; }
+                                  }
+                                  const totalSample = Math.max(1, numeric + dateCnt + empty + text + other);
+                                  const pct = (n) => Math.round((n/totalSample)*100);
+                                  return (
+                                    <div key={col} className="column-meta-item">
+                                      <strong>{col}</strong>
+                                      <small>Missing: {info.missing_count ?? '—'}</small>
+                                      <small>Unique: {info.unique_count ?? '—'}</small>
+                                      {info.mixed_type ? <small style={{color:'#f59e0b'}}>Mixed types</small> : null}
+                                      {info.constant ? <small style={{color:'#fb7185'}}>Constant</small> : null}
+                                      <div style={{marginTop:6,fontSize:'0.85rem',color:'var(--muted)'}}>
+                                        <div>Types (sample {totalSample}): {numeric} numeric ({pct(numeric)}%), {dateCnt} date ({pct(dateCnt)}%), {text} text ({pct(text)}%), {empty} empty ({pct(empty)}%)</div>
+                                      </div>
+                                    </div>
+                                  )
+                                })}
+                            </div>
+                      </div>
+                    )}
+                    {/* Plain-language suggestions rendered directly under diagnostics for quick use */}
+                    {plainLanguageSuggestions && Array.isArray(plainLanguageSuggestions) && plainLanguageSuggestions.length > 0 && (
+                      <div style={{marginTop:8}} className="pl-suggestions">
+                        <h4>Suggested plain-English fixes</h4>
+                        <div style={{display:'flex', flexDirection:'column', gap:8}}>
+                          {(() => {
+                            const threshold = 6
+                            const list = showAllPlainSuggestions ? plainLanguageSuggestions : plainLanguageSuggestions.slice(0, threshold)
+                            return (
+                              <>
+                                {list.map((s, idx) => (
+                                  <div key={idx} style={{display:'flex', gap:8, alignItems:'center'}}>
+                                    <button
+                                      onClick={() => {
+                                        try {
+                                          const txt = (s && s.text) ? s.text : (typeof s === 'string' ? s : '');
+                                          if (Array.isArray(s?.json_steps) && s.json_steps.length) {
+                                            setSelectedSuggestionSteps((prev) => {
+                                              const next = [...(prev || [])]
+                                              const keys = new Set(next.map((step) => JSON.stringify(step)))
+                                              s.json_steps.forEach((step) => {
+                                                const key = JSON.stringify(step)
+                                                if (!keys.has(key)) { next.push(step); keys.add(key) }
+                                              })
+                                              return next
+                                            })
+                                            setInstruction((prev) => (prev && prev.trim() ? `${prev}\n${txt}` : txt))
+                                            return
+                                          }
+                                          if (!Array.isArray(s?.json_steps) || !s.json_steps.length) {
+                                            addToast('This suggestion is review-only and has no automatic recipe step.', 'info')
+                                            return
+                                          }
+                                          // Prefer explicit machine_template provided by backend
+                                          const mt = s && s.machine_template ? s.machine_template : null;
+                                          const makeCompactFromText = (t) => {
+                                            if (!t) return null;
+                                            try {
+                                              // look for explicit action: ... params: ... patterns
+                                              const actionMatch = t.match(/action:\s*([a-z_]+)/i);
+                                              const paramsMatch = t.match(/params:\s*([^\)]+)/i);
+                                              const colMatch = t.match(/column ['\"]([^'\"]+)['\"]/i) || t.match(/column\s*=\s*([^\s,]+)/i) || t.match(/'(.+?)' contains/i);
+                                              if (actionMatch) {
+                                                const action = actionMatch[1].toLowerCase();
+                                                const col = colMatch ? (colMatch[1] || colMatch[0]) : '';
+                                                let paramsStr = paramsMatch ? paramsMatch[1].trim() : '';
+                                                paramsStr = paramsStr.replace(/,\s*/g, ' ').replace(/:\s*/g, '=').replace(/\s+/g, ' ').trim();
+                                                let compact = action + (col ? ' column=' + col : '');
+                                                if (paramsStr) compact += ' ' + paramsStr;
+                                                return compact;
+                                              }
+                                              // fallback: try to detect "Cast column \"X\" to integer" patterns
+                                              const castMatch = t.match(/cast column ['\"]?([^'\"]+)['\"]? to (integer|int|float|datetime|str|string)/i);
+                                              if (castMatch) {
+                                                const col = castMatch[1];
+                                                const to = castMatch[2].toLowerCase();
+                                                const mapTo = to === 'integer' || to === 'int' ? 'int' : (to === 'string' || to === 'str' ? 'str' : (to === 'datetime' ? 'datetime' : 'float'));
+                                                return 'cast column=' + col + ' to=' + mapTo;
+                                              }
+                                            } catch (e) {
+                                              return null;
+                                            }
+                                            return null;
+                                          };
+
+                                          const compact = mt || makeCompactFromText(txt);
+                                          const toInsert = compact ? (compact + '\n' + txt) : txt;
+                                          setInstruction(prev => (prev && prev.trim().length ? prev + '\n' + toInsert : toInsert));
+                                        } catch (e) {
+                                          const txt = (s && s.text) ? s.text : (typeof s === 'string' ? s : '');
+                                          setInstruction(prev => (prev && prev.trim().length ? prev + '\n' + txt : txt));
+                                        }
+                                      }}
+                                      style={{padding:'6px 10px'}}
+                                    >
+                                      Use
+                                    </button>
+                                    <div style={{flex:1, display:'flex', alignItems:'center', gap:8}}>
+                                      <div style={{flex:1}}>{s.text}</div>
+                                      {s && (s.confidence !== undefined) && (
+                                        <div style={{fontSize:'0.8rem', color:'var(--muted)'}}> {Math.round((s.confidence||0)*100)}% </div>
+                                      )}
+                                    </div>
+                                  </div>
+                                ))}
+                                {plainLanguageSuggestions.length > threshold && (
+                                  <div style={{marginTop:6}}>
+                                    <button className="secondary" onClick={() => setShowAllPlainSuggestions((v) => !v)}>
+                                      {showAllPlainSuggestions ? 'Show less' : `Show full list (${plainLanguageSuggestions.length})`}
+                                    </button>
+                                  </div>
+                                )}
+                              </>
+                            )
+                          })()}
                         </div>
                       </div>
                     )}
@@ -4420,22 +4588,11 @@ export default function App() {
                 <textarea
                   ref={instructionRef}
                   value={instruction}
-                  onChange={(e) => setInstruction(e.target.value)}
+                  onChange={(e) => { setInstruction(e.target.value); setSelectedSuggestionSteps([]) }}
                   rows={3}
                   placeholder="e.g. fill missing age values, lowercase email, and remove duplicate customers"
                 />
-                              {plainLanguageSuggestions && Array.isArray(plainLanguageSuggestions) && plainLanguageSuggestions.length > 0 && (
-                                <div style={{marginTop:8, display:'flex', flexDirection:'column', gap:6}}>
-                                  <small style={{color:'var(--muted)'}}>Suggested plain-English instructions (click to use):</small>
-                                  <div style={{display:'flex', gap:8, flexWrap:'wrap'}}>
-                                    {plainLanguageSuggestions.map((s, idx) => (
-                                      <button key={idx} onClick={() => setInstruction(s.text)} style={{padding:'6px 10px'}}>
-                                        {s.text.length > 80 ? s.text.slice(0,80)+'…' : s.text}
-                                      </button>
-                                    ))}
-                                  </div>
-                                </div>
-                              )}
+                
                 <div style={{marginTop:8, display:'flex', gap:8, alignItems:'center', flexWrap:'wrap'}}>
                   <small style={{color:'var(--muted)'}}>Regression options:</small>
                   <label style={{fontSize:'0.85rem'}}>Model
@@ -4519,18 +4676,58 @@ export default function App() {
                 ) : null}
               </div>
 
-              {generatedPreview && (
+              {((generatedPreview || preview)) && (
                 <div style={{marginTop:12}}>
+                  {/* Use displayPreview to show either generated or manual preview */}
+                  {(() => { try { window.__fb_display_preview = generatedPreview || preview } catch(e){} })()}
                   <h4>Generated preview (sample)</h4>
-                  {generatedPreview.warnings && generatedPreview.warnings.length > 0 && (
+                  {(generatedPreview || preview).warnings && (generatedPreview || preview).warnings.length > 0 && (
                     <div style={{marginBottom:8}}>
-                      {generatedPreview.warnings.map((w, i) => (
+                      {(generatedPreview || preview).warnings.map((w, i) => (
                         <div key={i} style={{color:'#f59e0b', fontSize:'0.95rem'}}>
                           {w.message || (w.step === 'impute' ? `Imputed ${w.column}: ${w.rows_changed || 0} rows changed` : JSON.stringify(w))}
                         </div>
                       ))}
+                      {(() => {
+                        const useWarnings = (generatedPreview || preview).warnings || []
+                        const castWarnings = (useWarnings || []).filter((w) => {
+                          try {
+                            if (w && (w.step === 'cast' || w.action === 'cast')) return true
+                            if (w && w.message && /cast|convert|parse|failed|cannot convert/i.test(w.message)) return true
+                            return false
+                          } catch (e) { return false }
+                        })
+                        if (!castWarnings || castWarnings.length === 0) return null
+                        return (
+                          <div style={{marginTop:6}}>
+                            <div style={{fontWeight:600, color:'#ef4444'}}>Cast warnings</div>
+                            {castWarnings.map((cw, j) => {
+                              const col = cw.column || (cw.step && cw.step.column) || (cw.params && cw.params.column) || null
+                              const toType = (cw.params && (cw.params.to || cw.params.type || cw.params.to_type)) || cw.to || cw.to_type || null
+                              const failed = cw.failed_rows || cw.failed_count || cw.rows_changed || cw.rows_failed || null
+                              return (
+                                <div key={j} style={{color:'#ef4444', fontSize:'0.9rem', marginTop:4}}>
+                                  {col ? <span>Column <strong>{col}</strong>: </span> : null}
+                                  {toType ? <span>Attempted cast to <strong>{toType}</strong>. </span> : null}
+                                  {failed !== null ? <span>{String(failed)} non-empty value(s) could not be converted and were set to empty. </span> : null}
+                                  {cw.message ? <span style={{opacity:0.9}}>{cw.message}</span> : <span>{JSON.stringify(cw)}</span>}
+                                </div>
+                              )
+                            })}
+                          </div>
+                        )
+                      })()}
                     </div>
                   )}
+                  <div style={{marginTop:8}}>
+                    <button onClick={() => { const el = document.getElementById('fb-raw-previews'); if(el) el.style.display = el.style.display === 'none' ? 'block' : 'none' }}>Toggle raw preview JSON</button>
+                    <div id="fb-raw-previews" style={{display:'none', marginTop:8}}>
+                      <div style={{marginTop:6}}><strong>generatedPreview</strong></div>
+                      <pre style={{maxHeight:200, overflow:'auto'}}>{JSON.stringify(generatedPreview, null, 2)}</pre>
+                      <div style={{marginTop:6}}><strong>preview</strong></div>
+                      <pre style={{maxHeight:200, overflow:'auto'}}>{JSON.stringify(preview, null, 2)}</pre>
+                    </div>
+                  </div>
                   <div style={{display:'flex',gap:12,alignItems:'center',marginBottom:8}}>
                     <div style={{display:'flex',gap:8,alignItems:'center'}}>
                       <label style={{fontSize:'0.9rem',color:'var(--muted)'}}>Rows</label>
@@ -4550,14 +4747,12 @@ export default function App() {
 
                   {showColumnPicker && (
                     <div style={{display:'flex',flexWrap:'wrap',gap:6,marginBottom:8}}>
-                      {((generatedPreview.before[0] ? Object.keys(generatedPreview.before[0]) : [])).map((col)=> (
+                      {previewColumns.map((col)=> (
                         <label key={col} style={{display:'inline-flex',alignItems:'center',gap:6}}>
                           <input type="checkbox" checked={selectedColumns ? selectedColumns.includes(col) : true} onChange={(e)=>{
-                            if(!selectedColumns){ setSelectedColumns(((generatedPreview.before[0]?Object.keys(generatedPreview.before[0]):[]).filter(c=>c!==col))) }
-                            else{
-                              if(e.target.checked) setSelectedColumns(selectedColumns.filter(c=>c!==col))
-                              else setSelectedColumns([...selectedColumns, col])
-                            }
+                            if(!selectedColumns){ setSelectedColumns(previewColumns.filter(c=>c!==col)) }
+                            else if(e.target.checked) setSelectedColumns([...selectedColumns, col])
+                            else setSelectedColumns(selectedColumns.filter(c=>c!==col))
                           }} />
                           <small style={{color:'var(--muted)'}}>{col}</small>
                         </label>
@@ -4567,19 +4762,23 @@ export default function App() {
 
                   <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',gap:12,marginBottom:8}}>
                     <div style={{display:'flex',gap:8,alignItems:'center'}}>
-                      <div style={{display:'inline-flex',alignItems:'center',gap:8}}>
-                        <div style={{width:12,height:12,background:'linear-gradient(90deg, rgba(245,158,11,0.12), rgba(245,158,11,0.06))',borderBottom:'2px solid rgba(245,158,11,0.18)'}} />
-                        <small style={{color:'var(--muted)'}}>Changed</small>
-                      </div>
-                      <div style={{display:'inline-flex',alignItems:'center',gap:8}}>
-                        <div style={{width:12,height:12,background:'#f59e0b',opacity:0.18,border:'1px solid rgba(245,158,11,0.22)'}} />
-                        <small style={{color:'var(--muted)'}}>Selected</small>
-                      </div>
+                        <div style={{display:'inline-flex',alignItems:'center',gap:8}}>
+                          <div style={{width:12,height:12,background:'#ecfdf5',border:'1px solid #10b981'}} />
+                          <small style={{color:'var(--muted)'}}>Type changed</small>
+                        </div>
+                        <div style={{display:'inline-flex',alignItems:'center',gap:8}}>
+                          <div style={{width:12,height:12,background:'linear-gradient(90deg, rgba(245,158,11,0.12), rgba(245,158,11,0.06))',borderBottom:'2px solid rgba(245,158,11,0.18)'}} />
+                          <small style={{color:'var(--muted)'}}>Value changed</small>
+                        </div>
+                        <div style={{display:'inline-flex',alignItems:'center',gap:8}}>
+                          <div style={{width:12,height:12,background:'#f59e0b',opacity:0.18,border:'1px solid rgba(245,158,11,0.22)'}} />
+                          <small style={{color:'var(--muted)'}}>Selected</small>
+                        </div>
                     </div>
                     <div style={{display:'flex',gap:8}}>
-                      <button onClick={() => setSelectedCells(((generatedPreview.before||[]).reduce((acc,_,i)=>{
-                        ((generatedPreview.before[i] ? Object.keys(generatedPreview.before[i]) : [])).forEach((col)=>{
-                          const isChanged = String((generatedPreview.before[i]||{})[col] ?? '') !== String(((generatedPreview.after[i]||{})[col] ?? ''))
+                      <button onClick={() => setSelectedCells(((displayPreview && displayPreview.before||[]).slice(0, rowsToShow || undefined).reduce((acc,_,i)=>{
+                        visibleColumns.forEach((col)=>{
+                          const isChanged = String(((displayPreview && displayPreview.before[i])||{})[col] ?? '') !== String(((displayPreview && displayPreview.after[i])||{})[col] ?? '')
                           if(isChanged) acc[`${i}|${col}`] = true
                         })
                         return acc
@@ -4597,25 +4796,29 @@ export default function App() {
                           <thead>
                             <tr>
                               <th>#</th>
-                              {(generatedPreview.before[0] ? ((selectedColumns?selectedColumns:Object.keys(generatedPreview.before[0])).slice(0,8)) : []).map((col) => (
+                              {visibleColumns.map((col) => (
                                 <th key={col}>{col}</th>
                               ))}
                             </tr>
                           </thead>
                           <tbody>
-                            {(generatedPreview.before || []).slice(0, rowsToShow || undefined).map((row, i) => (
+                            {(displayPreview && displayPreview.before || []).slice(0, rowsToShow || undefined).map((row, i) => (
                               <tr key={i}>
                                 <td>{i+1}</td>
-                                {(generatedPreview.before[0] ? ((selectedColumns?selectedColumns:Object.keys(generatedPreview.before[0])).slice(0,8)) : []).map((col) => {
-                                  const beforeVal = String((generatedPreview.before[i]||{})[col] ?? '')
-                                  const afterVal = String(((generatedPreview.after[i]||{})[col] ?? ''))
+                                {visibleColumns.map((col) => {
+                                  const beforeVal = String(((displayPreview && displayPreview.before[i])||{})[col] ?? '')
+                                  const afterVal = String(((displayPreview && displayPreview.after[i])||{})[col] ?? '')
                                   const isChanged = beforeVal !== afterVal
                                   const isSelected = !!selectedCells[_cellKey(i,col)]
+                                  const typeChanges = (displayPreview && displayPreview.type_changes) || {}
+                                  const isTypeChanged = !!(typeChanges && typeChanges[col])
+                                  const style = isTypeChanged ? { background: '#ecfdf5', border: '1px solid #10b981' } : (isChanged ? { background: 'linear-gradient(90deg, rgba(245,158,11,0.12), rgba(245,158,11,0.06))' } : {})
                                   const cls = isChanged ? (isSelected ? 'cell-changed cell-selected' : 'cell-changed') : ''
                                   return (
                                     <td key={col} className={cls}
+                                      style={style}
                                       onClick={() => { if(isChanged) toggleCellSelection(i,col) }}
-                                      onMouseEnter={(e)=>{ if(isChanged) setTooltip({x:e.clientX,y:e.clientY, before:beforeVal, after:afterVal}) }}
+                                      onMouseEnter={(e)=>{ if(isChanged) setTooltip({x:e.clientX,y:e.clientY, before:beforeVal, after:afterVal, typeChanged:isTypeChanged}) }}
                                       onMouseLeave={()=>setTooltip(null)}
                                     >{String(row[col] ?? '')}</td>
                                   )
@@ -4633,25 +4836,29 @@ export default function App() {
                           <thead>
                             <tr>
                               <th>#</th>
-                              {(generatedPreview.after[0] ? ((selectedColumns?selectedColumns:Object.keys(generatedPreview.after[0])).slice(0,8)) : []).map((col) => (
+                              {visibleColumns.map((col) => (
                                 <th key={col}>{col}</th>
                               ))}
                             </tr>
                           </thead>
                           <tbody>
-                            {(generatedPreview.after || []).slice(0, rowsToShow || undefined).map((row, i) => (
+                            {(displayPreview && displayPreview.after || []).slice(0, rowsToShow || undefined).map((row, i) => (
                               <tr key={i}>
                                 <td>{i+1}</td>
-                                {(generatedPreview.after[0] ? ((selectedColumns?selectedColumns:Object.keys(generatedPreview.after[0])).slice(0,8)) : []).map((col) => {
-                                  const beforeVal = String((generatedPreview.before[i]||{})[col] ?? '')
-                                  const afterVal = String((generatedPreview.after[i]||{})[col] ?? '')
+                                {visibleColumns.map((col) => {
+                                  const beforeVal = String(((displayPreview && displayPreview.before[i])||{})[col] ?? '')
+                                  const afterVal = String(((displayPreview && displayPreview.after[i])||{})[col] ?? '')
                                   const isChanged = beforeVal !== afterVal
                                   const isSelected = !!selectedCells[_cellKey(i,col)]
+                                  const typeChanges = (displayPreview && displayPreview.type_changes) || {}
+                                  const isTypeChanged = !!(typeChanges && typeChanges[col])
+                                  const style = isTypeChanged ? { background: '#ecfdf5', border: '1px solid #10b981' } : (isChanged ? { background: 'linear-gradient(90deg, rgba(245,158,11,0.12), rgba(245,158,11,0.06))' } : {})
                                   const cls = isChanged ? (isSelected ? 'cell-changed cell-selected' : 'cell-changed') : ''
                                   return (
                                     <td key={col} className={cls}
+                                      style={style}
                                       onClick={() => { if(isChanged) toggleCellSelection(i,col) }}
-                                      onMouseEnter={(e)=>{ if(isChanged) setTooltip({x:e.clientX,y:e.clientY, before:beforeVal, after:afterVal}) }}
+                                      onMouseEnter={(e)=>{ if(isChanged) setTooltip({x:e.clientX,y:e.clientY, before:beforeVal, after:afterVal, typeChanged:isTypeChanged}) }}
                                       onMouseLeave={()=>setTooltip(null)}
                                     >{String(row[col] ?? '')}</td>
                                   )
@@ -4669,8 +4876,8 @@ export default function App() {
                     <h5>Schema changes</h5>
                     <div className="schema-diff">
                       {(() => {
-                        const beforeCols = generatedPreview.before[0] ? Object.keys(generatedPreview.before[0]) : []
-                        const afterCols = generatedPreview.after[0] ? Object.keys(generatedPreview.after[0]) : []
+                        const beforeCols = (displayPreview && displayPreview.before[0]) ? Object.keys(displayPreview.before[0]) : []
+                        const afterCols = (displayPreview && displayPreview.after[0]) ? Object.keys(displayPreview.after[0]) : []
                         const added = afterCols.filter(c=>!beforeCols.includes(c))
                         const removed = beforeCols.filter(c=>!afterCols.includes(c))
                         return (
@@ -4684,6 +4891,53 @@ export default function App() {
                     </div>
                   </div>
 
+                    {/* Type changes */}
+                    <div style={{marginTop:10}}>
+                      <h5>Type changes</h5>
+                      <div className="schema-diff">
+                        {(() => {
+                          try {
+                            const tb = (displayPreview && displayPreview.types_before) || {}
+                            const ta = (displayPreview && displayPreview.types_after) || {}
+                            const allCols = Array.from(new Set([...(Object.keys(tb || {})), ...(Object.keys(ta || {}))])).sort()
+                            if (!allCols || allCols.length === 0) return <div style={{color:'var(--muted)'}}>No type information available</div>
+                            return (
+                              <div style={{display:'flex',flexDirection:'column',gap:8}}>
+                                <table style={{width:'100%',borderCollapse:'collapse'}}>
+                                  <thead>
+                                    <tr>
+                                      <th style={{textAlign:'left',padding:6}}>Column</th>
+                                      <th style={{textAlign:'left',padding:6}}>Before</th>
+                                      <th style={{textAlign:'left',padding:6}}>After</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {allCols.map((c) => {
+                                      const beforeType = tb[c] == null ? '—' : String(tb[c])
+                                      const afterType = ta[c] == null ? '—' : String(ta[c])
+                                      const isTypeChanged = beforeType !== afterType
+                                      return (
+                                        <tr key={c} style={{borderTop:'1px solid rgba(255,255,255,0.03)'}}>
+                                          <td style={{padding:6,width:260}}><strong>{c}</strong></td>
+                                          <td style={{padding:6}}>{beforeType}</td>
+                                          <td style={{padding:6, background: isTypeChanged ? '#ecfdf5' : 'transparent', border: isTypeChanged ? '1px solid #10b981' : 'none'}}>{afterType}</td>
+                                        </tr>
+                                      )
+                                    })}
+                                  </tbody>
+                                </table>
+                                <div style={{marginTop:6}}>
+                                  <small style={{color:'var(--muted)'}}>Columns highlighted in green had type changes.</small>
+                                </div>
+                              </div>
+                            )
+                          } catch (e) {
+                            return <div style={{color:'var(--muted)'}}>No type information available</div>
+                          }
+                        })()}
+                      </div>
+                    </div>
+
                   <div style={{marginTop:8,display:'flex',gap:8}}>
                     <button className="primary" onClick={() => { acceptGenerated(); }}>Accept generated</button>
                     <button onClick={() => { setRecipeText(prevRecipeText || ''); setGeneratedPreview(null); setSelectedCells({}); addToast('Rejected generated recipe', 'info') }}>Reject</button>
@@ -4694,6 +4948,14 @@ export default function App() {
               {/* Tooltip popup */}
               {tooltip && (
                 <div className="tooltip-popup" style={{left: tooltip.x + 8, top: tooltip.y + 8}}>
+                  <div style={{display:'flex',gap:8,alignItems:'center',marginBottom:6}}>
+                    {tooltip.typeChanged ? (
+                      <div style={{width:10,height:10,background:'#10b981',borderRadius:6}} />
+                    ) : (
+                      <div style={{width:10,height:10,background:'#f59e0b',borderRadius:6}} />
+                    )}
+                    <div style={{fontSize:'0.9rem',color:'var(--muted)'}}>{tooltip.typeChanged ? 'Type change' : 'Value change'}</div>
+                  </div>
                   <div><strong>Before</strong>: <span style={{fontFamily:'monospace'}}>{tooltip.before}</span></div>
                   <div><strong>After</strong>: <span style={{fontFamily:'monospace'}}>{tooltip.after}</span></div>
                 </div>
@@ -4734,7 +4996,7 @@ export default function App() {
                   <input type="checkbox" checked={previewAddRowIndex} onChange={(e)=>setPreviewAddRowIndex(e.target.checked)} />
                   <small style={{color:'var(--muted)'}}>Include row index (#)</small>
                 </label>
-                <button onClick={() => downloadPreviewCsv()} disabled={!generatedPreview}>Download CSV</button>
+                <button onClick={() => downloadPreviewCsv()} disabled={!displayPreview}>Download CSV</button>
               </div>
             </div>
           </div>

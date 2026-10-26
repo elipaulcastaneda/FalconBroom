@@ -1,0 +1,189 @@
+{
+  "cast_year_int_to_param": {
+    "recipe": {
+      "sources": [
+        {
+          "path": "samples/test_data/generated_house_data_01.csv"
+        }
+      ],
+      "cleaning_steps": [
+        {
+          "action": "cast",
+          "column": "construction_year",
+          "params": {
+            "to": "int"
+          }
+        }
+      ],
+      "outputs": [
+        {
+          "path": "out.csv"
+        }
+      ]
+    },
+    "preview": {
+      "before": [
+        {
+          "building_id": "B010000",
+          "address": "4992 Market St",
+          "city": "Philadelphia",
+          "state": "PA",
+          "construction_year": "1997",
+          "floors": 4,
+          "area_sqft": 2813,
+          "bedrooms": 3,
+          "bathrooms": 2,
+          "material": "Concrete",
+          "contractor": "BuildRight LLC",
+          "permit_status": "unknown",
+          "zipcode": "21966"
+        },
+        {
+          "building_id": "TX",
+          "address": "3470 Main St",
+          "city": "Austin",
+          "state": "B010001",
+          "construction_year": "1959",
+          "floors": 1,
+          "area_sqft": 3398,
+          "bedrooms": 2,
+          "bathrooms": 2,
+          "material": "Concrete",
+          "contractor": "BuildRight LLC",
+          "permit_status": "unknown",
+          "zipcode": "97018"
+        },
+        {
+          "building_id": "B010002",
+          "address": "Philadelphia",
+          "city": "9571 Maple St",
+          "state": "PA",
+          "construction_year": "1998",
+          "floors": 1,
+          "area_sqft": 4889,
+          "bedrooms": 3,
+          "bathrooms": 3,
+          "material": "Wood",
+          "contractor": "Acme Constructions",
+          "permit_status": "issued",
+          "zipcode": "TTRGL"
+        },
+        {
+          "building_id": "B010003",
+          "address": "3853 Pine St",
+          "city": "Los Angeles",
+          "state": "CA",
+          "construction_year": "2019",
+          "floors": 2,
+          "area_sqft": 3762,
+          "bedrooms": 2,
+          "bathrooms": 1,
+          "material": "Wood",
+          "contractor": "Homestead Co",
+          "permit_status": "issued",
+          "zipcode": "33525"
+        },
+        {
+          "building_id": "NY",
+          "address": "1108 Oak St",
+          "city": "Syracuse",
+          "state": "B010004",
+          "construction_year": "2012",
+          "floors": 2,
+          "area_sqft": 5597,
+          "bedrooms": 5,
+          "bathrooms": 3,
+          "material": "Concrete",
+          "contractor": "BuildRight LLC",
+          "permit_status": "pending",
+          "zipcode": "31620"
+        }
+      ],
+      "after": [
+        {
+          "building_id": "B010000",
+          "address": "4992 Market St",
+          "city": "Philadelphia",
+          "state": "PA",
+          "construction_year": "1997",
+          "floors": 4,
+          "area_sqft": 2813,
+          "bedrooms": 3,
+          "bathrooms": 2,
+          "material": "Concrete",
+          "contractor": "BuildRight LLC",
+          "permit_status": "unknown",
+          "zipcode": "21966"
+        },
+        {
+          "building_id": "TX",
+          "address": "3470 Main St",
+          "city": "Austin",
+          "state": "B010001",
+          "construction_year": "1959",
+          "floors": 1,
+          "area_sqft": 3398,
+          "bedrooms": 2,
+          "bathrooms": 2,
+          "material": "Concrete",
+          "contractor": "BuildRight LLC",
+          "permit_status": "unknown",
+          "zipcode": "97018"
+        },
+        {
+          "building_id": "B010002",
+          "address": "Philadelphia",
+          "city": "9571 Maple St",
+          "state": "PA",
+          "construction_year": "1998",
+          "floors": 1,
+          "area_sqft": 4889,
+          "bedrooms": 3,
+          "bathrooms": 3,
+          "material": "Wood",
+          "contractor": "Acme Constructions",
+          "permit_status": "issued",
+          "zipcode": "TTRGL"
+        },
+        {
+          "building_id": "B010003",
+          "address": "3853 Pine St",
+          "city": "Los Angeles",
+          "state": "CA",
+          "construction_year": "2019",
+          "floors": 2,
+          "area_sqft": 3762,
+          "bedrooms": 2,
+          "bathrooms": 1,
+          "material": "Wood",
+          "contractor": "Homestead Co",
+          "permit_status": "issued",
+          "zipcode": "33525"
+        },
+        {
+          "building_id": "NY",
+          "address": "1108 Oak St",
+          "city": "Syracuse",
+          "state": "B010004",
+          "construction_year": "2012",
+          "floors": 2,
+          "area_sqft": 5597,
+          "bedrooms": 5,
+          "bathrooms": 3,
+          "material": "Concrete",
+          "contractor": "BuildRight LLC",
+          "permit_status": "pending",
+          "zipcode": "31620"
+        }
+      ],
+      "warnings": [
+        {
+          "step": "cast",
+          "column": "construction_year",
+          "message": "Cast to int",
+          "rows_changed": null
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,82 @@
+============================= test session starts =============================
+platform win32 -- Python 3.14.0, pytest-9.0.2, pluggy-1.6.0 -- C:\Python314\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\Elijah\FalconBroom
+plugins: anyio-4.13.0, recording-0.13.0
+collecting ... STATUS 200
+TEXT {"ok":true,"users":[{"id":"u1","email":"a@b.com","aud":"authenticated","created_at":"t"}]}
+JSON {'ok': True, 'users': [{'id': 'u1', 'email': 'a@b.com', 'aud': 'authenticated', 'created_at': 't'}]}
+collected 0 items
+
+============================== warnings summary ===============================
+fbroom\main.py:112
+  C:\Users\Elijah\FalconBroom\fbroom\main.py:112: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    @app.on_event('startup')
+
+..\AppData\Roaming\Python\Python314\site-packages\fastapi\applications.py:4598
+..\AppData\Roaming\Python\Python314\site-packages\fastapi\applications.py:4598
+  C:\Users\Elijah\AppData\Roaming\Python\Python314\site-packages\fastapi\applications.py:4598: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    return self.router.on_event(event_type)  # ty: ignore[deprecated]
+
+fbroom\main.py:979
+  C:\Users\Elijah\FalconBroom\fbroom\main.py:979: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/
+    class SuggestBucketsResponse(BaseModel):
+
+..\AppData\Roaming\Python\Python314\site-packages\pydantic\_internal\_config.py:386
+  C:\Users\Elijah\AppData\Roaming\Python\Python314\site-packages\pydantic\_internal\_config.py:386: UserWarning: Valid config keys have changed in V2:
+  * 'schema_extra' has been renamed to 'json_schema_extra'
+    warnings.warn(message, UserWarning)
+
+fbroom\main.py:995
+  C:\Users\Elijah\FalconBroom\fbroom\main.py:995: PydanticDeprecatedSince20: Using extra keyword arguments on `Field` is deprecated and will be removed. Use `json_schema_extra` instead. (Extra keys: 'example'). Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/
+    path: str = Field(..., example="data/uploads/sample.csv")
+
+fbroom\main.py:996
+  C:\Users\Elijah\FalconBroom\fbroom\main.py:996: PydanticDeprecatedSince20: Using extra keyword arguments on `Field` is deprecated and will be removed. Use `json_schema_extra` instead. (Extra keys: 'example'). Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/
+    out_path: Optional[str] = Field(None, example="reports/output.parquet")
+
+fbroom\main.py:997
+  C:\Users\Elijah\FalconBroom\fbroom\main.py:997: PydanticDeprecatedSince20: Using extra keyword arguments on `Field` is deprecated and will be removed. Use `json_schema_extra` instead. (Extra keys: 'example'). Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/
+    compression: Optional[str] = Field(None, example="snappy")
+
+fbroom\main.py:998
+  C:\Users\Elijah\FalconBroom\fbroom\main.py:998: PydanticDeprecatedSince20: Using extra keyword arguments on `Field` is deprecated and will be removed. Use `json_schema_extra` instead. (Extra keys: 'example'). Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/
+    atomic: Optional[bool] = Field(True, example=True)
+
+fbroom\main.py:1002
+  C:\Users\Elijah\FalconBroom\fbroom\main.py:1002: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/
+    class ExplainedStepPreview(BaseModel):
+
+fbroom\main.py:1016
+  C:\Users\Elijah\FalconBroom\fbroom\main.py:1016: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/
+    class ExplainedStepResponse(BaseModel):
+
+fbroom\main.py:1082
+  C:\Users\Elijah\FalconBroom\fbroom\main.py:1082: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/
+    class ExplainResponse(BaseModel):
+
+fbroom\main.py:1126
+  C:\Users\Elijah\FalconBroom\fbroom\main.py:1126: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/
+    class WriteParquetResponse(BaseModel):
+
+fbroom\main.py:4973
+  C:\Users\Elijah\FalconBroom\fbroom\main.py:4973: DeprecationWarning: 
+          on_event is deprecated, use lifespan event handlers instead.
+  
+          Read more about it in the
+          [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+          
+    @app.on_event("startup")
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+============================ 14 warnings in 3.07s =============================

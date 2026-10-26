@@ -1,0 +1,5 @@
+{
+  "instruction": "Column 'address' may need cleaning: common text column. Suggested action: normalize values (trim, lowercase), dedupe similar values, and merge variants.\nColumn 'city' may need cleaning: common text column. Suggested action: normalize values (trim, lowercase), dedupe similar values, and merge variants.\nColumn 'state' may need cleaning: common text column. Suggested action: normalize values (trim, lowercase), dedupe similar values, and merge variants.\nColumn 'construction_year' contains mixed types. Suggestion: coerce to the intended type (e.g., numeric) and coerce unparsable values to null for review.\nColumn 'zipcode' has 15 missing/empty values. Suggestion: impute missing values (mean/median/mode) or mark as unknown; review policy.\nColumn 'zipcode' contains mixed types. Suggestion: coerce to the intended type (e.g., numeric) and coerce unparsable values to null for review.",
+  "source_path": "data/uploads/generated_house_data_01_69664c7f_43218_af50.csv",
+  "output_path": "output_from_text.csv"
+}

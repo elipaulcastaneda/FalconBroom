@@ -1,0 +1,1766 @@
+﻿
+================================================================================
+PATH: samples/test_data/generated_house_data_01.csv
+Raw metadata suggestions:
+{
+  "normalized_path": "samples/test_data/generated_house_data_01.csv",
+  "path": "samples/test_data/generated_house_data_01.csv",
+  "profile": {
+    "building_id": {
+      "dtype": "String",
+      "nulls": 0,
+      "unique": 376
+    },
+    "address": {
+      "dtype": "String",
+      "nulls": 0,
+      "unique": 418
+    },
+    "city": {
+      "dtype": "String",
+      "nulls": 0,
+      "unique": 169
+    },
+    "state": {
+      "dtype": "String",
+      "nulls": 0,
+      "unique": 150
+    },
+    "construction_year": {
+      "dtype": "String",
+      "nulls": 0,
+      "unique": 80
+    },
+    "floors": {
+      "dtype": "Int64",
+      "nulls": 0,
+      "unique": 5
+    },
+    "area_sqft": {
+      "dtype": "Int64",
+      "nulls": 0,
+      "unique": 484
+    },
+    "bedrooms": {
+      "dtype": "Int64",
+      "nulls": 0,
+      "unique": 6
+    },
+    "bathrooms": {
+      "dtype": "Int64",
+      "nulls": 0,
+      "unique": 4
+    },
+    "material": {
+      "dtype": "String",
+      "nulls": 0,
+      "unique": 7
+    },
+    "contractor": {
+      "dtype": "String",
+      "nulls": 0,
+      "unique": 10
+    },
+    "permit_status": {
+      "dtype": "String",
+      "nulls": 0,
+      "unique": 4
+    },
+    "zipcode": {
+      "dtype": "String",
+      "nulls": 15,
+      "unique": 483
+    }
+  },
+  "inspect_preview": {
+    "path": "samples/test_data/generated_house_data_01.csv",
+    "row_count": 500,
+    "column_count": 13,
+    "columns": [
+      "building_id",
+      "address",
+      "city",
+      "state",
+      "construction_year",
+      "floors",
+      "area_sqft",
+      "bedrooms",
+      "bathrooms",
+      "material",
+      "contractor",
+      "permit_status",
+      "zipcode"
+    ],
+    "rows": [
+      {
+        "building_id": "B010000",
+        "address": "4992 Market St",
+        "city": "Philadelphia",
+        "state": "PA",
+        "construction_year": "1997",
+        "floors": 4,
+        "area_sqft": 2813,
+        "bedrooms": 3,
+        "bathrooms": 2,
+        "material": "Concrete",
+        "contractor": "BuildRight LLC",
+        "permit_status": "unknown",
+        "zipcode": "21966"
+      },
+      {
+        "building_id": "TX",
+        "address": "3470 Main St",
+        "city": "Austin",
+        "state": "B010001",
+        "construction_year": "1959",
+        "floors": 1,
+        "area_sqft": 3398,
+        "bedrooms": 2,
+        "bathrooms": 2,
+        "material": "Concrete",
+        "contractor": "BuildRight LLC",
+        "permit_status": "unknown",
+        "zipcode": "97018"
+      },
+      {
+        "building_id": "B010002",
+        "address": "Philadelphia",
+        "city": "9571 Maple St",
+        "state": "PA",
+        "construction_year": "1998",
+        "floors": 1,
+        "area_sqft": 4889,
+        "bedrooms": 3,
+        "bathrooms": 3,
+        "material": "Wood",
+        "contractor": "Acme Constructions",
+        "permit_status": "issued",
+        "zipcode": "TTRGL"
+      },
+      {
+        "building_id": "B010003",
+        "address": "3853 Pine St",
+        "city": "Los Angeles",
+        "state": "CA",
+        "construction_year": "2019",
+        "floors": 2,
+        "area_sqft": 3762,
+        "bedrooms": 2,
+        "bathrooms": 1,
+        "material": "Wood",
+        "contractor": "Homestead Co",
+        "permit_status": "issued",
+        "zipcode": "33525"
+      },
+      {
+        "building_id": "NY",
+        "address": "1108 Oak St",
+        "city": "Syracuse",
+        "state": "B010004",
+        "construction_year": "2012",
+        "floors": 2,
+        "area_sqft": 5597,
+        "bedrooms": 5,
+        "bathrooms": 3,
+        "material": "Concrete",
+        "contractor": "BuildRight LLC",
+        "permit_status": "pending",
+        "zipcode": "31620"
+      },
+      {
+        "building_id": "TX",
+        "address": "1584 Elm St",
+        "city": "El Paso",
+        "state": "B010005",
+        "construction_year": "1950",
+        "floors": 1,
+        "area_sqft": 5987,
+        "bedrooms": 2,
+        "bathrooms": 1,
+        "material": "Mixed",
+        "contractor": "BuildRight LLC",
+        "permit_status": "denied",
+        "zipcode": "41885"
+      },
+      {
+        "building_id": "B010006",
+        "address": "San Antonio",
+        "city": "3013 Maple St",
+        "state": "TX",
+        "construction_year": "2023",
+        "floors": 2,
+        "area_sqft": 4845,
+        "bedrooms": 4,
+        "bathrooms": 4,
+        "material": "Mixed",
+        "contractor": "Homestead Co",
+        "permit_status": "denied",
+        "zipcode": "94376"
+      },
+      {
+        "building_id": "B010007",
+        "address": "El Paso",
+        "city": "3921 Pine St",
+        "state": "TX",
+        "construction_year": "2022",
+        "floors": 1,
+        "area_sqft": 5009,
+        "bedrooms": 3,
+        "bathrooms": 2,
+        "material": "Concrete",
+        "contractor": "Homestead Co",
+        "permit_status": "issued",
+        "zipcode": "77723"
+      },
+      {
+        "building_id": "B010008",
+        "address": "San Diego",
+        "city": "7375 Main St",
+        "state": "CA",
+        "construction_year": "1997",
+        "floors": 2,
+        "area_sqft": 4279,
+        "bedrooms": 3,
+        "bathrooms": 3,
+        "material": "Steel",
+        "contractor": "Homestead Co",
+        "permit_status": "issued",
+        "zipcode": "1501"
+      },
+      {
+        "building_id": "OH",
+        "address": "Cleveland",
+        "city": "4566 Pine St",
+        "state": "B010009",
+        "construction_year": "1976",
+        "floors": 4,
+        "area_sqft": 6542,
+        "bedrooms": 2,
+        "bathrooms": 2,
+        "material": "Wood",
+        "contractor": "PrimeConstruct",
+        "permit_status": "denied",
+        "zipcode": "15302"
+      },
+      {
+        "building_id": "B010010",
+        "address": "3391 Oak St",
+        "city": "Jacksonville",
+        "state": "FL",
+        "construction_year": "1969",
+        "floors": 1,
+        "area_sqft": 4810,
+        "bedrooms": 1,
+        "bathrooms": 1,
+        "material": "Steel",
+        "contractor": "NorthStar Builders",
+        "permit_status": "issued",
+        "zipcode": "79777"
+      },
+      {
+        "building_id": "B010011",
+        "address": "8744 Maple St",
+        "city": "New York",
+        "state": "NY",
+        "construction_year": "2020yrs",
+        "floors": 2,
+        "area_sqft": 3959,
+        "bedrooms": 5,
+        "bathrooms": 3,
+        "material": "Mixed",
+        "contractor": "Acme Constructions",
+        "permit_status": "denied",
+        "zipcode": "31457"
+      },
+      {
+        "building_id": "FL",
+        "address": "9836 Oak St",
+        "city": "Tallahassee",
+        "state": "B010012",
+        "construction_year": "1990",
+        "floors": 2,
+        "area_sqft": 974,
+        "bedrooms": 2,
+        "bathrooms": 2,
+        "material": "Concrete",
+        "contractor": "Acme Constructions",
+        "permit_status": "unknown",
+        "zipcode": "17434"
+      },
+      {
+        "building_id": "B010013",
+        "address": "5160 Market St",
+        "city": "San Francisco",
+        "state": "CA",
+        "construction_year": "1977",
+        "floors": 2,
+        "area_sqft": 4371,
+        "bedrooms": 2,
+        "bathrooms": 1,
+        "material": "Steel",
+        "contractor": "Acme Constructions",
+        "permit_status": "pending",
+        "zipcode": "31250"
+      },
+      {
+        "building_id": "B010014",
+        "address": "Cleveland",
+        "city": "3515 Elm St",
+        "state": "OH",
+        "construction_year": "2023",
+        "floors": 4,
+        "area_sqft": 5841,
+        "bedrooms": 2,
+        "bathrooms": 2,
+        "material": "Wood",
+        "contractor": "Acme Constructions",
+        "permit_status": "issued",
+        "zipcode": "46388"
+      },
+      {
+        "building_id": "PA",
+        "address": "4181 Main St",
+        "city": "Erie",
+        "state": "B010015",
+        "construction_year": "2007",
+        "floors": 3,
+        "area_sqft": 4732,
+        "bedrooms": 1,
+        "bathrooms": 1,
+        "material": "Mixed",
+        "contractor": "PrimeConstruct",
+        "permit_status": "denied",
+        "zipcode": "74646"
+      },
+      {
+        "building_id": "B010016",
+        "address": "9376 Oak St",
+        "city": "Springfield",
+        "state": "IL",
+        "construction_year": "1971",
+        "floors": 1,
+        "area_sqft": 5653,
+        "bedrooms": 5,
+        "bathrooms": 4,
+        "material": "Concrete",
+        "contractor": "PrimeConstruct",
+        "permit_status": "pending",
+        "zipcode": "77701"
+      },
+      {
+        "building_id": "B010017",
+        "address": "5051 Oak St",
+        "city": "Orlando",
+        "state": "FL",
+        "construction_year": "2000",
+        "floors": 2,
+        "area_sqft": 5197,
+        "bedrooms": 5,
+        "bathrooms": 3,
+        "material": "Wood",
+        "contractor": "Acme Constructions",
+        "permit_status": "denied",
+        "zipcode": "26830"
+      },
+      {
+        "building_id": "CA",
+        "address": "7124 Cedar St",
+        "city": "Los Angeles",
+        "state": "B010018",
+        "construction_year": "2001",
+        "floors": 3,
+        "area_sqft": 5846,
+        "bedrooms": 3,
+        "bathrooms": 3,
+        "material": "Mixed",
+        "contractor": "PrimeConstruct",
+        "permit_status": "denied",
+        "zipcode": null
+      },
+      {
+        "building_id": "B010019",
+        "address": "4464 Main St",
+        "city": "New York",
+        "state": "NY",
+        "construction_year": "1990",
+        "floors": 3,
+        "area_sqft": 6596,
+        "bedrooms": 2,
+        "bathrooms": 1,
+        "material": "Steel",
+        "contractor": "BuildRight LLC",
+        "permit_status": "unknown",
+        "zipcode": "11877"
+      }
+    ],
+    "offset": 0,
+    "limit": 20,
+    "returned_rows": 20,
+    "has_prev": false,
+    "has_next": true,
+    "diagnostics": {
+      "building_id": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 376,
+        "mixed_type": false,
+        "constant": false
+      },
+      "address": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 418,
+        "mixed_type": false,
+        "constant": false
+      },
+      "city": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 169,
+        "mixed_type": false,
+        "constant": false
+      },
+      "state": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 150,
+        "mixed_type": false,
+        "constant": false
+      },
+      "construction_year": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 80,
+        "mixed_type": true,
+        "constant": false
+      },
+      "floors": {
+        "missing_count": null
+      },
+      "area_sqft": {
+        "missing_count": null
+      },
+      "bedrooms": {
+        "missing_count": null
+      },
+      "bathrooms": {
+        "missing_count": null
+      },
+      "material": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 7,
+        "mixed_type": false,
+        "constant": false
+      },
+      "contractor": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 10,
+        "mixed_type": false,
+        "constant": false
+      },
+      "permit_status": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 4,
+        "mixed_type": false,
+        "constant": false
+      },
+      "zipcode": {
+        "missing_count": 15,
+        "missing_positions_sample": [
+          19,
+          36,
+          46,
+          86,
+          93,
+          97,
+          109,
+          225,
+          235,
+          246,
+          256,
+          346,
+          360,
+          410,
+          446
+        ],
+        "missing_pct": 3.0,
+        "unique_count": 483,
+        "mixed_type": true,
+        "constant": false
+      }
+    }
+  },
+  "diagnostics": {
+    "building_id": {
+      "missing_count": 0,
+      "missing_positions_sample": [],
+      "missing_pct": 0.0,
+      "unique_count": 376,
+      "mixed_type": false,
+      "constant": false
+    },
+    "address": {
+      "missing_count": 0,
+      "missing_positions_sample": [],
+      "missing_pct": 0.0,
+      "unique_count": 418,
+      "mixed_type": false,
+      "constant": false
+    },
+    "city": {
+      "missing_count": 0,
+      "missing_positions_sample": [],
+      "missing_pct": 0.0,
+      "unique_count": 169,
+      "mixed_type": false,
+      "constant": false
+    },
+    "state": {
+      "missing_count": 0,
+      "missing_positions_sample": [],
+      "missing_pct": 0.0,
+      "unique_count": 150,
+      "mixed_type": false,
+      "constant": false
+    },
+    "construction_year": {
+      "missing_count": 0,
+      "missing_positions_sample": [],
+      "missing_pct": 0.0,
+      "unique_count": 80,
+      "mixed_type": true,
+      "constant": false
+    },
+    "floors": {
+      "missing_count": null
+    },
+    "area_sqft": {
+      "missing_count": null
+    },
+    "bedrooms": {
+      "missing_count": null
+    },
+    "bathrooms": {
+      "missing_count": null
+    },
+    "material": {
+      "missing_count": 0,
+      "missing_positions_sample": [],
+      "missing_pct": 0.0,
+      "unique_count": 7,
+      "mixed_type": false,
+      "constant": false
+    },
+    "contractor": {
+      "missing_count": 0,
+      "missing_positions_sample": [],
+      "missing_pct": 0.0,
+      "unique_count": 10,
+      "mixed_type": false,
+      "constant": false
+    },
+    "permit_status": {
+      "missing_count": 0,
+      "missing_positions_sample": [],
+      "missing_pct": 0.0,
+      "unique_count": 4,
+      "mixed_type": false,
+      "constant": false
+    },
+    "zipcode": {
+      "missing_count": 15,
+      "missing_positions_sample": [
+        19,
+        36,
+        46,
+        86,
+        93,
+        97,
+        109,
+        225,
+        235,
+        246,
+        256,
+        346,
+        360,
+        410,
+        446
+      ],
+      "missing_pct": 3.0,
+      "unique_count": 483,
+      "mixed_type": true,
+      "constant": false
+    }
+  },
+  "suggestions": [
+    {
+      "column": "address",
+      "score": 0.35,
+      "reason": "common text column"
+    },
+    {
+      "column": "city",
+      "score": 0.35,
+      "reason": "common text column"
+    },
+    {
+      "column": "state",
+      "score": 0.35,
+      "reason": "common text column"
+    },
+    {
+      "column": "zipcode",
+      "score": 0.115,
+      "reason": "15 nulls"
+    }
+  ],
+  "plain_language_suggestions": [
+    {
+      "text": "Column 'address' may need cleaning: common text column. Suggested action: normalize values (trim, lowercase), dedupe similar values, and merge variants.",
+      "source": "suggestions"
+    },
+    {
+      "text": "Column 'city' may need cleaning: common text column. Suggested action: normalize values (trim, lowercase), dedupe similar values, and merge variants.",
+      "source": "suggestions"
+    },
+    {
+      "text": "Column 'state' may need cleaning: common text column. Suggested action: normalize values (trim, lowercase), dedupe similar values, and merge variants.",
+      "source": "suggestions"
+    },
+    {
+      "text": "Column 'zipcode' may need cleaning: 15 nulls. Suggested action: normalize values (trim, lowercase), dedupe similar values, and merge variants.",
+      "source": "suggestions"
+    },
+    {
+      "text": "Column 'construction_year' contains mixed types. Suggestion: coerce to the intended type (e.g., numeric) and coerce unparsable values to null for review.",
+      "source": "diagnostics"
+    },
+    {
+      "text": "Column 'zipcode' has 15 missing/empty values. Suggestion: impute missing values (mean/median/mode) or mark as unknown; review policy.",
+      "source": "diagnostics"
+    },
+    {
+      "text": "Column 'zipcode' contains mixed types. Suggestion: coerce to the intended type (e.g., numeric) and coerce unparsable values to null for review.",
+      "source": "diagnostics"
+    }
+  ]
+}
+Extracted suggestion text: samples/test_data/generated_house_data_01.csv
+Recipe+preview response:
+{
+  "recipe": {
+    "sources": [
+      {
+        "path": "samples/test_data/generated_house_data_01.csv"
+      }
+    ],
+    "cleaning_steps": [],
+    "joins": [],
+    "outputs": [
+      {
+        "path": "output.csv"
+      }
+    ]
+  },
+  "recipe_json_str": "{\n  \"sources\": [\n    {\n      \"path\": \"samples/test_data/generated_house_data_01.csv\"\n    }\n  ],\n  \"cleaning_steps\": [],\n  \"joins\": [],\n  \"outputs\": [\n    {\n      \"path\": \"output.csv\"\n    }\n  ]\n}",
+  "preview": {
+    "before": [
+      {
+        "building_id": "B010000",
+        "address": "4992 Market St",
+        "city": "Philadelphia",
+        "state": "PA",
+        "construction_year": "1997",
+        "floors": 4,
+        "area_sqft": 2813,
+        "bedrooms": 3,
+        "bathrooms": 2,
+        "material": "Concrete",
+        "contractor": "BuildRight LLC",
+        "permit_status": "unknown",
+        "zipcode": "21966"
+      },
+      {
+        "building_id": "TX",
+        "address": "3470 Main St",
+        "city": "Austin",
+        "state": "B010001",
+        "construction_year": "1959",
+        "floors": 1,
+        "area_sqft": 3398,
+        "bedrooms": 2,
+        "bathrooms": 2,
+        "material": "Concrete",
+        "contractor": "BuildRight LLC",
+        "permit_status": "unknown",
+        "zipcode": "97018"
+      },
+      {
+        "building_id": "B010002",
+        "address": "Philadelphia",
+        "city": "9571 Maple St",
+        "state": "PA",
+        "construction_year": "1998",
+        "floors": 1,
+        "area_sqft": 4889,
+        "bedrooms": 3,
+        "bathrooms": 3,
+        "material": "Wood",
+        "contractor": "Acme Constructions",
+        "permit_status": "issued",
+        "zipcode": "TTRGL"
+      },
+      {
+        "building_id": "B010003",
+        "address": "3853 Pine St",
+        "city": "Los Angeles",
+        "state": "CA",
+        "construction_year": "2019",
+        "floors": 2,
+        "area_sqft": 3762,
+        "bedrooms": 2,
+        "bathrooms": 1,
+        "material": "Wood",
+        "contractor": "Homestead Co",
+        "permit_status": "issued",
+        "zipcode": "33525"
+      },
+      {
+        "building_id": "NY",
+        "address": "1108 Oak St",
+        "city": "Syracuse",
+        "state": "B010004",
+        "construction_year": "2012",
+        "floors": 2,
+        "area_sqft": 5597,
+        "bedrooms": 5,
+        "bathrooms": 3,
+        "material": "Concrete",
+        "contractor": "BuildRight LLC",
+        "permit_status": "pending",
+        "zipcode": "31620"
+      }
+    ],
+    "after": [
+      {
+        "building_id": "B010000",
+        "address": "4992 Market St",
+        "city": "Philadelphia",
+        "state": "PA",
+        "construction_year": "1997",
+        "floors": 4,
+        "area_sqft": 2813,
+        "bedrooms": 3,
+        "bathrooms": 2,
+        "material": "Concrete",
+        "contractor": "BuildRight LLC",
+        "permit_status": "unknown",
+        "zipcode": "21966"
+      },
+      {
+        "building_id": "TX",
+        "address": "3470 Main St",
+        "city": "Austin",
+        "state": "B010001",
+        "construction_year": "1959",
+        "floors": 1,
+        "area_sqft": 3398,
+        "bedrooms": 2,
+        "bathrooms": 2,
+        "material": "Concrete",
+        "contractor": "BuildRight LLC",
+        "permit_status": "unknown",
+        "zipcode": "97018"
+      },
+      {
+        "building_id": "B010002",
+        "address": "Philadelphia",
+        "city": "9571 Maple St",
+        "state": "PA",
+        "construction_year": "1998",
+        "floors": 1,
+        "area_sqft": 4889,
+        "bedrooms": 3,
+        "bathrooms": 3,
+        "material": "Wood",
+        "contractor": "Acme Constructions",
+        "permit_status": "issued",
+        "zipcode": "TTRGL"
+      },
+      {
+        "building_id": "B010003",
+        "address": "3853 Pine St",
+        "city": "Los Angeles",
+        "state": "CA",
+        "construction_year": "2019",
+        "floors": 2,
+        "area_sqft": 3762,
+        "bedrooms": 2,
+        "bathrooms": 1,
+        "material": "Wood",
+        "contractor": "Homestead Co",
+        "permit_status": "issued",
+        "zipcode": "33525"
+      },
+      {
+        "building_id": "NY",
+        "address": "1108 Oak St",
+        "city": "Syracuse",
+        "state": "B010004",
+        "construction_year": "2012",
+        "floors": 2,
+        "area_sqft": 5597,
+        "bedrooms": 5,
+        "bathrooms": 3,
+        "material": "Concrete",
+        "contractor": "BuildRight LLC",
+        "permit_status": "pending",
+        "zipcode": "31620"
+      }
+    ],
+    "warnings": [],
+    "types_before": {
+      "building_id": "String",
+      "address": "String",
+      "city": "String",
+      "state": "String",
+      "construction_year": "String",
+      "floors": "Int64",
+      "area_sqft": "Int64",
+      "bedrooms": "Int64",
+      "bathrooms": "Int64",
+      "material": "String",
+      "contractor": "String",
+      "permit_status": "String",
+      "zipcode": "String"
+    },
+    "types_after": {
+      "building_id": "String",
+      "address": "String",
+      "city": "String",
+      "state": "String",
+      "construction_year": "String",
+      "floors": "Int64",
+      "area_sqft": "Int64",
+      "bedrooms": "Int64",
+      "bathrooms": "Int64",
+      "material": "String",
+      "contractor": "String",
+      "permit_status": "String",
+      "zipcode": "String"
+    },
+    "type_changes": {}
+  }
+}
+
+================================================================================
+PATH: samples/test_data/generated_house_data_02.csv
+Raw metadata suggestions:
+{
+  "normalized_path": "samples/test_data/generated_house_data_02.csv",
+  "path": "samples/test_data/generated_house_data_02.csv",
+  "profile": {
+    "building_id": {
+      "dtype": "String",
+      "nulls": 0,
+      "unique": 500
+    },
+    "address": {
+      "dtype": "String",
+      "nulls": 0,
+      "unique": 500
+    },
+    "city": {
+      "dtype": "String",
+      "nulls": 1,
+      "unique": 54
+    },
+    "state": {
+      "dtype": "String",
+      "nulls": 0,
+      "unique": 16
+    },
+    "construction_year": {
+      "dtype": "String",
+      "nulls": 0,
+      "unique": 79
+    },
+    "floors": {
+      "dtype": "Int64",
+      "nulls": 0,
+      "unique": 5
+    },
+    "area_sqft": {
+      "dtype": "Int64",
+      "nulls": 0,
+      "unique": 484
+    },
+    "bedrooms": {
+      "dtype": "Int64",
+      "nulls": 0,
+      "unique": 6
+    },
+    "bathrooms": {
+      "dtype": "Int64",
+      "nulls": 0,
+      "unique": 4
+    },
+    "material": {
+      "dtype": "String",
+      "nulls": 0,
+      "unique": 8
+    },
+    "contractor": {
+      "dtype": "String",
+      "nulls": 0,
+      "unique": 17
+    },
+    "permit_status": {
+      "dtype": "String",
+      "nulls": 0,
+      "unique": 4
+    },
+    "zipcode": {
+      "dtype": "String",
+      "nulls": 33,
+      "unique": 457
+    }
+  },
+  "inspect_preview": {
+    "path": "samples/test_data/generated_house_data_02.csv",
+    "row_count": 500,
+    "column_count": 13,
+    "columns": [
+      "building_id",
+      "address",
+      "city",
+      "state",
+      "construction_year",
+      "floors",
+      "area_sqft",
+      "bedrooms",
+      "bathrooms",
+      "material",
+      "contractor",
+      "permit_status",
+      "zipcode"
+    ],
+    "rows": [
+      {
+        "building_id": "B020000",
+        "address": "3543 Pine St",
+        "city": "Toledo",
+        "state": "OH",
+        "construction_year": "1980",
+        "floors": 2,
+        "area_sqft": 681,
+        "bedrooms": 5,
+        "bathrooms": 4,
+        "material": "Brick",
+        "contractor": "Acme Constructions",
+        "permit_status": "denied",
+        "zipcode": "Flint"
+      },
+      {
+        "building_id": "B020001",
+        "address": "6808 Elm St",
+        "city": "Philadelphia",
+        "state": "PA",
+        "construction_year": "2017",
+        "floors": 3,
+        "area_sqft": 3436,
+        "bedrooms": 5,
+        "bathrooms": 3,
+        "material": "Wood",
+        "contractor": "Homestead Co",
+        "permit_status": "unknown",
+        "zipcode": null
+      },
+      {
+        "building_id": "B020002",
+        "address": "1451 Maple St",
+        "city": "Jacksonville",
+        "state": "FL",
+        "construction_year": "1983",
+        "floors": 3,
+        "area_sqft": 7329,
+        "bedrooms": 4,
+        "bathrooms": 3,
+        "material": "Wood",
+        "contractor": "PrimeConstruct",
+        "permit_status": "unknown",
+        "zipcode": "53896-6133"
+      },
+      {
+        "building_id": "B020003",
+        "address": "1679 Elm St",
+        "city": "75638",
+        "state": "TX",
+        "construction_year": "1959",
+        "floors": 2,
+        "area_sqft": 5709,
+        "bedrooms": 3,
+        "bathrooms": 3,
+        "material": "Concrete",
+        "contractor": "Acme Constructions",
+        "permit_status": "unknown",
+        "zipcode": "Dallas"
+      },
+      {
+        "building_id": "B020004",
+        "address": "7924 Elm St",
+        "city": "Fresno",
+        "state": "CA",
+        "construction_year": "2003",
+        "floors": 5,
+        "area_sqft": 4344,
+        "bedrooms": 3,
+        "bathrooms": 2,
+        "material": "Mixed",
+        "contractor": "Homestead Co",
+        "permit_status": "unknown",
+        "zipcode": null
+      },
+      {
+        "building_id": "B020005",
+        "address": "5913 Main St",
+        "city": "Tampa",
+        "state": "FL",
+        "construction_year": "2003yrs",
+        "floors": 2,
+        "area_sqft": 7749,
+        "bedrooms": 2,
+        "bathrooms": 2,
+        "material": "Brick",
+        "contractor": "BuildRight LLC",
+        "permit_status": "denied",
+        "zipcode": "35486"
+      },
+      {
+        "building_id": "B020006",
+        "address": "5001 Main St",
+        "city": "Cleveland",
+        "state": "OH",
+        "construction_year": "2012",
+        "floors": 3,
+        "area_sqft": 3215,
+        "bedrooms": 3,
+        "bathrooms": 2,
+        "material": "Mixed",
+        "contractor": "BuildRight LLC",
+        "permit_status": "issued",
+        "zipcode": "96317"
+      },
+      {
+        "building_id": "B020007",
+        "address": "301 Elm St",
+        "city": "Chicago",
+        "state": "IL",
+        "construction_year": "2018yrs",
+        "floors": 3,
+        "area_sqft": 4828,
+        "bedrooms": 2,
+        "bathrooms": 1,
+        "material": "Brick",
+        "contractor": "Acme Constructions",
+        "permit_status": "denied",
+        "zipcode": "2343"
+      },
+      {
+        "building_id": "B020008",
+        "address": "5244 Pine St",
+        "city": "Lansing",
+        "state": "MI",
+        "construction_year": "1987",
+        "floors": 2,
+        "area_sqft": 2726,
+        "bedrooms": 2,
+        "bathrooms": 2,
+        "material": "Wood",
+        "contractor": "BuildRight LLC",
+        "permit_status": "issued",
+        "zipcode": "33025X"
+      },
+      {
+        "building_id": "B020009",
+        "address": "378 Elm St",
+        "city": "Buffalo",
+        "state": "NY",
+        "construction_year": "1987",
+        "floors": 2,
+        "area_sqft": 3838,
+        "bedrooms": 3,
+        "bathrooms": 3,
+        "material": "Brick",
+        "contractor": "Homestead Co",
+        "permit_status": "unknown",
+        "zipcode": "36786"
+      },
+      {
+        "building_id": "B020010",
+        "address": "612 Elm St",
+        "city": "Dallas",
+        "state": "TX",
+        "construction_year": "1990",
+        "floors": 1,
+        "area_sqft": 2944,
+        "bedrooms": 4,
+        "bathrooms": 3,
+        "material": "Mixed",
+        "contractor": "Homestead Co",
+        "permit_status": "unknown",
+        "zipcode": "Dallas"
+      },
+      {
+        "building_id": "B020011",
+        "address": "1134 Pine St",
+        "city": "Buffalo",
+        "state": "NY",
+        "construction_year": "2000",
+        "floors": 3,
+        "area_sqft": 6867,
+        "bedrooms": 4,
+        "bathrooms": 3,
+        "material": "Wood",
+        "contractor": "BuildRight LLC",
+        "permit_status": "unknown",
+        "zipcode": "92292"
+      },
+      {
+        "building_id": "B020012",
+        "address": "3129 Cedar St",
+        "city": "Orlando",
+        "state": "FL",
+        "construction_year": "1956",
+        "floors": 2,
+        "area_sqft": 2908,
+        "bedrooms": 3,
+        "bathrooms": 3,
+        "material": "Mixed",
+        "contractor": "BuildRight LLC",
+        "permit_status": "unknown",
+        "zipcode": "16805"
+      },
+      {
+        "building_id": "B020013",
+        "address": "6639 Market St",
+        "city": "Tampa",
+        "state": "FL",
+        "construction_year": "1963",
+        "floors": 2,
+        "area_sqft": 7454,
+        "bedrooms": 3,
+        "bathrooms": 2,
+        "material": "Concrete",
+        "contractor": "BuildRight LLC",
+        "permit_status": "unknown",
+        "zipcode": "38720"
+      },
+      {
+        "building_id": "B020014",
+        "address": "9332 Maple St",
+        "city": "Spokane",
+        "state": "WA",
+        "construction_year": "2011",
+        "floors": 1,
+        "area_sqft": 5911,
+        "bedrooms": 2,
+        "bathrooms": 1,
+        "material": "Mixed",
+        "contractor": "Homestead Co",
+        "permit_status": "unknown",
+        "zipcode": "Houston"
+      },
+      {
+        "building_id": "B020015",
+        "address": "8229 Pine St",
+        "city": "Detroit",
+        "state": "MI",
+        "construction_year": "1995",
+        "floors": 1,
+        "area_sqft": 6929,
+        "bedrooms": 3,
+        "bathrooms": 3,
+        "material": "Concrete",
+        "contractor": "Homestead Co",
+        "permit_status": "pending",
+        "zipcode": "98879"
+      },
+      {
+        "building_id": "B020016",
+        "address": "5945 Main St",
+        "city": "Warren",
+        "state": "MI",
+        "construction_year": "1954",
+        "floors": 3,
+        "area_sqft": 1814,
+        "bedrooms": 4,
+        "bathrooms": 3,
+        "material": "Concrete",
+        "contractor": "BuildRight LLC",
+        "permit_status": "issued",
+        "zipcode": "78191-2969"
+      },
+      {
+        "building_id": "B020017",
+        "address": "4752 Oak St",
+        "city": "San Francisco",
+        "state": "CA",
+        "construction_year": "1972",
+        "floors": 1,
+        "area_sqft": 3785,
+        "bedrooms": 4,
+        "bathrooms": 4,
+        "material": "Concrete",
+        "contractor": "PrimeConstruct",
+        "permit_status": "unknown",
+        "zipcode": "Albany"
+      },
+      {
+        "building_id": "B020018",
+        "address": "6113 Pine St",
+        "city": "Peoria",
+        "state": "IL",
+        "construction_year": "1965",
+        "floors": 2,
+        "area_sqft": 1428,
+        "bedrooms": 2,
+        "bathrooms": 1,
+        "material": "Steel",
+        "contractor": "PrimeConstruct",
+        "permit_status": "unknown",
+        "zipcode": "50430-1236"
+      },
+      {
+        "building_id": "B020019",
+        "address": "6079 Pine St",
+        "city": "Albany",
+        "state": "NY",
+        "construction_year": "1975",
+        "floors": 1,
+        "area_sqft": 1155,
+        "bedrooms": 2,
+        "bathrooms": 1,
+        "material": "Brick",
+        "contractor": "BuildRight LLC",
+        "permit_status": "denied",
+        "zipcode": "35050"
+      }
+    ],
+    "offset": 0,
+    "limit": 20,
+    "returned_rows": 20,
+    "has_prev": false,
+    "has_next": true,
+    "diagnostics": {
+      "building_id": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 500,
+        "mixed_type": false,
+        "constant": false
+      },
+      "address": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 500,
+        "mixed_type": false,
+        "constant": false
+      },
+      "city": {
+        "missing_count": 1,
+        "missing_positions_sample": [
+          28
+        ],
+        "missing_pct": 0.2,
+        "unique_count": 54,
+        "mixed_type": true,
+        "constant": false
+      },
+      "state": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 16,
+        "mixed_type": false,
+        "constant": false
+      },
+      "construction_year": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 79,
+        "mixed_type": true,
+        "constant": false
+      },
+      "floors": {
+        "missing_count": null
+      },
+      "area_sqft": {
+        "missing_count": null
+      },
+      "bedrooms": {
+        "missing_count": null
+      },
+      "bathrooms": {
+        "missing_count": null
+      },
+      "material": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 8,
+        "mixed_type": false,
+        "constant": false
+      },
+      "contractor": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 17,
+        "mixed_type": true,
+        "constant": false
+      },
+      "permit_status": {
+        "missing_count": 0,
+        "missing_positions_sample": [],
+        "missing_pct": 0.0,
+        "unique_count": 4,
+        "mixed_type": false,
+        "constant": false
+      },
+      "zipcode": {
+        "missing_count": 33,
+        "missing_positions_sample": [
+          2,
+          5,
+          44,
+          49,
+          72,
+          77,
+          83,
+          84,
+          85,
+          100,
+          104,
+          108,
+          184,
+          208,
+          232,
+          255,
+          259,
+          279,
+          291,
+          306
+        ],
+        "missing_pct": 6.6,
+        "unique_count": 457,
+        "mixed_type": true,
+        "constant": false
+      }
+    }
+  },
+  "diagnostics": {
+    "building_id": {
+      "missing_count": 0,
+      "missing_positions_sample": [],
+      "missing_pct": 0.0,
+      "unique_count": 500,
+      "mixed_type": false,
+      "constant": false
+    },
+    "address": {
+      "missing_count": 0,
+      "missing_positions_sample": [],
+      "missing_pct": 0.0,
+      "unique_count": 500,
+      "mixed_type": false,
+      "constant": false
+    },
+    "city": {
+      "missing_count": 1,
+      "missing_positions_sample": [
+        28
+      ],
+      "missing_pct": 0.2,
+      "unique_count": 54,
+      "mixed_type": true,
+      "constant": false
+    },
+    "state": {
+      "missing_count": 0,
+      "missing_positions_sample": [],
+      "missing_pct": 0.0,
+      "unique_count": 16,
+      "mixed_type": false,
+      "constant": false
+    },
+    "construction_year": {
+      "missing_count": 0,
+      "missing_positions_sample": [],
+      "missing_pct": 0.0,
+      "unique_count": 79,
+      "mixed_type": true,
+      "constant": false
+    },
+    "floors": {
+      "missing_count": null
+    },
+    "area_sqft": {
+      "missing_count": null
+    },
+    "bedrooms": {
+      "missing_count": null
+    },
+    "bathrooms": {
+      "missing_count": null
+    },
+    "material": {
+      "missing_count": 0,
+      "missing_positions_sample": [],
+      "missing_pct": 0.0,
+      "unique_count": 8,
+      "mixed_type": false,
+      "constant": false
+    },
+    "contractor": {
+      "missing_count": 0,
+      "missing_positions_sample": [],
+      "missing_pct": 0.0,
+      "unique_count": 17,
+      "mixed_type": true,
+      "constant": false
+    },
+    "permit_status": {
+      "missing_count": 0,
+      "missing_positions_sample": [],
+      "missing_pct": 0.0,
+      "unique_count": 4,
+      "mixed_type": false,
+      "constant": false
+    },
+    "zipcode": {
+      "missing_count": 33,
+      "missing_positions_sample": [
+        2,
+        5,
+        44,
+        49,
+        72,
+        77,
+        83,
+        84,
+        85,
+        100,
+        104,
+        108,
+        184,
+        208,
+        232,
+        255,
+        259,
+        279,
+        291,
+        306
+      ],
+      "missing_pct": 6.6,
+      "unique_count": 457,
+      "mixed_type": true,
+      "constant": false
+    }
+  },
+  "suggestions": [
+    {
+      "column": "city",
+      "score": 0.451,
+      "reason": "1 nulls; common text column"
+    },
+    {
+      "column": "address",
+      "score": 0.35,
+      "reason": "common text column"
+    },
+    {
+      "column": "state",
+      "score": 0.35,
+      "reason": "common text column"
+    },
+    {
+      "column": "zipcode",
+      "score": 0.133,
+      "reason": "33 nulls"
+    }
+  ],
+  "plain_language_suggestions": [
+    {
+      "text": "Column 'city' may need cleaning: 1 nulls; common text column. Suggested action: normalize values (trim, lowercase), dedupe similar values, and merge variants.",
+      "source": "suggestions"
+    },
+    {
+      "text": "Column 'address' may need cleaning: common text column. Suggested action: normalize values (trim, lowercase), dedupe similar values, and merge variants.",
+      "source": "suggestions"
+    },
+    {
+      "text": "Column 'state' may need cleaning: common text column. Suggested action: normalize values (trim, lowercase), dedupe similar values, and merge variants.",
+      "source": "suggestions"
+    },
+    {
+      "text": "Column 'zipcode' may need cleaning: 33 nulls. Suggested action: normalize values (trim, lowercase), dedupe similar values, and merge variants.",
+      "source": "suggestions"
+    },
+    {
+      "text": "Column 'city' has 1 missing/empty values. Suggestion: impute missing values (mean/median/mode) or mark as unknown; review policy.",
+      "source": "diagnostics"
+    },
+    {
+      "text": "Column 'city' contains mixed types. Suggestion: coerce to the intended type (e.g., numeric) and coerce unparsable values to null for review.",
+      "source": "diagnostics"
+    },
+    {
+      "text": "Column 'construction_year' contains mixed types. Suggestion: coerce to the intended type (e.g., numeric) and coerce unparsable values to null for review.",
+      "source": "diagnostics"
+    },
+    {
+      "text": "Column 'contractor' contains mixed types. Suggestion: coerce to the intended type (e.g., numeric) and coerce unparsable values to null for review.",
+      "source": "diagnostics"
+    },
+    {
+      "text": "Column 'zipcode' has 33 missing/empty values. Suggestion: impute missing values (mean/median/mode) or mark as unknown; review policy.",
+      "source": "diagnostics"
+    },
+    {
+      "text": "Column 'zipcode' contains mixed types. Suggestion: coerce to the intended type (e.g., numeric) and coerce unparsable values to null for review.",
+      "source": "diagnostics"
+    }
+  ]
+}
+Extracted suggestion text: samples/test_data/generated_house_data_02.csv
+Recipe+preview response:
+{
+  "recipe": {
+    "sources": [
+      {
+        "path": "samples/test_data/generated_house_data_02.csv"
+      }
+    ],
+    "cleaning_steps": [
+      {
+        "action": "impute",
+        "column": "city",
+        "params": {
+          "strategy": "empty_string"
+        }
+      }
+    ],
+    "joins": [],
+    "outputs": [
+      {
+        "path": "output.csv"
+      }
+    ]
+  },
+  "recipe_json_str": "{\n  \"sources\": [\n    {\n      \"path\": \"samples/test_data/generated_house_data_02.csv\"\n    }\n  ],\n  \"cleaning_steps\": [\n    {\n      \"action\": \"impute\",\n      \"column\": \"city\",\n      \"params\": {\n        \"strategy\": \"empty_string\"\n      }\n    }\n  ],\n  \"joins\": [],\n  \"outputs\": [\n    {\n      \"path\": \"output.csv\"\n    }\n  ]\n}",
+  "preview": {
+    "before": [
+      {
+        "building_id": "B020000",
+        "address": "3543 Pine St",
+        "city": "Toledo",
+        "state": "OH",
+        "construction_year": "1980",
+        "floors": 2,
+        "area_sqft": 681,
+        "bedrooms": 5,
+        "bathrooms": 4,
+        "material": "Brick",
+        "contractor": "Acme Constructions",
+        "permit_status": "denied",
+        "zipcode": "Flint"
+      },
+      {
+        "building_id": "B020001",
+        "address": "6808 Elm St",
+        "city": "Philadelphia",
+        "state": "PA",
+        "construction_year": "2017",
+        "floors": 3,
+        "area_sqft": 3436,
+        "bedrooms": 5,
+        "bathrooms": 3,
+        "material": "Wood",
+        "contractor": "Homestead Co",
+        "permit_status": "unknown",
+        "zipcode": null
+      },
+      {
+        "building_id": "B020002",
+        "address": "1451 Maple St",
+        "city": "Jacksonville",
+        "state": "FL",
+        "construction_year": "1983",
+        "floors": 3,
+        "area_sqft": 7329,
+        "bedrooms": 4,
+        "bathrooms": 3,
+        "material": "Wood",
+        "contractor": "PrimeConstruct",
+        "permit_status": "unknown",
+        "zipcode": "53896-6133"
+      },
+      {
+        "building_id": "B020003",
+        "address": "1679 Elm St",
+        "city": "75638",
+        "state": "TX",
+        "construction_year": "1959",
+        "floors": 2,
+        "area_sqft": 5709,
+        "bedrooms": 3,
+        "bathrooms": 3,
+        "material": "Concrete",
+        "contractor": "Acme Constructions",
+        "permit_status": "unknown",
+        "zipcode": "Dallas"
+      },
+      {
+        "building_id": "B020004",
+        "address": "7924 Elm St",
+        "city": "Fresno",
+        "state": "CA",
+        "construction_year": "2003",
+        "floors": 5,
+        "area_sqft": 4344,
+        "bedrooms": 3,
+        "bathrooms": 2,
+        "material": "Mixed",
+        "contractor": "Homestead Co",
+        "permit_status": "unknown",
+        "zipcode": null
+      }
+    ],
+    "after": [
+      {
+        "building_id": "B020000",
+        "address": "3543 Pine St",
+        "city": "Toledo",
+        "state": "OH",
+        "construction_year": "1980",
+        "floors": 2,
+        "area_sqft": 681,
+        "bedrooms": 5,
+        "bathrooms": 4,
+        "material": "Brick",
+        "contractor": "Acme Constructions",
+        "permit_status": "denied",
+        "zipcode": "Flint"
+      },
+      {
+        "building_id": "B020001",
+        "address": "6808 Elm St",
+        "city": "Philadelphia",
+        "state": "PA",
+        "construction_year": "2017",
+        "floors": 3,
+        "area_sqft": 3436,
+        "bedrooms": 5,
+        "bathrooms": 3,
+        "material": "Wood",
+        "contractor": "Homestead Co",
+        "permit_status": "unknown",
+        "zipcode": null
+      },
+      {
+        "building_id": "B020002",
+        "address": "1451 Maple St",
+        "city": "Jacksonville",
+        "state": "FL",
+        "construction_year": "1983",
+        "floors": 3,
+        "area_sqft": 7329,
+        "bedrooms": 4,
+        "bathrooms": 3,
+        "material": "Wood",
+        "contractor": "PrimeConstruct",
+        "permit_status": "unknown",
+        "zipcode": "53896-6133"
+      },
+      {
+        "building_id": "B020003",
+        "address": "1679 Elm St",
+        "city": "75638",
+        "state": "TX",
+        "construction_year": "1959",
+        "floors": 2,
+        "area_sqft": 5709,
+        "bedrooms": 3,
+        "bathrooms": 3,
+        "material": "Concrete",
+        "contractor": "Acme Constructions",
+        "permit_status": "unknown",
+        "zipcode": "Dallas"
+      },
+      {
+        "building_id": "B020004",
+        "address": "7924 Elm St",
+        "city": "Fresno",
+        "state": "CA",
+        "construction_year": "2003",
+        "floors": 5,
+        "area_sqft": 4344,
+        "bedrooms": 3,
+        "bathrooms": 2,
+        "material": "Mixed",
+        "contractor": "Homestead Co",
+        "permit_status": "unknown",
+        "zipcode": null
+      }
+    ],
+    "warnings": [],
+    "types_before": {
+      "building_id": "String",
+      "address": "String",
+      "city": "String",
+      "state": "String",
+      "construction_year": "String",
+      "floors": "Int64",
+      "area_sqft": "Int64",
+      "bedrooms": "Int64",
+      "bathrooms": "Int64",
+      "material": "String",
+      "contractor": "String",
+      "permit_status": "String",
+      "zipcode": "String"
+    },
+    "types_after": {
+      "building_id": "String",
+      "address": "String",
+      "city": "String",
+      "state": "String",
+      "construction_year": "String",
+      "floors": "Int64",
+      "area_sqft": "Int64",
+      "bedrooms": "Int64",
+      "bathrooms": "Int64",
+      "material": "String",
+      "contractor": "String",
+      "permit_status": "String",
+      "zipcode": "String"
+    },
+    "type_changes": {}
+  }
+}
+
+Completed script.

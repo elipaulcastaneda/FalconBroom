@@ -1,0 +1,22 @@
+============================= test session starts =============================
+platform win32 -- Python 3.14.0, pytest-9.0.2, pluggy-1.6.0 -- C:\Python314\python.exe
+cachedir: .pytest_cache
+rootdir: C:\Users\Elijah\FalconBroom
+plugins: anyio-4.13.0, recording-0.13.0
+collecting ... CWD: C:\Users\Elijah\FalconBroom
+FILES: ['.env', '.env.sample', '.git', '.gitattributes', '.github', '.gitignore', '.pytest_cache', '.venv', 'asgi_test.py', 'check_syntax.py', 'client_early_failures.jsonl', 'conn_9360.log', 'curl_3009.log', 'curl_3009_after_lifespan_off.log', 'curl_health_output.txt', 'data', 'debug_admin_call_output.txt', 'debug_env_output.txt', 'deploy', 'design.md', 'Dockerfile', 'docs', 'fbroom', 'fixed_out.csv', 'frontend', 'history.zip', 'import_test.py', 'Makefile', 'netstat_3009.log', 'netstat_3009_now.log', 'netstat_3009_ps.log', 'netstat_abn.log', 'netstat_abn_after_lifespan_off.log', 'netstat_abn_elev.log', 'netstat_abn_elev_hits.log', 'output_from_text.csv', 'out_test.csv', 'package-lock.json', 'packaged_debug_loop.log', 'preview.json', 'PRIVACY.md', 'probe_3009.log', 'pytest_multi_out.txt', 'py_procs.log', 'query', 'README.md', 'README_SESSIONS.md', 'recipe.json', 'recipe_for_e30903e3.json', 'RELEASE_CHECKLIST.md', 'RENDER_DEPLOY.md', 'requirements.txt', 'run_fb_app.py', 'run_uv.log', 'run_uvicorn_deepdebug.log', 'run_uvicorn_run1.log', 'run_uvicorn_run2.log', 'run_uvicorn_single.pid', 'run_uv_capture.err.log', 'run_uv_capture.log', 'run_uv_capture.out.log', 'run_uv_default.log', 'run_uv_faulthandler.log', 'run_uv_foreground.log', 'run_uv_lifespan_off.err', 'run_uv_lifespan_off.log', 'run_uv_lifespan_off.out', 'run_uv_log.txt', 'run_uv_no_lifespan.log', 'run_uv_retry.log', 'run_uv_single.log', 'run_uv_stream.err.log', 'run_uv_stream.out.log', 'run_uv_test.log', 'samples', 'scripts', 'server_watch.log', 'src-tauri', 'supabase', 'tests', 'tmp_bind_test.py', 'tmp_uv_app.log', 'tmp_uv_app.py', 'tools', 'uvicorn_err.log', 'uvicorn_out.log', 'uv_procs.log', '__pycache__']
+sys.path:
+ - C:\Users\Elijah\FalconBroom\tests
+ - C:\Users\Elijah\FalconBroom
+ - C:\Python314\python314.zip
+ - C:\Python314\DLLs
+ - C:\Python314\Lib
+ - C:\Python314
+ - C:\Users\Elijah\AppData\Roaming\Python\Python314\site-packages
+ - C:\Python314\Lib\site-packages
+
+Package dirs matching fbroom:
+found at .\fbroom
+collected 0 items
+
+============================ no tests ran in 0.04s ============================

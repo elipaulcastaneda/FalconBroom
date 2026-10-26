@@ -47,7 +47,8 @@ import re
 import csv
 import shutil
 import hashlib
-from .ingest import convert_uploaded_file
+from .ingest import convert_uploaded_file, generate_plain_language_suggestions
+from .step_catalog import TEMPLATE_ACTIONS, parse_instruction, parse_machine_template
 from .ingest import _google_drive_access_token
 from .recipe_schema import Recipe
 from typing import Optional, Any, List
@@ -82,6 +83,14 @@ except Exception:
     generate_latest = None
     CONTENT_TYPE_LATEST = 'text/plain; version=0.0.4'
     Counter = None
+# create preview requests counter if prometheus client available
+if Counter is not None:
+    try:
+        PREVIEW_COUNTER = Counter('fbroom_preview_requests_total', 'Total preview requests handled')
+    except Exception:
+        PREVIEW_COUNTER = None
+else:
+    PREVIEW_COUNTER = None
 # pydantic models used below
 
 app = FastAPI(title="FalconBroom Prototype API")
@@ -227,7 +236,16 @@ def _find_jwk_for_kid(jwks: dict, kid: str):
 
 # Prometheus counters for per-recipe runs (optional)
 if Counter is not None:
-    RECIPE_RUNS = Counter('fbroom_recipe_runs_total', 'Total recipe runs by recipe and status', ['recipe_id', 'status'])
+    try:
+        RECIPE_RUNS = Counter('fbroom_recipe_runs_total', 'Total recipe runs by recipe and status', ['recipe_id', 'status'])
+    except Exception:
+        # If metrics were already registered (e.g., tests re-importing module), reuse existing collector if possible.
+        try:
+            from prometheus_client import REGISTRY
+            names_map = getattr(REGISTRY, '_names_to_collectors', {})
+            RECIPE_RUNS = names_map.get('fbroom_recipe_runs_total') or names_map.get('fbroom_recipe_runs') or None
+        except Exception:
+            RECIPE_RUNS = None
 else:
     RECIPE_RUNS = None
 
@@ -591,6 +609,7 @@ class TextRecipeSpec(BaseModel):
     instruction: str
     source_path: str
     output_path: str = "output.csv"
+    suggested_steps: Optional[list[dict[str, Any]]] = None
     regression_model: Optional[str] = None
     regression_features: Optional[list] = None
     regression_group_by: Optional[str] = None
@@ -808,12 +827,17 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
                 resp['inspect_preview'] = conversion.get('inspect_preview')
             if conversion.get('suggestions') is not None:
                 resp['suggestions'] = conversion.get('suggestions')
+            # include plain-language suggestions generated at conversion time
+            if conversion.get('plain_language_suggestions') is not None:
+                resp['plain_language_suggestions'] = conversion.get('plain_language_suggestions')
         except Exception:
             pass
         return resp
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception('Unhandled error in /debug/recipe_from_text')
+        # Return a concise error message but ensure the stacktrace is logged.
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -853,39 +877,236 @@ def resolve_source_endpoint(spec: SourceResolveSpec):
 def suggest(spec: SourceSpec):
     try:
         profile = cleaner.profile(spec.path)
-        suggestions = cleaner.suggest_fixes(profile)
+        # get a sample of rows to allow cross-column type inference (move/swap suggestions)
+        inspection = cleaner.inspect_source(spec.path, offset=0, limit=500)
+        sample_rows = inspection.get('rows') if isinstance(inspection, dict) else None
+        suggestions = cleaner.suggest_fixes(profile, sample_rows=sample_rows, path=spec.path)
         return {"suggestions": suggestions}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/debug/recipe_from_text")
-def debug_recipe_from_text(spec: TextRecipeSpec):
-    """Debug endpoint: return the deterministic recipe generated from plain English and a small preview.
+@app.post("/metadata")
+def metadata(spec: SourceSpec):
+    """Return persisted metadata for a normalized upload and regenerate suggestions if missing.
 
-    Useful for verifying the backend's NL->recipe logic from the frontend.
+    This endpoint is useful for the frontend to fetch the upload's diagnostics and
+    editable plain-English suggestions after upload or on-demand.
     """
     try:
-        profile = cleaner.profile(spec.source_path)
-        recipe = recipe_from_plain_english(spec.instruction, profile, spec.source_path, spec.output_path)
-        # pydantic model to dict (support v1/v2)
+        path = spec.path
+        metadata = {}
         try:
-            recipe_json = recipe.model_dump()
+            md_path = Path(path).with_suffix('.json')
+            if md_path.exists():
+                try:
+                    metadata = json.loads(md_path.read_text(encoding='utf-8'))
+                except Exception:
+                    metadata = {}
         except Exception:
-            try:
-                recipe_json = recipe.dict()
-            except Exception:
-                recipe_json = json.loads(json.dumps(recipe, default=str))
+            metadata = {}
 
-        preview = cleaner.preview_recipe(recipe, n=5)
-        # also provide a full serialized JSON string for UI consumption
+        # ensure basic fields
+        metadata.setdefault('normalized_path', path)
+        metadata['path'] = path
+
+        # populate profile/inspect if absent
         try:
-            recipe_json_str = json.dumps(recipe_json, indent=2, ensure_ascii=False)
+            if 'profile' not in metadata:
+                metadata['profile'] = cleaner.profile(path)
+        except Exception:
+            pass
+        try:
+            if 'inspect_preview' not in metadata:
+                metadata['inspect_preview'] = cleaner.inspect_source(path, offset=0, limit=20)
+                try:
+                    metadata['diagnostics'] = metadata['inspect_preview'].get('diagnostics') if isinstance(metadata.get('inspect_preview'), dict) else None
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # suggestions from profile if missing
+        try:
+            if 'suggestions' not in metadata and isinstance(metadata.get('profile'), dict):
+                metadata['suggestions'] = [
+                    {"column": col, "score": score, "reason": reason}
+                    for col, score, reason in suggest_columns_to_clean(metadata.get('profile'))
+                ]
+        except Exception:
+            pass
+
+        # generate plain-language suggestions using ingest helper
+        try:
+            metadata['plain_language_suggestions'] = generate_plain_language_suggestions(metadata)
+        except Exception:
+            metadata.setdefault('plain_language_suggestions', [])
+
+        return {"metadata": metadata}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/debug/recipe_from_text")
+async def debug_recipe_from_text(request: Request):
+    """Debug endpoint: accept either a plain-English `instruction` (string) or a
+    deterministic `json_step` (dict). When `json_step` is provided the server
+    will build a `Recipe` containing that single step and return a preview.
+    """
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON body: {exc}")
+
+    try:
+        # Support: { instruction: <str> , source_path: <path>, output_path: <path> }
+        # or: { json_step: <dict>, source_path: <path>, output_path: <path> }
+        instruction = payload.get('instruction')
+        json_step = payload.get('json_step')
+        # Accept alternative key names for structured step payloads
+        if json_step is None:
+            for alt in ('jsonStep', 'json-step', 'step', 'action_step'):
+                if alt in payload:
+                    json_step = payload.get(alt)
+                    break
+        # If json_step is a JSON string, attempt to parse it
+        if isinstance(json_step, str):
+            try:
+                parsed = json.loads(json_step)
+                json_step = parsed
+            except Exception:
+                # leave as-is (will be rejected later)
+                pass
+        # If caller passed a dict as `instruction`, treat it as `json_step`
+        if isinstance(instruction, dict) and not json_step:
+            json_step = instruction
+            instruction = None
+
+        source_path = payload.get('source_path') or payload.get('sourcePath') or payload.get('source')
+        output_path = payload.get('output_path') or payload.get('outputPath') or payload.get('output') or 'output.csv'
+
+        recipe = None
+        recipe_json = None
+
+        if json_step is not None:
+            # Build a minimal recipe dict containing the single provided step
+            recipe_json = {
+                'cleaning_steps': [json_step],
+                'sources': [{'path': source_path}] if source_path else [],
+                'outputs': [],
+                'output_path': output_path,
+            }
+            try:
+                recipe = Recipe.model_validate(recipe_json)
+            except Exception:
+                try:
+                    recipe = Recipe(**recipe_json)
+                except Exception:
+                    # Fall back to keeping recipe_json as-is and let preview handle dict
+                    recipe = None
+        else:
+            if not instruction or not source_path:
+                raise HTTPException(status_code=400, detail='instruction (string) and source_path are required when json_step is not provided')
+            # Fallback to existing NL->recipe pathway
+            profile = cleaner.profile(source_path)
+            recipe = recipe_from_plain_english(instruction, profile, source_path, output_path)
+            try:
+                recipe_json = recipe.model_dump()
+            except Exception:
+                try:
+                    recipe_json = recipe.dict()
+                except Exception:
+                    recipe_json = json.loads(json.dumps(recipe, default=str))
+
+        # Defensive sanitization: same as before (keep behavior for map steps)
+        try:
+            if recipe is None and isinstance(recipe_json, dict):
+                # rebuild pydantic Recipe if possible
+                try:
+                    recipe = Recipe.model_validate(recipe_json)
+                except Exception:
+                    try:
+                        recipe = Recipe(**recipe_json)
+                    except Exception:
+                        recipe = None
+
+            recipe_dict = recipe_json if isinstance(recipe_json, dict) else (recipe_json if hasattr(recipe_json, 'copy') else dict(recipe_json)) if recipe_json is not None else {}
+            cs = recipe_dict.get('cleaning_steps') or []
+            sanitized = []
+            forbidden_tokens = set(['coerce', 'convert', 'cast', 'the', 'values', 'unparsable', 'intended', 'type'])
+            prof_for_check = None
+            try:
+                prof_for_check = cleaner.profile(source_path) if source_path else None
+            except Exception:
+                prof_for_check = None
+            for step in cs:
+                try:
+                    if (step.get('action') == 'map'):
+                        params = step.get('params') or {}
+                        col = step.get('column')
+                        if not col or (prof_for_check and col not in prof_for_check):
+                            continue
+                        allowed_param_keys = set(['mapping', 'map'])
+                        param_keys = set(params.keys())
+                        mapping = {}
+                        if 'mapping' in params and isinstance(params.get('mapping'), dict):
+                            mapping = params.get('mapping')
+                        elif 'map' in params and isinstance(params.get('map'), dict):
+                            mapping = params.get('map')
+                        elif 'mapping' in step and isinstance(step.get('mapping'), dict):
+                            mapping = step.get('mapping')
+                        else:
+                            if param_keys and not (param_keys <= allowed_param_keys):
+                                continue
+                        bad = False
+                        for k, v in (mapping.items() if isinstance(mapping, dict) else []):
+                            ks = str(k).strip().lower()
+                            vs = str(v).strip().lower()
+                            if ks in forbidden_tokens or vs in forbidden_tokens or len(ks) <= 1 or len(vs) <= 1:
+                                bad = True
+                                break
+                        if bad:
+                            continue
+                    sanitized.append(step)
+                except Exception:
+                    sanitized.append(step)
+            if isinstance(recipe_json, dict):
+                recipe_json['cleaning_steps'] = sanitized
+            # rebuild pydantic Recipe if we modified recipe_json
+            try:
+                if recipe is None and isinstance(recipe_json, dict):
+                    recipe = Recipe.model_validate(recipe_json)
+            except Exception:
+                try:
+                    if recipe is None and isinstance(recipe_json, dict):
+                        recipe = Recipe(**recipe_json)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Compute preview
+        preview = cleaner.preview_recipe(
+            recipe if recipe is not None else recipe_json,
+            n=5,
+            source_path=source_path,
+        )
+        try:
+            if PREVIEW_COUNTER is not None:
+                PREVIEW_COUNTER.inc()
+        except Exception:
+            pass
+
+        try:
+            recipe_json_str = json.dumps(recipe_json, indent=2, ensure_ascii=False) if recipe_json is not None else None
             logger.debug('DEBUG RECIPE JSON: %s', recipe_json_str)
         except Exception:
             recipe_json_str = None
             logger.debug('DEBUG RECIPE JSON (non-serializable)')
+
         return {"recipe": recipe_json, "recipe_json_str": recipe_json_str, "preview": preview}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1221,7 +1442,45 @@ def recipe_from_text(spec: TextRecipeSpec):
                 "features": spec.regression_features,
                 "group_by": spec.regression_group_by or None,
             }
-        recipe = recipe_from_plain_english(spec.instruction, profile, spec.source_path, spec.output_path, regression_options=reg_opts)
+        # Template lines and catalog clauses map 1:1 to steps and bypass the legacy NL heuristics.
+        template_steps = list(spec.suggested_steps or [])
+        if not spec.suggested_steps:
+            template_heads = "|".join(TEMPLATE_ACTIONS)
+            for line in (spec.instruction or "").splitlines():
+                if re.match(rf"^\s*(?:{template_heads})(?:\s+\w+=|\s*$)", line, flags=re.IGNORECASE):
+                    st = parse_machine_template(line)
+                    if st:
+                        template_steps.append(st)
+            if not template_steps:
+                template_steps = parse_instruction(spec.instruction, list(profile.keys())) or []
+        if template_steps:
+            allowed_actions = {
+                "normalize", "unicode_normalize", "regex_replace", "map", "cast", "impute",
+                "replace", "numeric_transform", "deduplicate", "drop_column", "rename",
+                "conditional", "bucketize", "remove_by_type", "move_by_type", "swap_by_types",
+            }
+            valid_columns = set(profile.keys())
+            checked_steps = []
+            for step in template_steps:
+                if not isinstance(step, dict) or step.get("action") not in allowed_actions:
+                    raise HTTPException(status_code=400, detail="Suggested recipe contains an unsupported action")
+                step_cols = step.get("column")
+                step_cols = [step_cols] if isinstance(step_cols, str) else list(step_cols or [])
+                params = step.get("params") or {}
+                step_cols += [params[k] for k in ("source", "target") if isinstance(params.get(k), str)]
+                for col in step_cols:
+                    if col and col not in valid_columns:
+                        raise HTTPException(status_code=400, detail=f"Suggested recipe references unknown column: {col}")
+                checked_steps.append(step)
+            # Clean text first, then cast, then scale/round, then impute, then row/column removal, whatever order they were clicked in.
+            phase = {
+                'normalize': 0, 'unicode_normalize': 0, 'regex_replace': 0, 'replace': 0, 'map': 0, 'move_by_type': 0, 'swap_by_types': 0,
+                'cast': 1, 'numeric_transform': 2, 'bucketize': 2, 'impute': 3, 'deduplicate': 4, 'rename': 5, 'drop_column': 6,
+            }
+            checked_steps.sort(key=lambda step: phase.get(step.get('action'), 1))
+            recipe = Recipe(sources=[{"path": spec.source_path}], cleaning_steps=checked_steps, joins=[], outputs=[{"path": spec.output_path}])
+        else:
+            recipe = recipe_from_plain_english(spec.instruction, profile, spec.source_path, spec.output_path, regression_options=reg_opts)
         explanations = explain_recipe(recipe, profile)
         # ensure parser output does not include metadata-targeting steps
         try:
@@ -1309,7 +1568,47 @@ def recipe_from_text(spec: TextRecipeSpec):
             recipe_json_str = None
             logger.debug('Generated recipe returned (non-serializable)')
 
-        return {
+        # Attempt to generate a lightweight preview for the UI. Preview generation
+        # may be expensive or fail if the recipe is invalid; capture and log any
+        # exception so callers can surface an explanation for why no preview
+        # was returned (helps debug why the frontend shows no before/after).
+        preview = None
+        preview_error = None
+        try:
+            # Reconstruct a Recipe model from the sanitized dict for preview
+            try:
+                recipe_obj = Recipe.model_validate(recipe_dict) if hasattr(Recipe, 'model_validate') else Recipe(**recipe_dict)
+            except Exception:
+                try:
+                    recipe_obj = Recipe(**recipe_dict)
+                except Exception as e:
+                    recipe_obj = None
+                    preview_error = f"recipe_validation_failed: {e}"
+                    logger.exception('Failed to validate recipe for preview: %s', e)
+
+            if recipe_obj is not None:
+                try:
+                    preview = cleaner.preview_recipe(recipe_obj, n=5)
+                except Exception as e:
+                    preview = None
+                    preview_error = f"preview_generation_failed: {e}"
+                    logger.exception('Failed to generate preview for recipe_from_text: %s', e)
+            else:
+                # If model validation failed, try a best-effort preview using the
+                # sanitized dict and the provided source path as fallback.
+                try:
+                    preview = cleaner.preview_recipe(recipe_dict, n=5, source_path=spec.source_path)
+                except Exception as e:
+                    preview = None
+                    if not preview_error:
+                        preview_error = f"preview_generation_failed_dict: {e}"
+                    logger.exception('Failed to generate preview from dict for recipe_from_text: %s', e)
+        except Exception as e:
+            preview = None
+            preview_error = f"unexpected_preview_error: {e}"
+            logger.exception('Unexpected error during preview attempt: %s', e)
+
+        result = {
             "instruction": spec.instruction,
             "action": infer_action(spec.instruction),
             "column_candidates": column_candidates,
@@ -1323,11 +1622,15 @@ def recipe_from_text(spec: TextRecipeSpec):
                 }
                 for exp in explanations
             ],
+            "preview": preview,
+            "preview_error": preview_error,
             "server": {
                 "pid": os.getpid(),
                 "time": datetime.now(timezone.utc).isoformat(),
             },
         }
+
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1480,7 +1783,42 @@ def _apply_step_preview(df, step, n=5):
     except Exception:
         after_vals = list(before_vals)
 
-    return {"column": col, "before": before_vals, "after": after_vals}
+    # determine types for the preview column before/after when possible
+    before_type = None
+    after_type = None
+    try:
+        if hasattr(sample, 'columns') and col in (sample.columns if hasattr(sample, 'columns') else []):
+            if _is_polars_df(sample):
+                try:
+                    before_type = str(sample.select(pl.col(col)).to_series().dtype)
+                except Exception:
+                    before_type = None
+        elif isinstance(sample, list) and len(sample) > 0 and isinstance(sample[0], dict):
+            try:
+                v = sample[0].get(col)
+                before_type = type(v).__name__ if v is not None else None
+            except Exception:
+                before_type = None
+    except Exception:
+        before_type = None
+
+    try:
+        if 'df2' in locals() and hasattr(df2, 'columns') and col in (df2.columns if hasattr(df2, 'columns') else []):
+            if _is_polars_df(df2):
+                try:
+                    after_type = str(df2.select(pl.col(col)).to_series().dtype)
+                except Exception:
+                    after_type = None
+        elif isinstance(df2, list) and len(df2) > 0 and isinstance(df2[0], dict):
+            try:
+                v = df2[0].get(col)
+                after_type = type(v).__name__ if v is not None else None
+            except Exception:
+                after_type = None
+    except Exception:
+        after_type = None
+
+    return {"column": col, "before": before_vals, "after": after_vals, "before_type": before_type, "after_type": after_type}
 
 
 

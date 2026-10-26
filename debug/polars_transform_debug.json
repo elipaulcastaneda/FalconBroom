@@ -1,0 +1,25 @@
+{
+  "is_polars": true,
+  "dtypes": {
+    "event_id": "String",
+    "species": "String",
+    "lat": "Float64",
+    "lon": "Float64",
+    "count": "Int64",
+    "observed_at": "Datetime(time_unit='us', time_zone=None)"
+  },
+  "before": [
+    "badger",
+    "badger",
+    "badger",
+    "badger",
+    "badger"
+  ],
+  "after": [
+    "badger",
+    "badger",
+    "badger",
+    "badger",
+    "badger"
+  ]
+}
