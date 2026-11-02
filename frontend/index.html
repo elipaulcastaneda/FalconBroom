@@ -24,9 +24,9 @@
         <div id="fb-loader-text">Starting backend, please wait...</div>
       </div>
     </div>
-    <script>
+    <script type="module">
       (function(){
-        const MAX_WAIT_MS = 30000;
+        const MAX_WAIT_MS = 120000;
         const POLL_MS = 250;
         const start = Date.now();
 
@@ -106,10 +106,7 @@
                 // flush any early failures to host and then load main app
                 await flushEarlyFailures();
                 removeLoader();
-                const s = document.createElement('script');
-                s.type = 'module';
-                s.src = '/src/main.jsx';
-                document.body.appendChild(s);
+                await import('/src/main.jsx');
                 return;
               }
             }
@@ -119,10 +116,7 @@
           // on fallback, flush captured failures then load app
           await flushEarlyFailures();
           removeLoader();
-          const s = document.createElement('script');
-          s.type = 'module';
-          s.src = '/src/main.jsx';
-          document.body.appendChild(s);
+          await import('/src/main.jsx');
         })();
       })();
     </script>
