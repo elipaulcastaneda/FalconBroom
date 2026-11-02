@@ -9,9 +9,15 @@ use keyring::Entry;
 
 struct BackendChild(Arc<Mutex<Option<Child>>>);
 
+struct BackendPort(u16);
+
 impl BackendChild {
-    fn new(child: Child) -> Self {
-        BackendChild(Arc::new(Mutex::new(Some(child))))
+    fn empty() -> Self {
+        BackendChild(Arc::new(Mutex::new(None)))
+    }
+
+    fn set(&self, child: Child) {
+        *self.0.lock().unwrap() = Some(child);
     }
 
     fn kill(&self) {
@@ -71,40 +77,57 @@ fn find_project_venv_python() -> Option<PathBuf> {
 
 fn find_python_executable() -> Result<PathBuf, String> {
     find_project_venv_python().ok_or_else(|| {
-        "No .venv Python found at the project root. Expected C:/Users/Elijah/FalconBroom/.venv/Scripts/python.exe".into()
+        "No bundled backend found next to the app and no .venv Python at the project root (dev only).".into()
     })
 }
 
-fn spawn_backend() -> Result<Child, String> {
-    let python = find_python_executable()?;
+fn free_port() -> Result<u16, String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| format!("No free port: {}", e))?;
+    listener.local_addr().map(|a| a.port()).map_err(|e| e.to_string())
+}
 
-    let workdir = project_root().unwrap_or_else(|| std::env::current_dir().unwrap());
+// The installed app ships the backend as a sidecar executable next to the main binary.
+fn find_bundled_backend() -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let name = if cfg!(target_os = "windows") { "falconbroom-backend.exe" } else { "falconbroom-backend" };
+    let p = dir.join(name);
+    if p.exists() { Some(p) } else { None }
+}
 
-    // Prefer running our safe, in-repo runner which contains the lifespan-off
-    // defaults, wait-for-listen logic and diagnostics. If the script is not
-    // present for any reason, fall back to `-m uvicorn` as before.
-    let mut cmd = Command::new(&python);
-    let script_path = workdir.join("scripts").join("run_uvicorn_single.py");
-    if script_path.exists() {
-        cmd.arg(script_path);
+fn spawn_backend(port: u16, data_dir: &std::path::Path) -> Result<Child, String> {
+    let parent_pid = std::process::id().to_string();
+    let port_s = port.to_string();
+
+    let mut cmd = if let Some(exe) = find_bundled_backend() {
+        std::fs::create_dir_all(data_dir).map_err(|e| format!("Cannot create data dir: {}", e))?;
+        let mut c = Command::new(exe);
+        c.arg("--port").arg(&port_s)
+            .arg("--data-dir").arg(data_dir)
+            .arg("--parent-pid").arg(&parent_pid);
+        c
     } else {
-        cmd.args(&["-m", "uvicorn", "fbroom.main:app", "--port", "3009", "--host", "127.0.0.1"]);
+        // Development: run the backend from the repo's virtualenv.
+        let python = find_python_executable()?;
+        let workdir = project_root().unwrap_or_else(|| std::env::current_dir().unwrap());
+        let mut c = Command::new(&python);
+        c.args(&["-m", "fbroom.sidecar", "--port"]).arg(&port_s)
+            .arg("--parent-pid").arg(&parent_pid)
+            .current_dir(workdir);
+        c
+    };
+
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-
-    // For local packaged/dev runs, prefer disabling ASGI lifespan to avoid
-    // the observed race. Also preserve a clean background execution.
-    cmd.current_dir(workdir)
-        .env("LIFESPAN_OFF", "1")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    let child = cmd.spawn().map_err(|e| format!("Failed to spawn backend: {}", e))?;
-    Ok(child)
+    cmd.spawn().map_err(|e| format!("Failed to spawn backend: {}", e))
 }
 
 // Command exposed to frontend: opens native file dialog and posts the selected path to the backend /profile endpoint.
 #[tauri::command]
-fn pick_file_and_profile() -> Result<Value, String> {
+fn pick_file_and_profile(port: tauri::State<'_, BackendPort>) -> Result<Value, String> {
     let path = rfd::FileDialog::new()
         .add_filter("CSV", &["csv"])
         .pick_file();
@@ -117,7 +140,7 @@ fn pick_file_and_profile() -> Result<Value, String> {
     // Call backend /profile. Prefer remote backend URL if provided via env var.
     let client = reqwest::blocking::Client::new();
     let env_base = std::env::var("FALCONBROOM_BACKEND_URL");
-    let base = env_base.clone().unwrap_or_else(|_| "http://127.0.0.1:3009".to_string());
+    let base = env_base.clone().unwrap_or_else(|_| format!("http://127.0.0.1:{}", port.0));
     let url = format!("{}/profile", base.trim_end_matches('/'));
 
     let resp = if env_base.is_ok() {
@@ -220,54 +243,33 @@ fn frontend_log(payload: String) -> Result<bool, String> {
 }
 
 fn main() {
-        // Start backend process and keep handle in state.
-        // If `FALCONBROOM_BACKEND_URL` is set we assume a remote backend and skip spawning a local one.
-        let backend_child = if std::env::var("FALCONBROOM_BACKEND_URL").is_ok() {
-            None
-        } else {
-            match spawn_backend() {
-                Ok(c) => {
-                    // After spawning the backend, perform a short health-check loop
-                    // to ensure the local server is accepting connections before
-                    // the webview loads. This prevents transient ERR_CONNECTION_REFUSED
-                    // in embedded webviews that may execute network requests immediately.
-                    let health_url = "http://127.0.0.1:3009/health";
-                    let mut healthy = false;
-                    for _ in 0..20 {
-                        // try a quick blocking request with short timeout
-                        if let Ok(resp) = reqwest::blocking::get(health_url) {
-                            if resp.status().is_success() {
-                                healthy = true;
-                                break;
-                            }
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(250));
-                    }
-                    if !healthy {
-                        eprintln!("Warning: backend health check failed or timed out; continuing anyway");
-                    }
-                    Some(BackendChild::new(c))
-                }
-                Err(e) => {
-                    eprintln!("Warning: could not start backend: {}", e);
-                    None
-                }
-            }
-        };
-
-    // Prepare a synchronous initialization script to set the backend URL before any
-    // web content executes. Use env override if present, otherwise default to
-    // the local backend URL we spawn.
+    // If `FALCONBROOM_BACKEND_URL` is set we assume a remote backend and skip spawning a local one.
     let env_base = std::env::var("FALCONBROOM_BACKEND_URL").ok();
-    let base = env_base.clone().unwrap_or_else(|| "http://127.0.0.1:3009".to_string());
-    // Escape single quotes in base just in case
+    let port = if env_base.is_some() { 0 } else { free_port().unwrap_or(3009) };
+    let base = env_base.clone().unwrap_or_else(|| format!("http://127.0.0.1:{}", port));
+
+    // Set the backend URL before any page script runs.
     let base_escaped = base.replace("'", "\\'");
     let init_js = format!("(function(){{try{{window.__FALCONBROOM_BACKEND_URL = '{}' ;}}catch(e){{}}}})();", base_escaped);
+    let start_page = if env_base.is_some() { "index.html" } else { "loading.html" };
+
+    let backend_child = BackendChild::empty();
+    let exit_handle = BackendChild(backend_child.0.clone());
 
     let builder = tauri::Builder::default()
         .manage(backend_child)
+        .manage(BackendPort(port))
         .invoke_handler(tauri::generate_handler![pick_file_and_profile, secure_store_get, secure_store_set, secure_store_delete])
         .setup(move |app| {
+            if env_base.is_none() {
+                // Data lives in the OS app-data directory, not next to the executable.
+                let data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir().join("FalconBroom"));
+                match spawn_backend(port, &data_dir) {
+                    Ok(c) => app.state::<BackendChild>().set(c),
+                    Err(e) => eprintln!("Warning: could not start backend: {}", e),
+                }
+            }
+
             // Create or reuse the main window and attach a webview that runs
             // the initialization script before any page scripts execute. If
             // a window named "main" already exists (e.g. created by the
@@ -279,10 +281,11 @@ fn main() {
             };
 
             // Use a distinct label for the webview to avoid conflicting with
-            // the window's label.
+            // the window's label. The loading page waits for the backend's
+            // /health endpoint, then opens index.html.
             let webview_builder = tauri::webview::WebviewBuilder::new(
                 "main-webview",
-                tauri::WebviewUrl::App("index.html".into()),
+                tauri::WebviewUrl::App(start_page.into()),
             )
             .initialization_script(&init_js);
 
@@ -296,7 +299,10 @@ fn main() {
 
     let app = builder.build(tauri::generate_context!()).expect("error while building tauri application");
 
-    app.run(|_app_handle, _event| {
+    app.run(move |_app_handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            exit_handle.kill();
+        }
         // Application event loop
     });
 }

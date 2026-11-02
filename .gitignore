@@ -72,3 +72,8 @@ samples/sanitized/
 # Tauri generated
 src-tauri/gen/
 frontend/frontend/
+
+# Sidecar build output
+/build/
+src-tauri/binaries/
+*.spec

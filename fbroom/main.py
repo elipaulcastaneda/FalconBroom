@@ -348,7 +348,7 @@ else:
     # Development: allow localhost and tauri schemes
     app.add_middleware(
         CORSMiddleware,
-        allow_origin_regex=r"^(https?://(localhost|127\.0\.0\.1)(:\d+)?)$|^(tauri://localhost)$",
+        allow_origin_regex=r"^(https?://(localhost|127\.0\.0\.1)(:\d+)?)$|^(tauri://localhost)$|^(https?://tauri\.localhost)$",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
