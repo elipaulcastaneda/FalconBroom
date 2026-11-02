@@ -18,7 +18,7 @@ def _eager_join_preview_reference(spec):
     common = list((set(left.columns) & set(right.columns)) - set(left_on + right_on))
     if common:
         right = right.rename({column: f"{column}_right" for column in common})
-    joined = left.join(right, left_on=left_on, right_on=right_on, how=how)
+    joined = left.join(right, left_on=left_on, right_on=right_on, how="full" if how == "outer" else how)
     joined_count = joined.height
 
     unmatched_left = None

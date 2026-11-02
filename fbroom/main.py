@@ -2974,7 +2974,7 @@ def join_preview(spec: JoinPreviewSpec):
 
             if use_lazy_samples and how != "outer":
                 joined_lazy = left_df.lazy().join(
-                    right_df.lazy(), left_on=left_on, right_on=right_on, how=how
+                    right_df.lazy(), left_on=left_on, right_on=right_on, how=("full" if how == "outer" else how)
                 )
                 joined_count = int(joined_lazy.select(pl.len()).collect().item())
                 if spec.sample < joined_count:
@@ -2995,9 +2995,9 @@ def join_preview(spec: JoinPreviewSpec):
                     preview_rows = _df_head_records(preview_lazy.head(spec.sample).collect(), n=spec.sample)
                     used_lazy_preview = True
                 else:
-                    joined = left_df.join(right_df, left_on=left_on, right_on=right_on, how=how)
+                    joined = left_df.join(right_df, left_on=left_on, right_on=right_on, how=("full" if how == "outer" else how))
             else:
-                joined = left_df.join(right_df, left_on=left_on, right_on=right_on, how=how)
+                joined = left_df.join(right_df, left_on=left_on, right_on=right_on, how=("full" if how == "outer" else how))
         except Exception:
             # try pandas fallback with explicit suffixes
             joined = None
@@ -3280,7 +3280,7 @@ def join_export(spec: JoinExportSpec):
                     except Exception:
                         pass
 
-            joined = left_df.join(right_df, left_on=left_on, right_on=right_on, how=how)
+            joined = left_df.join(right_df, left_on=left_on, right_on=right_on, how=("full" if how == "outer" else how))
         except Exception:
             try:
                 import pandas as _pd
