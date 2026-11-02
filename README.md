@@ -1,5 +1,7 @@
 # FalconBroom
 
+License: proprietary beta license. See [LICENSE](LICENSE).
+
 ## Prototype scaffold
 
 This repository now contains a minimal Python prototype for data profiling and cleaning.

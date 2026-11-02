@@ -2,6 +2,7 @@
 name = "falconbroom-tauri"
 version = "0.1.0"
 authors = ["FalconBroom"]
+license-file = "../LICENSE"
 edition = "2021"
 build = "build.rs"
 

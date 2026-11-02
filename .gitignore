@@ -49,3 +49,26 @@ scripts/py_spy_*
 # Ignore large sanitized output; allow synthetic demo folder
 samples/sanitized/
 !samples/demo_custom/
+
+# Scratch / debug output
+/debug/
+/*_output*.txt
+/run_uv*.err
+/run_uv*.out
+/run_uv_log.txt
+/tests_list*.txt
+/pytest_multi_out.txt
+/history.zip
+/client_early_failures.jsonl
+/fixed_out.csv
+/out_test.csv
+/output_from_text.csv
+/preview.json
+/recipe*.json
+/tmp_*.py
+/query
+*.pid
+
+# Tauri generated
+src-tauri/gen/
+frontend/frontend/
