@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import unicodedata
 from pathlib import Path
 from uuid import uuid4
 from typing import Any
@@ -88,7 +89,36 @@ def _stringify(value: Any) -> str:
     return str(value)
 
 
-def _append_row(rows: list[dict[str, Any]], **row: Any) -> None:
+_CSV_FIELDNAMES = [
+    "source_kind",
+    "source_name",
+    "source_path",
+    "unit_kind",
+    "container_name",
+    "sheet_name",
+    "slide_number",
+    "paragraph_index",
+    "table_index",
+    "row_index",
+    "column_index",
+    "cell_label",
+    "text",
+    "style_json",
+    "notes",
+]
+
+
+class _CsvRowSink:
+    def __init__(self, writer: csv.DictWriter):
+        self.writer = writer
+        self.count = 0
+
+    def append(self, row: dict[str, Any]) -> None:
+        self.writer.writerow(row)
+        self.count += 1
+
+
+def _append_row(rows: _CsvRowSink, **row: Any) -> None:
     rows.append(
         {
             "source_kind": row.get("source_kind", "unknown"),
@@ -111,25 +141,8 @@ def _append_row(rows: list[dict[str, Any]], **row: Any) -> None:
 
 
 def _write_rows_to_csv(rows: list[dict[str, Any]], output_path: Path) -> None:
-    fieldnames = [
-        "source_kind",
-        "source_name",
-        "source_path",
-        "unit_kind",
-        "container_name",
-        "sheet_name",
-        "slide_number",
-        "paragraph_index",
-        "table_index",
-        "row_index",
-        "column_index",
-        "cell_label",
-        "text",
-        "style_json",
-        "notes",
-    ]
     with output_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames, quoting=csv.QUOTE_MINIMAL)
+        writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDNAMES, quoting=csv.QUOTE_MINIMAL)
         writer.writeheader()
         for row in rows:
             writer.writerow(row)
@@ -215,7 +228,7 @@ def _download_google_drive_export(file_id: str, mime_type: str) -> bytes:
         raise RuntimeError(f"Drive export request failed: {exc}") from exc
 
 
-def _extract_google_drive_export(source_path: Path, output_dir: Path, rows: list[dict[str, Any]], warnings: list[str]) -> bool:
+def _extract_google_drive_export(source_path: Path, output_dir: Path, rows: _CsvRowSink, warnings: list[str]) -> bool:
     payload = _google_shortcut_payload(source_path)
     url = _first_nonempty(
         [
@@ -262,7 +275,7 @@ def _extract_google_drive_export(source_path: Path, output_dir: Path, rows: list
     return True
 
 
-def _extract_text_rows(source_path: Path, source_kind: str, rows: list[dict[str, Any]]) -> None:
+def _extract_text_rows(source_path: Path, source_kind: str, rows: _CsvRowSink) -> None:
     raw_text = _decode_bytes(source_path.read_bytes())
     stripped = raw_text.strip()
     if not stripped:
@@ -315,7 +328,7 @@ def _extract_text_rows(source_path: Path, source_kind: str, rows: list[dict[str,
             )
 
 
-def _extract_workbook_rows(source_path: Path, rows: list[dict[str, Any]]) -> None:
+def _extract_workbook_rows(source_path: Path, rows: _CsvRowSink) -> None:
     if load_workbook is None:
         raise RuntimeError("openpyxl is not installed. Install requirements to enable spreadsheet extraction.")
 
@@ -371,7 +384,7 @@ def _extract_workbook_rows(source_path: Path, rows: list[dict[str, Any]]) -> Non
                     )
 
 
-def _extract_docx_rows(source_path: Path, rows: list[dict[str, Any]]) -> None:
+def _extract_docx_rows(source_path: Path, rows: _CsvRowSink) -> None:
     if Document is None:
         raise RuntimeError("python-docx is not installed. Install requirements to enable Word extraction.")
 
@@ -441,7 +454,7 @@ def _extract_docx_rows(source_path: Path, rows: list[dict[str, Any]]) -> None:
                     )
 
 
-def _extract_pptx_rows(source_path: Path, rows: list[dict[str, Any]]) -> None:
+def _extract_pptx_rows(source_path: Path, rows: _CsvRowSink) -> None:
     if Presentation is None:
         raise RuntimeError("python-pptx is not installed. Install requirements to enable PowerPoint extraction.")
 
@@ -509,7 +522,7 @@ def _extract_pptx_rows(source_path: Path, rows: list[dict[str, Any]]) -> None:
                 )
 
 
-def _extract_google_shortcut_rows(source_path: Path, output_dir: Path, rows: list[dict[str, Any]], warnings: list[str]) -> None:
+def _extract_google_shortcut_rows(source_path: Path, output_dir: Path, rows: _CsvRowSink, warnings: list[str]) -> None:
     payload = _google_shortcut_payload(source_path)
 
     if isinstance(payload, dict):
@@ -692,6 +705,104 @@ def _uniq(vals, k: int = 3) -> list:
     return seen
 
 
+def _value_shape(value: str) -> str:
+    """Digits -> 9, upper -> A, lower -> a; runs of the same class collapse ('68113-3892' -> '9-9')."""
+    out: list[str] = []
+    for ch in value.strip():
+        token = '9' if ch.isdigit() else ('A' if ch.isupper() else ('a' if ch.islower() else ch))
+        if not (out and out[-1] == token and token in '9Aa'):
+            out.append(token)
+    return ''.join(out)
+
+
+def _shape_regex(shape: str) -> str:
+    return ''.join({'9': r'\d+', 'A': r'[A-Z]+', 'a': r'[a-z]+'}.get(ch) or re.escape(ch) for ch in shape)
+
+
+def _column_shapes(raw_values: list) -> tuple[list, set, set] | None:
+    """Per-row shapes, the core shapes covering 75% of values, and every recurring shape."""
+    shapes = [_value_shape(v) if v else None for v in raw_values]
+    counts: dict[str, int] = {}
+    for shape in shapes:
+        if shape is not None:
+            counts[shape] = counts.get(shape, 0) + 1
+    total = sum(counts.values())
+    if total < 20:
+        return None
+    home: set = set()
+    covered = 0
+    for shape, count in sorted(counts.items(), key=lambda item: -item[1]):
+        home.add(shape)
+        covered += count
+        if covered / total >= 0.75:
+            break
+    recurring = {shape for shape, count in counts.items() if count >= 5 and count / total >= 0.02}
+    return shapes, home, home | recurring
+
+
+def _shape_class(shape: str) -> str:
+    if re.fullmatch(r"9(?:[-/. ]9)*[Aa]?", shape):
+        return 'digit'
+    if re.fullmatch(r"[Aa]+(?:[ '.-][Aa]+)*", shape):
+        return 'word'
+    return 'mixed'
+
+
+def _belongs(shape: str, accepted: set, home: set) -> bool:
+    """A shape belongs to a column when it recurs there or is the same plain class as the column's usual values."""
+    if shape in accepted:
+        return True
+    kind = _shape_class(shape)
+    return kind != 'mixed' and any(_shape_class(h) == kind for h in home)
+
+
+def _shape_swaps(col_stats: dict[str, dict[str, Any]], skip_pairs: set) -> list[dict[str, Any]]:
+    """Find column pairs whose values sit in each other's place on the same rows."""
+    profiles = {}
+    for col, stats in col_stats.items():
+        profile = _column_shapes(stats.get('raw_values') or [])
+        if profile:
+            profiles[col] = profile
+    found: list[dict[str, Any]] = []
+    names = list(profiles)
+    for left_index, left in enumerate(names):
+        for right in names[left_index + 1:]:
+            if (left, right) in skip_pairs:
+                continue
+            left_shapes, left_home, left_accepted = profiles[left]
+            right_shapes, right_home, right_accepted = profiles[right]
+            if left_home & right_home:
+                continue
+            crossed: list[int] = []
+            home_rows = 0
+            for index in range(min(len(left_shapes), len(right_shapes))):
+                a, b = left_shapes[index], right_shapes[index]
+                if a is None or b is None:
+                    continue
+                if a in left_home and b in right_home:
+                    home_rows += 1
+                elif a not in left_home and _belongs(a, right_accepted, right_home) and b not in right_home and _belongs(b, left_accepted, left_home):
+                    crossed.append(index)
+            if len(crossed) < 5 or home_rows < 10 or home_rows < len(crossed) * 2:
+                continue
+            left_raw, right_raw = col_stats[left]['raw_values'], col_stats[right]['raw_values']
+            left_set = sorted({left_shapes[i] for i in crossed})
+            right_set = sorted({right_shapes[i] for i in crossed})
+            if len(left_set) > 12 or len(right_set) > 12:
+                continue
+            moves = [
+                {'source': left, 'target': right, 'type': 'pattern', 'pattern': '|'.join(_shape_regex(s) for s in left_set), 'exceptions': []},
+                {'source': right, 'target': left, 'type': 'pattern', 'pattern': '|'.join(_shape_regex(s) for s in right_set), 'exceptions': []},
+            ]
+            found.append({
+                'left': left, 'right': right, 'rows': len(crossed), 'home_rows': home_rows,
+                'left_examples': _uniq([left_raw[i] for i in crossed], 3),
+                'right_examples': _uniq([right_raw[i] for i in crossed], 3),
+                'step': {'action': 'swap_by_types', 'column': None, 'params': {'moves': moves, 'replacement': ''}},
+            })
+    return found
+
+
 def _preferred_abbreviation_case(col: str, vals: list[str]) -> str | None:
     if not vals or not all(re.fullmatch(r"(?=.*[A-Za-z])[A-Za-z0-9]{2,6}", value) for value in vals):
         return None
@@ -745,6 +856,24 @@ def _complete_entries(entries: list[dict[str, Any]]) -> None:
         instruction = steps_to_text(steps)
         if instruction:
             e['instruction'] = instruction
+
+
+def _parses_with(value: str, fmt: str) -> bool:
+    try:
+        datetime.strptime(value, fmt)
+        return True
+    except ValueError:
+        return False
+
+
+def _drop_rows_entry(col: str, count: int, total: int, description: str, params: dict[str, Any], examples: list) -> dict[str, Any]:
+    shown = f" (e.g. {', '.join(repr(e) for e in examples)})" if examples else ''
+    return _entry(
+        f"Or drop the {count} row(s) where '{col}' {description}{shown} among {total} analyzed rows; this removes the whole row from the output instead of fixing the value",
+        None,
+        0.4,
+        [{'action': 'drop_rows', 'column': col, 'params': params}],
+    )
 
 
 def _entry(text: str, machine: str | None, confidence: float, steps: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -874,6 +1003,24 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
     n = len(vals)
     if n < 10:
         return {'kind': 'text', 'entries': []}
+    total_rows = n + missing_count
+    blank_count = missing_count - len(markers)
+
+    def drop_entries(issues: list[tuple[str, dict[str, Any], int, list]]) -> list[dict[str, Any]]:
+        """Row-removal alternatives as (description, params, count, examples); skipped if over half the rows would go."""
+        found = list(issues)
+        if blank_count:
+            found.append(('is blank', {'issue': 'blank'}, blank_count, []))
+        if markers:
+            distinct = _uniq(markers, 12)
+            found.append((f"is {', '.join(distinct)}", {'issue': 'values', 'values': distinct}, len(markers), distinct))
+        return [
+            _drop_rows_entry(col, count, total_rows, description, params, _uniq(examples, 3))
+            for description, params, count, examples in found
+            if 0 < count and count / total_rows <= 0.5
+        ]
+
+    pending_drops: list[dict[str, Any]] = []
     european_numbers = [s for s in vals if _LOCALE_NUMBER_RE.fullmatch(re.sub(r"[€£$¥₹\s]", "", s))]
     if european_numbers:
         return {'kind': 'locale_number_review', 'entries': [_entry(
@@ -905,14 +1052,19 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
                 None,
                 0.85 if invalid_count == 0 else 0.7,
                 [{'action': 'cast', 'column': col, 'params': {'to': 'datetime', 'fmt': fmt}}],
-            )]}
+            )] + drop_entries([(
+                f"is not a valid {fmt} date", {'issue': 'not_date', 'fmt': fmt}, invalid_count,
+                [s for s in vals if not _parses_with(s, fmt)],
+            )] if invalid_count else [])}
     date_matches = sum(1 for s in vals if _DATE_LIKE_RE.match(s))
     if date_matches / n >= 0.75:
         iso = sum(1 for s in vals if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s))
         if iso / n >= 0.9 and not _ID_NAME_RE.search(col):
+            bad_dates = [s for s in vals if not _parses_with(s, '%Y-%m-%d')]
             return {'kind': 'date', 'entries': [_entry(
                 f"Parse ISO dates in '{col}' as dates; invalid values will become empty",
-                None, 0.85, [{'action': 'cast', 'column': col, 'params': {'to': 'datetime', 'fmt': '%Y-%m-%d'}}]) ]}
+                None, 0.85, [{'action': 'cast', 'column': col, 'params': {'to': 'datetime', 'fmt': '%Y-%m-%d'}}]) ] + drop_entries(
+                [("is not a valid %Y-%m-%d date", {'issue': 'not_date', 'fmt': '%Y-%m-%d'}, len(bad_dates), bad_dates)] if bad_dates else [])}
         return {'kind': 'date_review', 'entries': [_entry(
             f"'{col}' contains date-like values, but the format or day/month order is ambiguous. Review examples before converting: {', '.join(_uniq(vals))}",
             None, 0.45)]}
@@ -924,6 +1076,9 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
     zip_like = bool(re.search(r"zip|postal|post_?code", col, re.I)) or (cnt['zip4'] > 0 and (cnt['zip4'] + digits5) / n >= 0.5)
     if zip_like:
         result = {'kind': 'identifier', 'entries': _zip_entries(col, vals)}
+        words = [s for s in vals if not re.search(r"\d", s)]
+        if words:
+            pending_drops.extend(drop_entries([("is text with no digits", {'issue': 'matches', 'pattern': r"\D+"}, len(words), words)]))
     elif re.search(r'email|e_mail', col, re.I):
         spaced = [s for s in raw_values if s != s.strip()]
         invalid = [s.strip() for s in vals if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", s.strip())]
@@ -933,6 +1088,7 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
                                [{'action': 'normalize', 'column': col, 'params': {'case': 'trim'}}]))
         if invalid:
             ents.append(_entry(f"Review {len(invalid)} email-shaped values in '{col}' that do not match a basic email format; examples: {', '.join(_uniq(invalid))}", None, 0.5))
+            pending_drops.extend(drop_entries([("is not a valid email address", {'issue': 'not_matches', 'pattern': r"[^\s@]+@[^\s@]+\.[^\s@]+"}, len(invalid), invalid)]))
         result = {'kind': 'identifier', 'entries': ents}
     elif re.search(r'phone|mobile|telephone|\btel\b', col, re.I):
         compact = [re.sub(r'[^\d+]', '', s) for s in vals]
@@ -949,6 +1105,12 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
         result = {'kind': 'identifier', 'entries': entries}
     else:
         result = _numeric_entries(col, vals, kinds, cnt)
+        bad_numbers = [s for s, (k, _, _) in zip(vals, kinds) if k in ('text', 'zip4')]
+        if result.get('kind') == 'numeric' and not cnt['affix'] and bad_numbers:
+            pending_drops.extend(drop_entries([("is not a number", {'issue': 'not_numeric'}, len(bad_numbers), bad_numbers)]))
+
+    if not any(e['json_steps'][0]['params'].get('issue') in ('blank', 'values') for e in pending_drops):
+        pending_drops.extend(drop_entries([]))
 
     is_potential_key = bool(_UNIQUE_KEY_NAME_RE.search(col) or re.search(r'email|e_mail', col, re.I))
     if is_potential_key:
@@ -1006,6 +1168,15 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
             None,
             0.65,
             [{'action': 'regex_replace', 'column': col, 'params': {'pattern': marker_pattern, 'replace': ''}}],
+        ))
+
+    compatibility_values = [value for value in vals if unicodedata.normalize('NFKC', value) != value]
+    if compatibility_values:
+        result['entries'].append(_entry(
+            f"Normalize compatibility characters in '{col}' using NFKC ({len(compatibility_values)} sampled value(s) change; examples: {', '.join(_uniq(compatibility_values))})",
+            None,
+            0.8,
+            [{'action': 'unicode_normalize', 'column': col, 'params': {'form': 'NFKC'}}],
         ))
 
     # Suggest normalization only for low-cardinality labels with case/space variants.
@@ -1076,15 +1247,17 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
                         None,
                         0.55,
                     ))
+    result['entries'].extend(pending_drops)
     return result
 
 
-def _analyze_columns(path: str | None) -> dict[str, dict[str, Any]]:
+def _analyze_columns(path: str | None, df=None) -> dict[str, dict[str, Any]]:
     """Analyze every column of the normalized table so suggestions reflect the real value patterns."""
     out: dict[str, dict[str, Any]] = {}
-    if not path or not Path(path).exists():
-        return out
-    df = _read_table(path)
+    if df is None:
+        if not path or not Path(path).exists():
+            return out
+        df = _read_table(path)
     try:
         row_columns = [c for c in df.columns if c not in _META_COLS and not (isinstance(c, str) and c.startswith('_'))]
         if row_columns:
@@ -1105,12 +1278,17 @@ def _analyze_columns(path: str | None) -> dict[str, dict[str, Any]]:
         if not isinstance(c, str) or c.startswith('_') or c in _META_COLS:
             continue
         try:
-            vals = df[c].to_list() if _is_polars_df(df) else df[c].tolist()
+            row_count = len(df)
+            if row_count > 5000:
+                indices = [i * (row_count - 1) // 4999 for i in range(5000)]
+                if _is_polars_df(df):
+                    vals = df.get_column(c).gather(indices).to_list()
+                else:
+                    vals = df[c].iloc[indices].tolist()
+            else:
+                vals = df[c].to_list() if _is_polars_df(df) else df[c].tolist()
         except Exception:
             continue
-        if len(vals) > 5000:
-            indices = [i * (len(vals) - 1) // 4999 for i in range(5000)]
-            vals = [vals[i] for i in indices]
         res = _analyze_column(c, vals)
         if res:
             out[c] = res
@@ -1168,14 +1346,56 @@ def _analyze_columns(path: str | None) -> dict[str, dict[str, Any]]:
     return out
 
 
-def generate_plain_language_suggestions(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+def _label_suggestion(entry: dict[str, Any]) -> None:
+    """Tag a suggestion with a display category and the columns it concerns, so the UI can group it."""
+    steps = entry.get('json_steps') or []
+    actions = {step.get('action') for step in steps}
+    if not steps:
+        category = 'review'
+    elif 'drop_rows' in actions:
+        category = 'drop_rows'
+    elif actions & {'move_by_type', 'swap_by_types'}:
+        category = 'move'
+    elif actions & {'drop_column', 'deduplicate', 'remove_by_type'}:
+        category = 'remove'
+    else:
+        category = 'fix'
+
+    columns: list[str] = []
+
+    def add(value: Any) -> None:
+        if isinstance(value, str) and value and value not in columns:
+            columns.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                add(item)
+
+    for step in steps:
+        add(step.get('column'))
+        params = step.get('params') or {}
+        add(params.get('source'))
+        add(params.get('target'))
+        for move in params.get('moves') or []:
+            if isinstance(move, dict):
+                add(move.get('source'))
+                add(move.get('target'))
+    if not columns:
+        quoted = re.search(r"'([^']+)'", str(entry.get('text') or ''))
+        if quoted:
+            columns.append(quoted.group(1))
+    entry['category'] = category
+    entry['column'] = columns[0] if columns else None
+    entry['columns'] = columns
+
+
+def generate_plain_language_suggestions(metadata: dict[str, Any], df=None) -> list[dict[str, Any]]:
     """Create short, editable plain-English suggestions from metadata/diagnostics.
 
     Returns a list of {text: str, source: str} entries.
     """
     out: list[dict[str, Any]] = []
     try:
-        col_info = _analyze_columns(metadata.get("normalized_path") or metadata.get("path"))
+        col_info = _analyze_columns(metadata.get("normalized_path") or metadata.get("path"), df=df)
     except Exception:
         col_info = {}
     try:
@@ -1314,12 +1534,13 @@ def generate_plain_language_suggestions(metadata: dict[str, Any]) -> list[dict[s
         norm = metadata.get("normalized_path")
         if norm and Path(norm).exists():
             try:
-                df = _read_table(norm)
+                if df is None:
+                    df = _read_table(norm)
                 cols = list(df.columns if _is_polars_df(df) else list(df.columns))
-                # sample up to 1000 rows to estimate types
+                # sample up to 5000 rows to estimate types
                 sample = None
                 try:
-                    sample = df.head(1000) if _is_polars_df(df) else (df.head(1000) if hasattr(df, 'head') else df)
+                    sample = df.head(5000) if _is_polars_df(df) else (df.head(5000) if hasattr(df, 'head') else df)
                 except Exception:
                     sample = df
 
@@ -1331,17 +1552,36 @@ def generate_plain_language_suggestions(metadata: dict[str, Any]) -> list[dict[s
                         if _is_polars_df(sample):
                             ser = sample.select(c).to_series().to_list()
                         else:
-                            ser = list(sample[c].astype(str).tolist()[:1000]) if c in sample.columns else []
+                            ser = list(sample[c].tolist()[:5000]) if c in sample.columns else []
                         numeric_count = 0
                         date_count = 0
                         nonempty = 0
                         non_numeric_count = 0
                         vals = []
-                        for v in ser[:500]:
-                            s = '' if v is None else str(v).strip()
+                        raw_values = []
+                        type_values = []
+                        type_counts = {'numeric': 0, 'string': 0, 'date': 0}
+                        type_examples = {'numeric': [], 'string': [], 'date': []}
+                        for v in ser[:5000]:
+                            try:
+                                missing = v is None or (isinstance(v, float) and v != v)
+                            except Exception:
+                                missing = v is None
+                            s = '' if missing else str(v).strip()
+                            raw_values.append(s or None)
                             if s == '':
+                                type_values.append(None)
                                 continue
                             nonempty += 1
+                            if _DATE_LIKE_RE.match(s):
+                                kind = 'date'
+                            else:
+                                cell_kind, _, _ = _classify_cell(s)
+                                kind = 'numeric' if cell_kind in ('numeric', 'formatted') else 'string'
+                            type_values.append(kind)
+                            type_counts[kind] += 1
+                            if len(type_examples[kind]) < 5:
+                                type_examples[kind].append(s)
                             if re.match(r'^[-+]?\d+(?:[\.,]\d+)?$', s):
                                 numeric_count += 1
                                 vals.append(s)
@@ -1357,130 +1597,256 @@ def generate_plain_language_suggestions(metadata: dict[str, Any]) -> list[dict[s
                             'date_count': date_count,
                             'non_numeric_count': non_numeric_count,
                             'nonempty': nonempty,
-                            'examples': vals[:10]
+                            'examples': vals[:10],
+                            'type_values': type_values,
+                            'type_counts': type_counts,
+                            'type_examples': type_examples,
+                            'raw_values': raw_values,
                         }
                     except Exception:
-                        col_stats[c] = {'numeric_count': 0, 'date_count': 0, 'non_numeric_count': 0, 'nonempty': 0, 'examples': []}
+                        col_stats[c] = {'numeric_count': 0, 'date_count': 0, 'non_numeric_count': 0, 'nonempty': 0, 'examples': [], 'type_values': [], 'type_counts': {'numeric': 0, 'string': 0, 'date': 0}, 'type_examples': {'numeric': [], 'string': [], 'date': []}}
 
-                # generate transfer suggestions based on col_stats
-                for c, stats in col_stats.items():
-                    try:
-                        nonempty = stats.get('nonempty', 0)
-                        numeric_count = stats.get('numeric_count', 0)
-                        date_count = stats.get('date_count', 0)
-                        non_numeric_count = stats.get('non_numeric_count', 0)
-                        numeric_vals = stats.get('numeric_vals', [])
-                        # compute simple numeric summary
-                        src_median = None
-                        if numeric_vals:
-                            try:
-                                svals = sorted(numeric_vals)
-                                src_median = svals[len(svals)//2]
-                            except Exception:
-                                src_median = None
-                        # detect year-like source column
-                        src_year_like = False
-                        try:
-                            if numeric_vals:
-                                year_like_count = sum(1 for v in numeric_vals if 1800 <= v <= 2100)
-                                src_year_like = (year_like_count / max(1, len(numeric_vals))) >= 0.8
-                        except Exception:
-                            src_year_like = False
-                        # numeric-heavy sources
-                        if nonempty >= 10 and numeric_count >= 5 and (numeric_count / nonempty) > 0.15:
-                            # find destination columns
-                            for d, dst in col_stats.items():
-                                if d == c:
-                                    continue
-                                # destination empty or date-like or numeric-like
-                                dst_nonempty = dst.get('nonempty', 0)
-                                dst_numeric = dst.get('numeric_count', 0)
-                                dst_numeric_vals = dst.get('numeric_vals', [])
-                                dst_median = None
-                                if dst_numeric_vals:
-                                    try:
-                                        dvals = sorted(dst_numeric_vals)
-                                        dst_median = dvals[len(dvals)//2]
-                                    except Exception:
-                                        dst_median = None
-
-                                candidate_ok = False
-                                # allow if destination empty
-                                if dst_nonempty == 0:
-                                    candidate_ok = True
-                                # allow if both numeric and medians are compatible (avoid years->bedrooms)
-                                elif dst_numeric > dst_nonempty * 0.5 and src_median is not None and dst_median is not None:
-                                    # avoid moving large-year-like numbers into small-integer columns
-                                    if src_year_like and not (1800 <= (dst_median or 0) <= 2100):
-                                        candidate_ok = False
-                                    else:
-                                        # allow if medians are of same order magnitude
-                                        try:
-                                            if dst_median == 0:
-                                                candidate_ok = False
-                                            else:
-                                                ratio = abs(src_median) / max(1, abs(dst_median))
-                                                candidate_ok = 0.2 <= ratio <= 5
-                                        except Exception:
-                                            candidate_ok = False
-                                # allow if destination is date-like and source looks like year
-                                if not candidate_ok and dst.get('date_count', 0) > dst_nonempty * 0.5 and src_year_like:
-                                    candidate_ok = True
-
-                                # when source is year-like, prefer destinations with 'year' in name or empty
-                                if src_year_like and not (candidate_ok and (dst_nonempty == 0 or 'year' in d.lower())):
-                                    candidate_ok = False
-
-                                if not candidate_ok:
-                                    continue
-
-                                # build suggestion text
-                                if dst.get('date_count', 0) > 0 and dst.get('non_numeric_count', 0) > 0:
-                                    text = (
-                                        f"Put all numerical values of the '{c}' column in the '{d}' column, and move all string values of the '{d}' column except for dates in the '{c}' column."
-                                    )
-                                else:
-                                    text = (
-                                        f"Put all numerical values of the '{c}' column in the '{d}' column. Suggest coercing '{d}' to numeric and keeping remaining text in '{c}'."
-                                    )
-                                examples = ', '.join(sorted(set(stats.get('examples', []) or []))[:5])
-                                if examples:
-                                    text = text + f" Examples: {examples}"
-                                existing_texts = {e.get('text') for e in out if e.get('text')}
-                                if text not in existing_texts:
-                                    out.append({'text': text, 'source': 'cross_column_numeric_transfer', 'confidence': 0.5, 'json_steps': [{'action': 'move_by_type', 'column': None, 'params': {
-                                        'source': c, 'target': d, 'type': 'numeric', 'exceptions': [], 'replacement': '',
-                                    }}]})
-                                    transfer_texts.append(text)
-                        # non-numeric-heavy sources -> move to mostly-empty dest
-                        if nonempty >= 10 and non_numeric_count >= 5 and (non_numeric_count / nonempty) > 0.15:
-                            for d, dst in col_stats.items():
-                                if d == c:
-                                    continue
-                                if dst.get('nonempty', 0) == 0:
-                                    text = f"Move non-numeric values from '{c}' into '{d}'."
-                                    examples = ''
-                                    existing_texts = {e.get('text') for e in out if e.get('text')}
-                                    if text not in existing_texts:
-                                        out.append({'text': text, 'source': 'cross_column_text_transfer', 'confidence': 0.5, 'json_steps': [{'action': 'move_by_type', 'column': None, 'params': {
-                                            'source': c, 'target': d, 'type': 'string', 'exceptions': [], 'replacement': '',
-                                        }}]})
-                                        transfer_texts.append(text)
-                    except Exception:
+                # Suggest type removal only for a small, non-date minority in ordinary data columns.
+                for col, stats in col_stats.items():
+                    counts = stats.get('type_counts') or {}
+                    numeric_count = counts.get('numeric', 0)
+                    string_count = counts.get('string', 0)
+                    typed_count = numeric_count + string_count
+                    if (
+                        _ID_NAME_RE.search(col)
+                        or counts.get('date', 0)
+                        or typed_count < 20
+                        or not numeric_count
+                        or not string_count
+                    ):
                         continue
-            except Exception:
-                pass
-            # aggregate multiple transfer suggestions into one compound suggestion
-            try:
-                if len(transfer_texts) > 1:
-                    # join compactly using commas and 'then'
-                    combined = transfer_texts[0]
-                    for t in transfer_texts[1:]:
-                        combined = combined.rstrip('. ') + ", then " + t[0].lower() + t[1:]
-                    # avoid duplicates
-                    existing_texts = {e.get('text') for e in out if e.get('text')}
-                    if combined and combined not in existing_texts:
-                        out.append({'text': combined, 'source': 'cross_column_transfer_combined'})
+                    minority_type = 'numeric' if numeric_count < string_count else 'string'
+                    minority_count = min(numeric_count, string_count)
+                    minority_share = minority_count / typed_count
+                    if minority_count < 5 or minority_share > 0.2:
+                        continue
+                    examples = ', '.join(repr(value) for value in (stats.get('type_examples') or {}).get(minority_type, []))
+                    readable_type = 'numeric' if minority_type == 'numeric' else 'text'
+                    step = {'action': 'remove_by_type', 'column': col, 'params': {'target_type': minority_type, 'replacement': ''}}
+                    out.append({
+                        'text': f"'{col}' has {minority_count} {readable_type} value(s) ({minority_share:.0%} of the typed sample), versus {typed_count - minority_count} of the other type. Review whether to blank the minority values{f' such as {examples}' if examples else ''}.",
+                        'source': 'mixed_type_minority',
+                        'confidence': 0.65,
+                        'json_steps': [step],
+                    })
+
+                # Recommend reciprocal swaps only when off-type values align across rows
+                # and each column has a strong, opposite dominant type.
+                columns = list(col_stats)
+                swap_columns: set[str] = set()
+                swap_pairs: set[tuple[str, str]] = set()
+                shape_swap_columns: set[str] = set()
+                for left_index, left in enumerate(columns):
+                    left_stats = col_stats[left]
+                    left_counts = left_stats.get('type_counts') or {}
+                    left_total = left_counts.get('numeric', 0) + left_counts.get('string', 0)
+                    if _ID_NAME_RE.search(left) or left_counts.get('date') or left_total < 20:
+                        continue
+                    for right in columns[left_index + 1:]:
+                        right_stats = col_stats[right]
+                        right_counts = right_stats.get('type_counts') or {}
+                        right_total = right_counts.get('numeric', 0) + right_counts.get('string', 0)
+                        if _ID_NAME_RE.search(right) or right_counts.get('date') or right_total < 20:
+                            continue
+                        orientations = (
+                            ('string', 'numeric', 'numeric', 'string'),
+                            ('numeric', 'string', 'string', 'numeric'),
+                        )
+                        for left_expected, right_expected, left_wrong, right_wrong in orientations:
+                            if left_counts.get(left_expected, 0) / left_total < 0.65 or right_counts.get(right_expected, 0) / right_total < 0.65:
+                                continue
+                            comparable = min(len(left_stats['type_values']), len(right_stats['type_values']))
+                            expected_rows = sum(
+                                left_stats['type_values'][i] == left_expected and right_stats['type_values'][i] == right_expected
+                                for i in range(comparable)
+                            )
+                            wrong_rows = sum(
+                                left_stats['type_values'][i] == left_wrong and right_stats['type_values'][i] == right_wrong
+                                for i in range(comparable)
+                            )
+                            if wrong_rows < 5 or expected_rows < 10 or expected_rows < wrong_rows * 2:
+                                continue
+                            moves = [
+                                {'source': left, 'target': right, 'type': left_wrong, 'exceptions': []},
+                                {'source': right, 'target': left, 'type': right_wrong, 'exceptions': []},
+                            ]
+                            step = {'action': 'swap_by_types', 'column': None, 'params': {'moves': moves, 'replacement': ''}}
+                            out.append({
+                                'text': f"'{left}' is mostly {left_expected} and '{right}' is mostly {right_expected}, but {wrong_rows} sampled row(s) have {left_wrong} values in '{left}' alongside {right_wrong} values in '{right}' (the dominant pairing appears in {expected_rows} rows). Review swapping those off-type values.",
+                                'source': 'cross_column_type_swap',
+                                'confidence': 0.7,
+                                'json_steps': [step],
+                            })
+                            swap_columns.update((left, right))
+                            swap_pairs.add((left, right))
+                            break
+
+                # Any two columns whose values sit in each other's place on the same rows (zip<->city, phone<->name, ...).
+                for found in _shape_swaps(col_stats, swap_pairs):
+                    left, right = found['left'], found['right']
+                    out.append({
+                        'text': f"On {found['rows']} sampled row(s), '{left}' holds values that look like '{right}' (e.g. {', '.join(map(repr, found['left_examples']))}) while '{right}' holds values that look like '{left}' (e.g. {', '.join(map(repr, found['right_examples']))}); the usual pairing appears on {found['home_rows']} rows. Swap them on those rows.",
+                        'source': 'cross_column_shape_swap',
+                        'confidence': 0.85,
+                        'json_steps': [found['step']],
+                    })
+                    swap_columns.update((left, right))
+                    shape_swap_columns.update((left, right))
+                if shape_swap_columns:
+                    out[:] = [
+                        entry for entry in out
+                        if not (entry.get('source') == 'diagnostics' and any(f"in '{col}' are text, not ZIP codes" in entry.get('text', '') for col in shape_swap_columns))
+                    ]
+
+                if swap_columns:
+                    out[:] = [
+                        entry for entry in out
+                        if entry.get('source') != 'mixed_type_minority'
+                        or not any(step.get('column') in swap_columns for step in entry.get('json_steps') or [])
+                    ]
+
+                # A one-way move is executable only when misplaced values align with blanks
+                # in a destination that otherwise contains the same value type.
+                move_sources: set[str] = set()
+                for source, source_stats in col_stats.items():
+                    source_counts = source_stats.get('type_counts') or {}
+                    source_total = source_counts.get('numeric', 0) + source_counts.get('string', 0)
+                    if _ID_NAME_RE.search(source) or source_counts.get('date') or source_total < 20:
+                        continue
+                    for target_type in ('numeric', 'string'):
+                        minority_count = source_counts.get(target_type, 0)
+                        if minority_count < 5 or minority_count / source_total > 0.2:
+                            continue
+                        for target, target_stats in col_stats.items():
+                            if target == source or target in swap_columns or _ID_NAME_RE.search(target):
+                                continue
+                            target_counts = target_stats.get('type_counts') or {}
+                            target_total = target_counts.get('numeric', 0) + target_counts.get('string', 0)
+                            if target_counts.get('date') or target_total < 20:
+                                continue
+                            if target_counts.get(target_type, 0) / target_total < 0.75:
+                                continue
+                            row_count = min(len(source_stats['type_values']), len(target_stats['type_values']))
+                            aligned_blanks = sum(
+                                source_stats['type_values'][index] == target_type
+                                and target_stats['type_values'][index] is None
+                                for index in range(row_count)
+                            )
+                            target_has_value = sum(
+                                source_stats['type_values'][index] != target_type
+                                and target_stats['type_values'][index] == target_type
+                                for index in range(row_count)
+                            )
+                            if aligned_blanks < 5 or aligned_blanks / minority_count < 0.9 or target_has_value < 10:
+                                continue
+                            if source in move_sources:
+                                continue
+                            step = {'action': 'move_by_type', 'column': None, 'params': {
+                                'source': source, 'target': target, 'type': target_type,
+                                'exceptions': [], 'replacement': '',
+                            }}
+                            out.append({
+                                'text': f"'{source}' contains {aligned_blanks} {target_type} value(s) on rows where '{target}' is blank; '{target}' contains {target_type} values on {target_has_value} other sampled rows. Review moving those values into '{target}'.",
+                                'source': 'row_aligned_type_transfer',
+                                'confidence': 0.8,
+                                'json_steps': [step],
+                            })
+                            move_sources.add(source)
+                            break
+                if move_sources:
+                    out[:] = [
+                        entry for entry in out
+                        if entry.get('source') != 'mixed_type_minority'
+                        or not any(step.get('column') in move_sources for step in entry.get('json_steps') or [])
+                    ]
+
+                # Text in a ZIP column belongs in the column holding similar text (e.g. city names).
+                zip_name_re = re.compile(r'zip|postal|post_?code', re.I)
+                place_name_re = re.compile(r'city|town|place|locality|municipality', re.I)
+                text_shape = re.compile(r"[A-Za-z][A-Za-z .'-]*")
+                for zip_col, zip_stats in col_stats.items():
+                    if not zip_name_re.search(zip_col) or zip_col in shape_swap_columns:
+                        continue
+                    zip_raw = zip_stats.get('raw_values') or []
+                    zip_text_rows = [i for i, v in enumerate(zip_raw) if v and not re.search(r'\d', v)]
+                    if len(zip_text_rows) < 5:
+                        continue
+                    # Mixed digit/letter values would be swept up by a type-based step, so they must be cleaned first.
+                    mixed_digit = {v for v in zip_raw if v and re.search(r'\d', v) and not re.fullmatch(r'\d+', v)}
+                    zip4_values = {v for v in mixed_digit if re.fullmatch(r'\d{5}-\d{4}', v)}
+                    trailing_values = {v for v in mixed_digit if re.fullmatch(r'\d{4,5}[A-Za-z]+', v)}
+                    unknown_values = mixed_digit - zip4_values - trailing_values
+                    cleanup_steps = []
+                    if zip4_values:
+                        cleanup_steps.append({'action': 'regex_replace', 'column': zip_col, 'params': {'pattern': r'^(\d{5})-\d{4}$', 'replace': r'\1'}})
+                    if trailing_values:
+                        cleanup_steps.append({'action': 'regex_replace', 'column': zip_col, 'params': {'pattern': r'^(\d{4,5})[A-Za-z]+$', 'replace': r'\1'}})
+                    zip_text = {zip_raw[i].casefold() for i in zip_text_rows}
+                    best = None
+                    for target, target_stats in col_stats.items():
+                        if target == zip_col or zip_name_re.search(target):
+                            continue
+                        target_raw = target_stats.get('raw_values') or []
+                        row_count = min(len(zip_raw), len(target_raw))
+                        target_text_rows = {i for i in range(row_count) if target_raw[i] and not re.search(r'\d', target_raw[i])}
+                        elsewhere = [i for i in target_text_rows if i not in set(zip_text_rows)]
+                        if len(elsewhere) < 10:
+                            continue
+                        target_text = {target_raw[i].casefold() for i in target_text_rows}
+                        overlap = len(zip_text & target_text) / len(zip_text)
+                        shape = sum(bool(text_shape.fullmatch(zip_raw[i])) for i in zip_text_rows) / len(zip_text_rows)
+                        name_match = bool(place_name_re.search(target))
+                        if overlap < 0.3 and not (name_match and shape >= 0.8):
+                            continue
+                        score = overlap + (0.5 if name_match else 0) + shape * 0.1
+                        if best is None or score > best[0]:
+                            best = (score, target, target_raw, row_count)
+                    if best is None:
+                        continue
+                    _, target, target_raw, row_count = best
+                    both_text = sum(1 for i in zip_text_rows if i < row_count and target_raw[i] and not re.search(r'\d', target_raw[i]))
+                    target_blank = sum(1 for i in zip_text_rows if i >= row_count or not target_raw[i])
+                    target_digits = [i for i in range(row_count) if target_raw[i] and re.fullmatch(r'\d+', target_raw[i])]
+                    digits_on_text_rows = sum(1 for i in target_digits if zip_raw[i] and not re.search(r'\d', zip_raw[i]))
+                    examples = ', '.join(_uniq([zip_raw[i] for i in zip_text_rows]))
+                    count = len(zip_text_rows)
+                    blocked_reason = None
+                    if unknown_values:
+                        blocked_reason = f"'{zip_col}' also contains values such as {', '.join(_uniq(sorted(unknown_values)))} that mix digits and letters in an unrecognized way"
+                    elif both_text:
+                        blocked_reason = f"'{target}' already holds text on {both_text} of those rows (e.g. {', '.join(_uniq([target_raw[i] for i in zip_text_rows if i < row_count and target_raw[i]]))}), so a move would overwrite it"
+                    transfer = None
+                    if blocked_reason:
+                        pass
+                    elif target_blank == count:
+                        transfer = {'action': 'move_by_type', 'column': None, 'params': {'source': zip_col, 'target': target, 'type': 'string', 'exceptions': [], 'replacement': ''}}
+                        text = f"Move the {count} text value(s) in '{zip_col}' (e.g. {examples}) into '{target}', where they match the other values and the cell is blank."
+                    elif target_digits and digits_on_text_rows == len(target_digits) and digits_on_text_rows >= max(5, int(count * 0.8)):
+                        moves = [
+                            {'source': zip_col, 'target': target, 'type': 'string', 'exceptions': []},
+                            {'source': target, 'target': zip_col, 'type': 'numeric', 'exceptions': []},
+                        ]
+                        transfer = {'action': 'swap_by_types', 'column': None, 'params': {'moves': moves, 'replacement': ''}}
+                        text = f"Swap the {count} text value(s) in '{zip_col}' (e.g. {examples}) with the ZIP-like numbers in '{target}' on the same rows; the text matches the other values in '{target}'."
+                    else:
+                        blocked_reason = f"'{target}' is neither blank nor ZIP-like on those rows, so the rows do not line up for a swap or move"
+                    if transfer is None:
+                        out.append({
+                            'text': f"{count} text value(s) in '{zip_col}' (e.g. {examples}) look like they belong in '{target}', but no automatic transfer is offered: {blocked_reason}. Review those rows.",
+                            'source': 'zip_text_transfer_blocked',
+                            'confidence': 0.6,
+                        })
+                    else:
+                        out.append({'text': text, 'source': 'zip_text_transfer', 'confidence': 0.8, 'json_steps': cleanup_steps + [transfer]})
+                    out[:] = [
+                        entry for entry in out
+                        if not (entry.get('source') == 'diagnostics' and f"in '{zip_col}' are text, not ZIP codes" in entry.get('text', ''))
+                    ]
             except Exception:
                 pass
     except Exception:
@@ -1490,7 +1856,8 @@ def generate_plain_language_suggestions(metadata: dict[str, Any]) -> list[dict[s
         norm = metadata.get("normalized_path")
         if norm and Path(norm).exists():
             try:
-                df = _read_table(norm)
+                if df is None:
+                    df = _read_table(norm)
                 cols = list(df.columns if _is_polars_df(df) else list(df.columns))
                 sample = df.head(1000) if _is_polars_df(df) else (df.head(1000) if hasattr(df, 'head') else df)
                 for c in cols:
@@ -1532,6 +1899,7 @@ def generate_plain_language_suggestions(metadata: dict[str, Any]) -> list[dict[s
         if not t or t in seen:
             continue
         seen.add(t)
+        _label_suggestion(e)
         uniq.append(e)
     return uniq
 
@@ -1543,47 +1911,60 @@ def convert_uploaded_file(source_path: str | Path, output_dir: str | Path) -> di
 
     suffix = source_path.suffix.lower()
     target = output_dir / f"{_safe_stem(source_path.name)}_{source_path.stat().st_size}_{source_path.stat().st_mtime_ns & 0xFFFF:x}.csv"
-    rows: list[dict[str, Any]] = []
     warnings: list[str] = []
+    temporary_target = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary_target.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDNAMES, quoting=csv.QUOTE_MINIMAL)
+            writer.writeheader()
+            rows = _CsvRowSink(writer)
 
-    if suffix in TEXT_EXTENSIONS:
-        _extract_text_rows(source_path, suffix.lstrip("."), rows)
-    elif suffix in SPREADSHEET_EXTENSIONS:
-        _extract_workbook_rows(source_path, rows)
-    elif suffix in DOCUMENT_EXTENSIONS:
-        _extract_docx_rows(source_path, rows)
-    elif suffix in PRESENTATION_EXTENSIONS:
-        _extract_pptx_rows(source_path, rows)
-    elif suffix in GOOGLE_SHORTCUT_EXTENSIONS:
-        _extract_google_shortcut_rows(source_path, output_dir, rows, warnings)
-    else:
-        warnings.append(f"Unsupported extension {suffix or '(none)'}; stored as line-based text fallback.")
-        _extract_text_rows(source_path, suffix.lstrip(".") or "binary", rows)
+            if suffix in TEXT_EXTENSIONS:
+                _extract_text_rows(source_path, suffix.lstrip("."), rows)
+            elif suffix in SPREADSHEET_EXTENSIONS:
+                _extract_workbook_rows(source_path, rows)
+            elif suffix in DOCUMENT_EXTENSIONS:
+                _extract_docx_rows(source_path, rows)
+            elif suffix in PRESENTATION_EXTENSIONS:
+                _extract_pptx_rows(source_path, rows)
+            elif suffix in GOOGLE_SHORTCUT_EXTENSIONS:
+                _extract_google_shortcut_rows(source_path, output_dir, rows, warnings)
+            else:
+                warnings.append(f"Unsupported extension {suffix or '(none)'}; stored as line-based text fallback.")
+                _extract_text_rows(source_path, suffix.lstrip(".") or "binary", rows)
 
-    if not rows:
-        warnings.append("No structured content was extracted; added a placeholder row.")
-        _append_row(
-            rows,
-            source_kind=suffix.lstrip(".") or "unknown",
-            source_name=source_path.name,
-            source_path=str(source_path),
-            unit_kind="placeholder",
-            text="",
-            notes="no structured content extracted",
-        )
+            if rows.count == 0:
+                warnings.append("No structured content was extracted; added a placeholder row.")
+                _append_row(
+                    rows,
+                    source_kind=suffix.lstrip(".") or "unknown",
+                    source_name=source_path.name,
+                    source_path=str(source_path),
+                    unit_kind="placeholder",
+                    text="",
+                    notes="no structured content extracted",
+                )
+            row_count = rows.count
 
-    _write_rows_to_csv(rows, target)
+        temporary_target.replace(target)
+    except BaseException:
+        temporary_target.unlink(missing_ok=True)
+        raise
 
     metadata = {
         "source_path": str(source_path.resolve()),
         "normalized_path": str(target.resolve()),
         "source_kind": suffix.lstrip(".") or "unknown",
         "source_name": source_path.name,
-        "row_count": len(rows),
+        "row_count": row_count,
         "warnings": warnings,
     }
     # Attempt to compute lightweight profile/inspect/suggestions synchronously.
     # If any step fails, record a warning but proceed with the original metadata.
+    try:
+        analysis_frame = _read_table(str(target))
+    except Exception:
+        analysis_frame = None
     try:
         cleaner = Cleaner()
     except Exception as e:
@@ -1592,12 +1973,12 @@ def convert_uploaded_file(source_path: str | Path, output_dir: str | Path) -> di
 
     if cleaner:
         try:
-            prof = cleaner.profile(str(target))
+            prof = cleaner.profile(str(target), df=analysis_frame)
             metadata["profile"] = prof
         except Exception as e:
             warnings.append(f"profile_failed: {e}")
         try:
-            insp = cleaner.inspect_source(str(target), offset=0, limit=20)
+            insp = cleaner.inspect_source(str(target), offset=0, limit=20, df=analysis_frame)
             # attach diagnostics summary and a short preview
             metadata["inspect_preview"] = insp
             try:
@@ -1626,7 +2007,7 @@ def convert_uploaded_file(source_path: str | Path, output_dir: str | Path) -> di
     try:
         # generate plain-language suggestions for immediate UI use
         try:
-            metadata["plain_language_suggestions"] = generate_plain_language_suggestions(metadata)
+                metadata["plain_language_suggestions"] = generate_plain_language_suggestions(metadata, df=analysis_frame)
         except Exception:
             metadata["plain_language_suggestions"] = []
         metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1639,6 +2020,7 @@ def convert_uploaded_file(source_path: str | Path, output_dir: str | Path) -> di
         except Exception:
             pass
 
+    del analysis_frame
     metadata["metadata_path"] = str(metadata_path.resolve())
     metadata["path"] = metadata["normalized_path"]
     # spawn background worker to compute expensive diagnostics (fuzzy clusters, spell analysis)

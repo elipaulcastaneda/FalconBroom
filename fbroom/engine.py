@@ -520,6 +520,28 @@ def _split_mixed_column(df, col, params=None):
 
 
 # --- Complex conditional derivations ---
+def _iter_dtype_preserving_records(frame):
+    import pandas as _pd
+
+    columns = list(frame.columns)
+    integer_positions = {
+        index for index, dtype in enumerate(frame.dtypes)
+        if _pd.api.types.is_integer_dtype(dtype)
+    }
+    float_positions = {
+        index for index, dtype in enumerate(frame.dtypes)
+        if _pd.api.types.is_float_dtype(dtype)
+    }
+    for values in frame.itertuples(index=False, name=None):
+        row = {}
+        for index, (column, value) in enumerate(zip(columns, values)):
+            if index in integer_positions or index in float_positions:
+                # pd.NA breaks `value or default` checks downstream; iterrows() yielded NaN here.
+                value = float('nan') if _pd.isna(value) else (int(value) if index in integer_positions else float(value))
+            row[column] = value
+        yield row
+
+
 def _apply_derivations(df, params=None):
     """Apply multi-condition derived columns. params: {'rules': [ {'if': '<expr>', 'then': {'col':'name','value':'<expr>'}} ] }
     Expressions may reference columns by name; they are evaluated per-row with a minimal locals mapping.
@@ -663,8 +685,8 @@ def _apply_derivations(df, params=None):
         except Exception:
             # fallback: iterate
             vals = []
-            for _, r in pd.iterrows():
-                vals.append(apply_row(r))
+            for row in _iter_dtype_preserving_records(pd):
+                vals.append(apply_row(row))
             pd[out_col] = vals
 
     if pl is not None:
@@ -731,7 +753,7 @@ def _cross_column_consistency(df, params=None):
             return (False, None)
 
         flags = []; suggs = []
-        for _, row in pd_df.iterrows():
+        for row in _iter_dtype_preserving_records(pd_df):
             f, s = resolve(row)
             flags.append(f); suggs.append(s)
         pd_df[flag_col] = flags
@@ -840,7 +862,7 @@ def _external_lookup(df, params=None):
         headers = params.get('headers') or {}
         import httpx
         results = {out: [] for out in mapping.values()} if mapping else {}
-        for _, row in pd_df.iterrows():
+        for row in _iter_dtype_preserving_records(pd_df):
             try:
                 url = template.format(**{k: row.get(k, '') for k in pd_df.columns})
                 cache_key = ('http', url)
@@ -867,7 +889,7 @@ def _external_lookup(df, params=None):
         import sqlite3
         conn = sqlite3.connect(db)
         results = {out: [] for out in mapping.values()} if mapping else {}
-        for _, row in pd_df.iterrows():
+        for row in _iter_dtype_preserving_records(pd_df):
             try:
                 q = qtemplate.format(**{k: row.get(k, '') for k in pd_df.columns})
                 cur = conn.execute(q)
@@ -1309,6 +1331,109 @@ def _drop_column(df, col):
             return df.drop(columns=[col])
         except Exception:
             return df
+
+
+def _drop_rows(df, columns, params=None):
+    """Drop rows where any of `columns` has the data issue in params['issue'].
+
+    Issues: blank, values (params['values']), not_numeric, not_date (optional params['fmt']),
+    matches / not_matches (params['pattern'], whole-value match). Returns (df_new, info).
+    """
+    params = params or {}
+    issue = params.get("issue")
+    cols = [c for c in ([columns] if isinstance(columns, str) else list(columns or [])) if c in (df.columns if _is_polars_df(df) else list(df.columns))]
+    info = {"step": "drop_rows", "column": cols, "issue": issue, "rows_dropped": 0, "sample_positions": []}
+    if not cols or issue not in ("blank", "values", "not_numeric", "not_date", "matches", "not_matches"):
+        return df, info
+
+    import re as _re
+    numeric_re = _re.compile(r"^[-+]?\d+(?:\.\d+)?$")
+    pattern = None
+    if issue in ("matches", "not_matches"):
+        try:
+            pattern = _re.compile(params.get("pattern") or "")
+        except _re.error:
+            return df, info
+        if not params.get("pattern"):
+            return df, info
+    wanted = {str(v).strip().casefold() for v in (params.get("values") or [])} if issue == "values" else set()
+    fmt = params.get("fmt")
+
+    def flagged(value):
+        if value is None or (isinstance(value, float) and value != value):
+            text = ""
+        else:
+            text = str(value).strip()
+        if issue == "blank":
+            return text == ""
+        if text == "":
+            return False
+        if issue == "values":
+            return text.casefold() in wanted
+        if issue == "not_numeric":
+            cleaned = _re.sub(r"[\$£€¥₹,\s]", "", text)
+            if cleaned.startswith("(") and cleaned.endswith(")"):
+                cleaned = "-" + cleaned[1:-1]
+            return not numeric_re.match(cleaned)
+        if issue == "not_date":
+            if fmt:
+                try:
+                    datetime.strptime(text, fmt)
+                    return False
+                except ValueError:
+                    return True
+            return not _is_date_str(text)
+        matched = pattern.fullmatch(text) is not None
+        return matched if issue == "matches" else not matched
+
+    if _is_polars_df(df) and issue == "blank":
+        python_strip_chars = " \t\n\r\v\f\x1c\x1d\x1e\x1f\x85\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+        enum_type = getattr(pl, "Enum", None)
+        string_type = getattr(pl, "String", getattr(pl, "Utf8", None))
+        drop_expr = None
+        supported_types = True
+        for column in cols:
+            series = df.get_column(column)
+            column_expr = pl.col(column).is_null()
+            if (
+                series.dtype in (string_type, pl.Categorical)
+                or (enum_type is not None and isinstance(series.dtype, enum_type))
+            ):
+                if string_type is None or not hasattr(series.str, "strip_chars"):
+                    supported_types = False
+                    break
+                column_expr = column_expr | (
+                    pl.col(column).cast(string_type).str.strip_chars(python_strip_chars) == ""
+                )
+            elif series.dtype in (pl.Float32, pl.Float64):
+                column_expr = column_expr | pl.col(column).is_nan()
+            elif series.dtype == pl.Object:
+                supported_types = False
+                break
+            drop_expr = column_expr if drop_expr is None else drop_expr | column_expr
+
+        if supported_types and drop_expr is not None:
+            drop_mask = df.select(drop_expr.alias("__drop_rows")).to_series()
+            dropped = int(drop_mask.sum())
+            if not dropped:
+                return df, info
+            info["rows_dropped"] = dropped
+            info["sample_positions"] = [int(position) + 1 for position in drop_mask.arg_true().head(20).to_list()]
+            return df.filter(~drop_mask), info
+
+    if _is_polars_df(df):
+        columns_values = [df.get_column(c).to_list() for c in cols]
+    else:
+        columns_values = [df[c].tolist() for c in cols]
+    drop = [any(flagged(values[i]) for values in columns_values) for i in range(len(columns_values[0]))]
+    dropped = sum(drop)
+    if not dropped:
+        return df, info
+    info["rows_dropped"] = dropped
+    info["sample_positions"] = [i + 1 for i, flag in enumerate(drop) if flag][:20]
+    if _is_polars_df(df):
+        return df.filter(pl.Series([not flag for flag in drop])), info
+    return df.loc[[not flag for flag in drop]].reset_index(drop=True), info
 
 
 def _rename_column(df, old, new):
@@ -1843,56 +1968,48 @@ def _swap_by_types(df, moves, replacement=""):
             ser = s.astype(str).fillna("")
             return ~(is_num_series(ser) | is_date_series(ser) | (ser == ""))
 
-        # perform reciprocal swaps first
-        for a in moves:
-            for b in moves:
-                if a is b:
-                    continue
+        def move_mask(series, mov):
+            pattern = mov.get('pattern')
+            if pattern:
+                rx = _re.compile(pattern)
+                return series.map(lambda v: (not _pd.isna(v)) and bool(rx.fullmatch(str(v).strip())))
+            typ = mov.get('type')
+            if typ == 'numeric':
+                return is_num_series(series)
+            if typ == 'date':
+                return is_date_series(series)
+            return is_string_series(series)
+
+        def blank_mask(series):
+            return series.map(lambda v: _pd.isna(v) or str(v).strip() == '')
+
+        def has_partner(mov):
+            return any(o is not mov and o.get('source') == mov.get('target') and o.get('target') == mov.get('source') for o in moves)
+
+        # perform reciprocal swaps first, once per pair
+        for i, a in enumerate(moves):
+            for b in moves[i + 1:]:
                 if a.get('source') == b.get('target') and a.get('target') == b.get('source'):
                     src = a.get('source')
                     tgt = a.get('target')
                     if src not in pd_df.columns or tgt not in pd_df.columns:
                         continue
-                    # build masks
-                    mask_a = None
-                    mask_b = None
-                    typ_a = a.get('type')
-                    typ_b = b.get('type')
-                    if typ_a == 'numeric':
-                        mask_a = is_num_series(pd_df[src])
-                    elif typ_a == 'date':
-                        mask_a = is_date_series(pd_df[src])
-                    else:
-                        mask_a = is_string_series(pd_df[src])
-
-                    if typ_b == 'numeric':
-                        mask_b = is_num_series(pd_df[tgt])
-                    elif typ_b == 'date':
-                        mask_b = is_date_series(pd_df[tgt])
-                    else:
-                        mask_b = is_string_series(pd_df[tgt])
-
-                    mask = mask_a & mask_b
+                    mask = move_mask(pd_df[src], a) & move_mask(pd_df[tgt], b)
                     if mask.any():
-                        # swap columns where mask True
                         tmp_src = pd_df.loc[mask, src].copy()
                         pd_df.loc[mask, src] = pd_df.loc[mask, tgt].values
                         pd_df.loc[mask, tgt] = tmp_src.values
                         rows_changed += int(mask.sum())
 
-        # single-direction moves
+        # single-direction moves; inside a swap pair they only fill blank target cells
         for mov in moves:
             src = mov.get('source')
             tgt = mov.get('target')
             if src not in pd_df.columns or tgt not in pd_df.columns:
                 continue
-            typ = mov.get('type')
-            if typ == 'numeric':
-                mask = is_num_series(pd_df[src])
-            elif typ == 'date':
-                mask = is_date_series(pd_df[src])
-            else:
-                mask = is_string_series(pd_df[src])
+            mask = move_mask(pd_df[src], mov)
+            if has_partner(mov):
+                mask = mask & blank_mask(pd_df[tgt])
 
             if mask.any():
                 pd_df.loc[mask, tgt] = pd_df.loc[mask, src].values
@@ -1927,6 +2044,27 @@ def _swap_by_types(df, moves, replacement=""):
     rows_changed = 0
     new_data = {c: list(data[c]) for c in cols}
 
+    def matches(mov, val):
+        pattern = mov.get('pattern')
+        if pattern:
+            return val is not None and bool(_re.fullmatch(pattern, str(val).strip()))
+        typ = mov.get('type')
+        exc = mov.get('exceptions') or []
+        if typ == 'numeric':
+            if 'date' in exc and is_date_val(val):
+                return False
+            return is_num_val(val)
+        if typ == 'string':
+            if 'date' in exc and is_date_val(val):
+                return False
+            return is_string_val(val)
+        if typ == 'date':
+            return is_date_val(val)
+        return False
+
+    def partnered(mov):
+        return any(o is not mov and o.get('source') == mov.get('target') and o.get('target') == mov.get('source') for o in moves)
+
     for i in range(n):
         applied_swap = False
         for a in moves:
@@ -1938,21 +2076,6 @@ def _swap_by_types(df, moves, replacement=""):
                     tgt_col = a.get('target')
                     va = data.get(src_col)[i]
                     vb = data.get(tgt_col)[i]
-                    def matches(mov, val):
-                        typ = mov.get('type')
-                        exc = mov.get('exceptions') or []
-                        if typ == 'numeric':
-                            if 'date' in exc and is_date_val(val):
-                                return False
-                            return is_num_val(val)
-                        elif typ == 'string':
-                            if 'date' in exc and is_date_val(val):
-                                return False
-                            return is_string_val(val)
-                        elif typ == 'date':
-                            return is_date_val(val)
-                        return False
-
                     if matches(a, va) and matches(b, vb):
                         new_data[src_col][i] = vb
                         new_data[tgt_col][i] = va
@@ -1970,21 +2093,10 @@ def _swap_by_types(df, moves, replacement=""):
             if src not in data or tgt not in data:
                 continue
             val = data[src][i]
-            typ = mov.get('type')
-            exc = mov.get('exceptions') or []
-            ok = False
-            if typ == 'numeric':
-                if 'date' in exc and is_date_val(val):
-                    ok = False
-                else:
-                    ok = is_num_val(val)
-            elif typ == 'string':
-                if 'date' in exc and is_date_val(val):
-                    ok = False
-                else:
-                    ok = is_string_val(val)
-            elif typ == 'date':
-                ok = is_date_val(val)
+            ok = matches(mov, val)
+            if ok and partnered(mov):
+                existing = data[tgt][i]
+                ok = existing is None or str(existing).strip() == ''
 
             if ok:
                 new_data[tgt][i] = val
@@ -3236,9 +3348,10 @@ def _impute_missing(df, col, params=None):
 class Cleaner:
     # Columns considered metadata and not part of the user's data table
     META_KEYS = {"container_name", "sheet_name", "slide_number", "paragraph_index", "table_index", "column_index", "cell_label", "source_kind", "source_name", "source_path", "unit_kind", "row_index"}
-    def profile(self, path: str):
+    def profile(self, path: str, df=None):
         """Produce a minimal profile for a CSV path using Polars if available."""
-        df = _read_table(path)
+        if df is None:
+            df = _read_table(path)
         profile = {}
         for col in df.columns:
             # ignore metadata columns
@@ -3251,7 +3364,7 @@ class Cleaner:
             profile[col] = {"dtype": dtype, "nulls": nulls, "unique": unique}
         return profile
 
-    def inspect_source(self, path: str, offset: int = 0, limit: int = 100):
+    def inspect_source(self, path: str, offset: int = 0, limit: int = 100, df=None):
         """Return paged row-level data for Source-tab inspection.
 
         If the ingestion produced long-form rows (with `unit_kind` and
@@ -3259,7 +3372,8 @@ class Cleaner:
         parsing each `text` line into columns so the frontend can render a
         familiar grid view.
         """
-        df = _read_table(path)
+        if df is None:
+            df = _read_table(path)
 
         def _is_number(x: str) -> bool:
                 try:
@@ -3842,6 +3956,12 @@ class Cleaner:
                 df = _unique_df(df, subset=subset)
                 continue
 
+            if step.action == "drop_rows":
+                df, info = _drop_rows(df, [c for c in cols if c], step.params or {})
+                if info:
+                    diagnostics.append(info)
+                continue
+
             # For other steps, apply per-column
             for col in cols:
                 # Skip steps that reference missing columns to avoid runtime errors
@@ -4339,6 +4459,17 @@ class Cleaner:
                 subset = [c for c in cols if c]
                 subset = subset if subset else None
                 df_after = _unique_df(df_after, subset=subset)
+                continue
+
+            if step.action == "drop_rows":
+                df_after, info = _drop_rows(df_after, [c for c in cols if c], step.params or {})
+                dropped = int((info or {}).get("rows_dropped") or 0)
+                label = ", ".join(c for c in cols if c)
+                warnings.append({
+                    "step": "drop_rows", "column": label,
+                    "message": f"Dropped {dropped} row(s) where {label} {(step.params or {}).get('issue', 'has an issue')}",
+                    "rows_changed": dropped, "sample_positions": (info or {}).get("sample_positions", []),
+                })
                 continue
 
             for col in cols:

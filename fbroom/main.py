@@ -580,7 +580,8 @@ _connected_ws = set()
 async def _broadcast_shared_update_message(message: dict):
     import asyncio
     to_remove = []
-    text = json.dumps(message, default=str)
+    # broadcasts are change notifications only; never include file paths or names
+    text = json.dumps({"type": message.get("type")}, default=str)
     for ws in list(_connected_ws):
         try:
             await ws.send_text(text)
@@ -771,11 +772,18 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         safe_stem = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in stem)
         target = UPLOAD_DIR / f"{safe_stem}_{uuid4().hex[:8]}{suffix}"
 
-        contents = await file.read()
-        if not contents:
+        first_chunk = await file.read(1024 * 1024)
+        if not first_chunk:
             raise HTTPException(status_code=400, detail="Uploaded file is empty.")
 
-        target.write_bytes(contents)
+        uploaded_size = 0
+        with target.open("wb") as target_file:
+            chunk = first_chunk
+            while chunk:
+                target_file.write(chunk)
+                uploaded_size += len(chunk)
+                chunk = await file.read(1024 * 1024)
+
         conversion = convert_uploaded_file(target, UPLOAD_DIR)
         # persist simple metadata (owner if authenticated)
         try:
@@ -815,7 +823,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
             "source_path": conversion["source_path"],
             "source_kind": conversion["source_kind"],
             "name": file.filename,
-            "size": len(contents),
+            "size": uploaded_size,
             "row_count": conversion["row_count"],
             "warnings": conversion["warnings"],
         }
@@ -1442,6 +1450,38 @@ def recipe_from_text(spec: TextRecipeSpec):
                 "features": spec.regression_features,
                 "group_by": spec.regression_group_by or None,
             }
+        valid_columns = set(profile.keys())
+
+        def _step_column_references(step):
+            references = []
+
+            def add(value):
+                if isinstance(value, str):
+                    if value and value not in references:
+                        references.append(value)
+                elif isinstance(value, (list, tuple)):
+                    for item in value:
+                        add(item)
+
+            def add_condition(condition):
+                if not isinstance(condition, dict):
+                    return
+                add(condition.get("column"))
+                add_condition(condition.get("cond"))
+                for child in condition.get("conds") or []:
+                    add_condition(child)
+
+            add(step.get("column"))
+            params = step.get("params") or {}
+            for key in ("source", "target", "sources", "group_by", "keys"):
+                add(params.get(key))
+            add_condition(params.get("condition"))
+            for move in params.get("moves") or []:
+                if isinstance(move, dict):
+                    add(move.get("source"))
+                    add(move.get("target"))
+            return references
+
         # Template lines and catalog clauses map 1:1 to steps and bypass the legacy NL heuristics.
         template_steps = list(spec.suggested_steps or [])
         if not spec.suggested_steps:
@@ -1457,30 +1497,30 @@ def recipe_from_text(spec: TextRecipeSpec):
             allowed_actions = {
                 "normalize", "unicode_normalize", "regex_replace", "map", "cast", "impute",
                 "replace", "numeric_transform", "deduplicate", "drop_column", "rename",
-                "conditional", "bucketize", "remove_by_type", "move_by_type", "swap_by_types",
+                "conditional", "bucketize", "remove_by_type", "move_by_type", "swap_by_types", "join", "drop_rows",
             }
-            valid_columns = set(profile.keys())
             checked_steps = []
             for step in template_steps:
                 if not isinstance(step, dict) or step.get("action") not in allowed_actions:
                     raise HTTPException(status_code=400, detail="Suggested recipe contains an unsupported action")
-                step_cols = step.get("column")
-                step_cols = [step_cols] if isinstance(step_cols, str) else list(step_cols or [])
-                params = step.get("params") or {}
-                step_cols += [params[k] for k in ("source", "target") if isinstance(params.get(k), str)]
-                for col in step_cols:
+                for col in _step_column_references(step):
                     if col and col not in valid_columns:
                         raise HTTPException(status_code=400, detail=f"Suggested recipe references unknown column: {col}")
                 checked_steps.append(step)
-            # Clean text first, then cast, then scale/round, then impute, then row/column removal, whatever order they were clicked in.
+            # Clean text first, then drop flagged rows, then cast, scale/round, impute, dedupe, rename, and drop columns last.
             phase = {
                 'normalize': 0, 'unicode_normalize': 0, 'regex_replace': 0, 'replace': 0, 'map': 0, 'move_by_type': 0, 'swap_by_types': 0,
-                'cast': 1, 'numeric_transform': 2, 'bucketize': 2, 'impute': 3, 'deduplicate': 4, 'rename': 5, 'drop_column': 6,
+                'drop_rows': 1, 'cast': 2, 'numeric_transform': 3, 'bucketize': 3, 'impute': 4, 'deduplicate': 5, 'rename': 6, 'drop_column': 7,
             }
-            checked_steps.sort(key=lambda step: phase.get(step.get('action'), 1))
+            checked_steps.sort(key=lambda step: phase.get(step.get('action'), 2))
             recipe = Recipe(sources=[{"path": spec.source_path}], cleaning_steps=checked_steps, joins=[], outputs=[{"path": spec.output_path}])
         else:
             recipe = recipe_from_plain_english(spec.instruction, profile, spec.source_path, spec.output_path, regression_options=reg_opts)
+        for step in recipe.cleaning_steps:
+            step_data = step.model_dump() if hasattr(step, "model_dump") else step.dict()
+            for col in _step_column_references(step_data):
+                if col and col not in valid_columns:
+                    raise HTTPException(status_code=400, detail=f"Recipe references unknown column: {col}")
         explanations = explain_recipe(recipe, profile)
         # ensure parser output does not include metadata-targeting steps
         try:
@@ -1631,6 +1671,8 @@ def recipe_from_text(spec: TextRecipeSpec):
         }
 
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -2900,6 +2942,16 @@ def join_preview(spec: JoinPreviewSpec):
 
         # perform join (use polars), but first rename conflicting right-side columns
         joined = None
+        joined_count = None
+        preview_rows = None
+        used_lazy_preview = False
+        use_lazy_samples = (
+            spec.sample is not None
+            and spec.sample > 0
+            and _is_polars_df(left_df)
+            and _is_polars_df(right_df)
+        )
+        common = []
         try:
             # identify conflict columns (exclude join keys)
             lcols = set(left_df.columns)
@@ -2920,9 +2972,39 @@ def join_preview(spec: JoinPreviewSpec):
                     except Exception:
                         pass
 
-            joined = left_df.join(right_df, left_on=left_on, right_on=right_on, how=how)
+            if use_lazy_samples and how != "outer":
+                joined_lazy = left_df.lazy().join(
+                    right_df.lazy(), left_on=left_on, right_on=right_on, how=how
+                )
+                joined_count = int(joined_lazy.select(pl.len()).collect().item())
+                if spec.sample < joined_count:
+                    preview_lazy = joined_lazy
+                    if prefer == 'right' and common and how != "anti":
+                        for base in common:
+                            right_name = f"{base}{suffix_right}"
+                            if right_name in right_df.columns and base in left_df.columns:
+                                try:
+                                    preview_lazy = preview_lazy.with_columns(
+                                        pl.when(pl.col(right_name).is_not_null())
+                                        .then(pl.col(right_name))
+                                        .otherwise(pl.col(base))
+                                        .alias(base)
+                                    ).drop(right_name)
+                                except Exception:
+                                    pass
+                    preview_rows = _df_head_records(preview_lazy.head(spec.sample).collect(), n=spec.sample)
+                    used_lazy_preview = True
+                else:
+                    joined = left_df.join(right_df, left_on=left_on, right_on=right_on, how=how)
+            else:
+                joined = left_df.join(right_df, left_on=left_on, right_on=right_on, how=how)
         except Exception:
             # try pandas fallback with explicit suffixes
+            joined = None
+            joined_count = None
+            preview_rows = None
+            used_lazy_preview = False
+            use_lazy_samples = False
             try:
                 import pandas as _pd
                 lpd = left_df.to_pandas() if hasattr(left_df, 'to_pandas') else left_df
@@ -2946,33 +3028,52 @@ def join_preview(spec: JoinPreviewSpec):
                 right_count = right_df.shape[0]
             except Exception:
                 right_count = None
-        try:
-            joined_count = len(joined)
-        except Exception:
+        if not used_lazy_preview:
             try:
-                joined_count = joined.shape[0]
+                joined_count = len(joined)
             except Exception:
-                joined_count = None
+                try:
+                    joined_count = joined.shape[0]
+                except Exception:
+                    joined_count = None
 
         # unmatched samples
         unmatched_left = None
         unmatched_right = None
-        try:
-            if how in ("inner", "left", "outer"):
-                unmatched_left_df = left_df.join(right_df, left_on=left_on, right_on=right_on, how="anti")
-                unmatched_left = _df_head_records(unmatched_left_df, n=spec.sample)
-        except Exception:
-            unmatched_left = []
-        try:
-            if how in ("inner", "right", "outer"):
-                unmatched_right_df = right_df.join(left_df, left_on=right_on, right_on=left_on, how="anti")
-                unmatched_right = _df_head_records(unmatched_right_df, n=spec.sample)
-        except Exception:
-            unmatched_right = []
+        if use_lazy_samples:
+            try:
+                if how in ("inner", "left", "outer"):
+                    unmatched_left_lazy = left_df.lazy().join(
+                        right_df.lazy(), left_on=left_on, right_on=right_on, how="anti"
+                    )
+                    unmatched_left = _df_head_records(unmatched_left_lazy.head(spec.sample).collect(), n=spec.sample)
+            except Exception:
+                unmatched_left = []
+            try:
+                if how in ("inner", "right", "outer"):
+                    unmatched_right_lazy = right_df.lazy().join(
+                        left_df.lazy(), left_on=right_on, right_on=left_on, how="anti"
+                    )
+                    unmatched_right = _df_head_records(unmatched_right_lazy.head(spec.sample).collect(), n=spec.sample)
+            except Exception:
+                unmatched_right = []
+        else:
+            try:
+                if how in ("inner", "left", "outer"):
+                    unmatched_left_df = left_df.join(right_df, left_on=left_on, right_on=right_on, how="anti")
+                    unmatched_left = _df_head_records(unmatched_left_df, n=spec.sample)
+            except Exception:
+                unmatched_left = []
+            try:
+                if how in ("inner", "right", "outer"):
+                    unmatched_right_df = right_df.join(left_df, left_on=right_on, right_on=left_on, how="anti")
+                    unmatched_right = _df_head_records(unmatched_right_df, n=spec.sample)
+            except Exception:
+                unmatched_right = []
 
         # If prefer == 'right', collapse suffixed right columns into base names
         try:
-            if prefer == 'right' and common:
+            if joined is not None and prefer == 'right' and common:
                 if isinstance(joined, dict) or not hasattr(joined, 'columns'):
                     pass
                 else:
@@ -3010,7 +3111,8 @@ def join_preview(spec: JoinPreviewSpec):
         except Exception:
             pass
 
-        preview_rows = _df_head_records(joined, n=spec.sample)
+        if preview_rows is None:
+            preview_rows = _df_head_records(joined, n=spec.sample)
 
         return {
             "stats": {"left_count": left_count, "right_count": right_count, "joined_count": joined_count},
@@ -4076,6 +4178,31 @@ def _find_team_owner_by_name(team_name: str):
     return None
 
 
+TEAM_ROLES = ("member", "admin", "guest")
+
+
+def _team_owner_for(user: dict):
+    """Return the owner record of the team this user belongs to (or owns), else None."""
+    if not user:
+        return None
+    if user.get("team_name"):
+        return _find_team_owner_by_name(user.get("team_name")) or user
+    email = (user.get("email") or "").lower()
+    if not email:
+        return None
+    try:
+        for p in _users_dir().glob("*.json"):
+            try:
+                uu = json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if email in [str(m).lower() for m in (uu.get("team_members") or [])]:
+                return uu
+    except Exception:
+        pass
+    return None
+
+
 def _get_user_from_token(token: str):
     # Support both pre-existing session files and JWT tokens
     try:
@@ -4289,6 +4416,29 @@ def _send_email_message(to_email: str, subject: str, body: str):
     smtp_pass = os.environ.get("SMTP_PASS")
     from_addr = os.environ.get("FROM_EMAIL") or "noreply@falconbroom.local"
     msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = to_email
+    msg.set_content(body)
+    if not smtp_host:
+        # no SMTP configured: persist locally so the message can be retrieved, and report not sent
+        try:
+            edir = Path("data") / "emails"
+            edir.mkdir(parents=True, exist_ok=True)
+            (edir / f"email_{uuid4().hex}.json").write_text(json.dumps({"to": to_email, "subject": subject, "body": body}, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        return False
+    import smtplib
+    with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as s:
+        try:
+            s.starttls()
+        except Exception:
+            pass
+        if smtp_user and smtp_pass:
+            s.login(smtp_user, smtp_pass)
+        s.send_message(msg)
+    return True
 
 
 # Session file helpers: optional encryption using SESSION_ENCRYPTION_KEY env var.
@@ -4395,12 +4545,12 @@ def _make_verification_token(user_id: str, email: str, expires_seconds: int = 60
     return jwt.encode(payload, jwt_secret, algorithm=jwt_algo)
 
 
-def _make_invite_token(inviter_id: str, invitee_email: str, team_name: Optional[str] = None, expires_seconds: int = 60 * 60 * 24 * 7):
+def _make_invite_token(inviter_id: str, invitee_email: str, team_name: Optional[str] = None, expires_seconds: int = 60 * 60 * 24 * 7, role: str = "member"):
     jwt_secret = JWT_SECRET
     jwt_algo = JWT_ALGO
     now = datetime.now(timezone.utc)
     exp = now.timestamp() + expires_seconds
-    payload = {"inviter": inviter_id, "email": invitee_email, "team": team_name, "purpose": "invite", "iat": int(now.timestamp()), "exp": int(exp), "jti": uuid4().hex}
+    payload = {"inviter": inviter_id, "email": invitee_email, "team": team_name, "role": role, "purpose": "invite", "iat": int(now.timestamp()), "exp": int(exp), "jti": uuid4().hex}
     return jwt.encode(payload, jwt_secret, algorithm=jwt_algo)
 
 
@@ -5856,26 +6006,36 @@ def admin_queue_delete(request: Request, payload: dict):
 def team_invite(payload: dict, request: Request):
     try:
         user = _require_auth(request)
-        email = payload.get("email")
+        email = (payload.get("email") or "").strip()
         role = payload.get("role") or "member"
         if not email:
             raise HTTPException(status_code=400, detail="Missing invite email")
+        if role not in TEAM_ROLES:
+            raise HTTPException(status_code=400, detail="Invalid role")
         inviter = user
         team_name = inviter.get("team_name") or payload.get("team_name") or inviter.get("username") + "'s team"
-        token = _make_invite_token(inviter.get("id"), email, team_name)
+        token = _make_invite_token(inviter.get("id"), email, team_name, role=role)
         # persist invite record
         invdir = Path("data") / "invites"
         invdir.mkdir(parents=True, exist_ok=True)
         invfile = invdir / f"invite_{uuid4().hex}.json"
         invfile.write_text(json.dumps({"inviter": inviter.get("id"), "email": email, "role": role, "team": team_name, "token": token, "created_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}, indent=2), encoding="utf-8")
-        # send email
+        # the owner's record must carry the team name so the team can be resolved on accept
+        if not inviter.get("team_name"):
+            try:
+                inviter["team_name"] = team_name
+                inviter["team_owner"] = True
+                (_users_dir() / f"{inviter.get('id')}.json").write_text(json.dumps(inviter, indent=2, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                pass
+        email_sent = False
         try:
             link = os.environ.get("APP_URL", "http://localhost:3000") + f"/accept-invite?token={token}"
-            _send_email_message(email, "You are invited to FalconBroom", f"You were invited to join {team_name}. Accept: {link}")
+            email_sent = bool(_send_email_message(email, "You are invited to FalconBroom", f"You were invited to join {team_name}. Accept: {link}\n\nOr paste this invite token in the Team tab: {token}"))
         except Exception:
-            pass
+            email_sent = False
         _consent_audit("team_invite", {"inviter": inviter.get("id"), "email": email, "team": team_name})
-        return {"ok": True}
+        return {"ok": True, "email_sent": email_sent, "token": None if email_sent else token}
     except HTTPException:
         raise
     except Exception as e:
@@ -5883,61 +6043,40 @@ def team_invite(payload: dict, request: Request):
 
 
 @app.post("/team/accept")
-def team_accept(payload: dict):
+def team_accept(payload: dict, request: Request):
+    """Join a team using an invite token. The caller must be signed in as the invited email."""
     try:
+        user = _require_auth(request)
         token = payload.get("token")
-        username = payload.get("username")
-        password = payload.get("password")
         if not token:
             raise HTTPException(status_code=400, detail="Missing token")
-        jwt_secret = JWT_SECRET
-        jwt_algo = JWT_ALGO
         try:
-            data = jwt.decode(token, jwt_secret, algorithms=[jwt_algo])
+            data = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid or expired token")
         if data.get("purpose") != "invite":
             raise HTTPException(status_code=400, detail="Invalid token purpose")
-        email = data.get("email")
-        inviter_id = data.get("inviter")
-        team_name = data.get("team")
-        # find or create user for invitee
-        existing = _find_user_by_email(email)
-        if existing:
-            # add to inviter's team
-            inviter = _get_user_by_id(inviter_id)
-            if not inviter:
-                raise HTTPException(status_code=404, detail="Inviter not found")
-            inviter.setdefault("team_name", team_name)
-            members = inviter.setdefault("team_members", [])
-            if email not in members:
-                members.append(email)
-            p = _users_dir() / f"{inviter.get('id')}.json"
-            p.write_text(json.dumps(inviter, indent=2, ensure_ascii=False), encoding="utf-8")
-            _consent_audit("team_accept", {"inviter": inviter.get("id"), "added": email})
-            return {"ok": True}
-        # create new user with supplied username/password
-        if not username or not password:
-            raise HTTPException(status_code=400, detail="Missing username/password for account creation")
-        new_user = _create_user(username, email, password)
-        # add to inviter's team
-        inviter = _get_user_by_id(inviter_id)
-        if inviter:
-            inviter.setdefault("team_name", team_name)
-            members = inviter.setdefault("team_members", [])
-            if email not in members:
-                members.append(email)
-            p = _users_dir() / f"{inviter.get('id')}.json"
-            p.write_text(json.dumps(inviter, indent=2, ensure_ascii=False), encoding="utf-8")
-        _consent_audit("team_accept", {"inviter": inviter_id, "new_user": new_user.get('id')})
-        tokens = _create_session_tokens(new_user.get("id"), persistent=True)
-        # set cookie via response semantics not available here; return access token and client should call /login
-        return {"access_token": tokens.get("access_token"), "user_id": new_user.get("id")}
+        email = (data.get("email") or "").strip()
+        invited_role = data.get("role") if data.get("role") in TEAM_ROLES else "member"
+        if not user.get("email") or user.get("email").strip().lower() != email.lower():
+            raise HTTPException(status_code=403, detail=f"This invite was sent to {email}. Sign in with that email to accept it.")
+        inviter = _get_user_by_id(data.get("inviter"))
+        if not inviter:
+            raise HTTPException(status_code=404, detail="Inviter not found")
+        if inviter.get("id") == user.get("id"):
+            raise HTTPException(status_code=400, detail="You cannot accept your own invite")
+        inviter.setdefault("team_name", data.get("team"))
+        members = inviter.setdefault("team_members", [])
+        if email.lower() not in [str(m).lower() for m in members]:
+            members.append(email)
+        inviter.setdefault("team_roles", {})[email] = invited_role
+        (_users_dir() / f"{inviter.get('id')}.json").write_text(json.dumps(inviter, indent=2, ensure_ascii=False), encoding="utf-8")
+        _consent_audit("team_accept", {"inviter": inviter.get("id"), "added": email})
+        return {"ok": True, "team_name": inviter.get("team_name"), "role": invited_role}
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/uploads/{name}/share")
 def share_upload(name: str, payload: dict, request: Request):
@@ -5990,8 +6129,17 @@ def share_upload(name: str, payload: dict, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/uploads/shared")
-def list_shared_uploads():
+def _shared_uploads_for(user: dict):
+    """Shared uploads visible to `user`: files they shared plus files shared by members of their team."""
+    owner = _team_owner_for(user)
+    team_ids = set()
+    if owner:
+        team_ids.add(owner.get("id"))
+        for m in (owner.get("team_members") or []):
+            mu = _find_user_by_email(m)
+            if mu:
+                team_ids.add(mu.get("id"))
+    team_ids.add(user.get("id"))
     out = []
     try:
         for p in UPLOAD_DIR.iterdir():
@@ -6002,7 +6150,7 @@ def list_shared_uploads():
                 if not meta.exists():
                     continue
                 mj = json.loads(meta.read_text(encoding="utf-8"))
-                if mj.get("shared_with_team"):
+                if mj.get("shared_with_team") and mj.get("shared_by") in team_ids:
                     st = p.stat()
                     out.append({"name": p.name, "path": str(p), "size": st.st_size, "modified_at": datetime.utcfromtimestamp(st.st_mtime).isoformat() + "Z", "shared_by": mj.get("shared_by"), "shared_at": mj.get("shared_at")})
             except Exception:
@@ -6010,6 +6158,11 @@ def list_shared_uploads():
     except Exception:
         pass
     return {"uploads": sorted(out, key=lambda r: r.get("shared_at") or "", reverse=True)}
+
+
+@app.get("/uploads/shared")
+def list_shared_uploads(request: Request):
+    return _shared_uploads_for(_require_auth(request))
 
 
 @app.post("/privacy/optout")
@@ -6184,12 +6337,17 @@ def privacy_record(payload: dict):
 
 @app.websocket("/ws/shared")
 async def ws_shared(websocket: WebSocket):
+    token = websocket.query_params.get("token") or ""
+    user = _get_user_from_token(token) if token else None
+    if not user:
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     _connected_ws.add(websocket)
     try:
-        # send initial state
+        # send initial state scoped to this user's team
         try:
-            init = list_shared_uploads()
+            init = _shared_uploads_for(user)
             await websocket.send_text(json.dumps({"type": "init", "uploads": init.get("uploads", [])}, default=str))
         except Exception:
             pass
@@ -6314,15 +6472,17 @@ def list_team_members(request: Request):
         # owner entry
         members.append({"id": owner.get("id"), "username": owner.get("username"), "email": owner.get("email"), "role": "owner"})
         # include explicit team_members (emails)
+        roles = owner.get("team_roles") or {}
         for email in (owner.get("team_members") or []):
+            role = roles.get(email) if roles.get(email) in TEAM_ROLES else "member"
             try:
                 u = _find_user_by_email(email)
                 if u:
-                    members.append({"id": u.get("id"), "username": u.get("username"), "email": u.get("email"), "role": "member"})
+                    members.append({"id": u.get("id"), "username": u.get("username"), "email": u.get("email"), "role": role})
                 else:
-                    members.append({"id": None, "username": None, "email": email, "role": "member"})
+                    members.append({"id": None, "username": None, "email": email, "role": role})
             except Exception:
-                members.append({"id": None, "username": None, "email": email, "role": "member"})
+                members.append({"id": None, "username": None, "email": email, "role": role})
 
         return {"team_name": team_name, "members": members}
     except HTTPException:
@@ -6437,8 +6597,8 @@ def update_team_member(payload: dict, request: Request):
             return {"ok": True}
         elif action == "update_role":
             role = payload.get("role")
-            if not role:
-                raise HTTPException(status_code=400, detail="Missing role")
+            if role not in TEAM_ROLES:
+                raise HTTPException(status_code=400, detail="Invalid role")
             roles = owner.setdefault("team_roles", {})
             roles[target_email] = role
             p = _users_dir() / f"{owner.get('id')}.json"

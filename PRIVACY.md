@@ -7,6 +7,8 @@ Purpose
 
 Consent & PII
 - The `data/` folder may contain consent records, user profiles, uploads and other production-like artifacts.
+- Workflow drafts for uploaded files are stored in that upload's `.meta.json` sidecar. Drafts can include the user's instruction, recipe JSON, and editor settings; they do not duplicate the uploaded file contents.
+- Deleting an upload through the app also deletes its metadata sidecar and saved workflow draft.
 - Before sharing the repository or a snapshot with partners, ensure consent records and PII are either:
   - replaced by synthetic records (preferred), or
   - removed entirely from the distribution.

@@ -1,20 +1,19 @@
-"""Single source of truth for recipe steps shared by suggestions, templates and the text parser.
+"""Shared recipe-step grammar for suggestions, templates and the text parser.
 
-Every step shape is expressible three ways that must stay equivalent:
-  * a structured step dict (what the engine runs),
-  * a compact template line (`cast column=x to=float`),
-  * a plain-English clause (`cast x to float`).
-`step_to_template`/`step_to_text` serialize a step; `parse_machine_template`/`parse_instruction`
-read it back. tests/test_parser_suggestion_parity.py asserts the round trips.
+Machine templates cover the catalog actions; plain-English clauses are supported
+for the subset with unambiguous natural-language forms.
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
+from urllib.parse import quote, unquote
 
 TEMPLATE_ACTIONS = (
     'normalize', 'impute', 'cast', 'coerce', 'regex_replace', 'map', 'numeric_transform',
     'deduplicate', 'drop_column', 'rename', 'unicode_normalize', 'replace', 'move_by_type',
+    'bucketize', 'conditional', 'remove_by_type', 'swap_by_types', 'join', 'drop_rows',
 )
 
 _TYPE_WORDS = {
@@ -55,6 +54,14 @@ def _token(value: Any) -> str | None:
     return _quote(text)
 
 
+def _json_token(value: Any) -> str:
+    return quote(json.dumps(value, separators=(',', ':'), ensure_ascii=True), safe='')
+
+
+def _decode_json(value: str) -> Any:
+    return json.loads(unquote(value))
+
+
 def parse_machine_template(mt: str) -> dict | None:
     """Parse one template line such as `cast column=x to=float` into a step dict."""
     try:
@@ -70,6 +77,11 @@ def parse_machine_template(mt: str) -> dict | None:
                 v = v[1:-1]
             kv[k.lower()] = v
 
+        if kv.get('step'):
+            step = _decode_json(kv['step'])
+            if isinstance(step, dict) and step.get('action') == action:
+                return step
+
         col = kv.get('column')
         if action == 'normalize' and col:
             return {'action': 'normalize', 'column': col, 'params': {'case': kv.get('case') or 'lower'}}
@@ -79,6 +91,12 @@ def parse_machine_template(mt: str) -> dict | None:
                 params['value'] = _num(kv['value'])
             if kv.get('source'):
                 params['source'] = kv['source']
+            if kv.get('sources'):
+                params['sources'] = _decode_json(kv['sources'])
+            if kv.get('model'):
+                params['model'] = kv['model']
+            if kv.get('group_by'):
+                params['group_by'] = kv['group_by']
             return {'action': 'impute', 'column': col, 'params': params}
         if action in ('cast', 'coerce') and col and (kv.get('to') or kv.get('type')):
             params = {'to': kv.get('to') or kv.get('type')}
@@ -113,6 +131,16 @@ def parse_machine_template(mt: str) -> dict | None:
             return {'action': 'deduplicate', 'column': column, 'params': {}}
         if action == 'drop_column' and col:
             return {'action': 'drop_column', 'column': col, 'params': {}}
+        if action == 'drop_rows' and col and kv.get('issue'):
+            names = [c.strip() for c in col.split(',') if c.strip()]
+            params = {'issue': kv['issue']}
+            if kv.get('values'):
+                params['values'] = _decode_json(kv['values'])
+            if kv.get('pattern') is not None:
+                params['pattern'] = kv['pattern']
+            if kv.get('fmt'):
+                params['fmt'] = kv['fmt']
+            return {'action': 'drop_rows', 'column': names[0] if len(names) == 1 else names, 'params': params}
         if action == 'rename' and col and (kv.get('new_name') or kv.get('to')):
             return {'action': 'rename', 'column': col, 'params': {'new_name': kv.get('new_name') or kv.get('to')}}
         if action == 'unicode_normalize' and col:
@@ -127,12 +155,30 @@ def parse_machine_template(mt: str) -> dict | None:
                 'source': kv['source'], 'target': kv['target'], 'type': kv.get('type') or 'string',
                 'exceptions': [], 'replacement': '',
             }}
+        if action == 'bucketize' and col and kv.get('buckets'):
+            return {'action': 'bucketize', 'column': col, 'params': {'buckets': _decode_json(kv['buckets'])}}
+        if action == 'conditional' and kv.get('params'):
+            return {'action': 'conditional', 'column': col, 'params': _decode_json(kv['params'])}
+        if action == 'remove_by_type' and col and kv.get('target_type'):
+            params = {'target_type': kv['target_type'], 'replacement': _decode_json(kv['replacement']) if kv.get('replacement') else ''}
+            if kv.get('exceptions'):
+                params['exceptions'] = _decode_json(kv['exceptions'])
+            return {'action': 'remove_by_type', 'column': col, 'params': params}
+        if action == 'swap_by_types' and kv.get('moves'):
+            return {'action': 'swap_by_types', 'column': None, 'params': {
+                'moves': _decode_json(kv['moves']), 'replacement': _decode_json(kv.get('replacement', quote('""'))),
+            }}
+        if action == 'join' and kv.get('left') and kv.get('right') and kv.get('keys'):
+            return {'action': 'join', 'column': None, 'params': {
+                'left': kv['left'], 'right': kv['right'], 'keys': _decode_json(kv['keys']),
+                'fuzzy': str(kv.get('fuzzy', 'false')).lower() in ('1', 'true', 'yes'),
+            }}
         return None
     except Exception:
         return None
 
 
-def step_to_template(step: dict) -> str | None:
+def _step_to_template_legacy(step: dict) -> str | None:
     """Serialize a step to a template line, or None when it cannot be written losslessly."""
     action = step.get('action')
     column = step.get('column')
@@ -149,6 +195,30 @@ def step_to_template(step: dict) -> str | None:
         if not src or not tgt or params.get('exceptions') or params.get('replacement'):
             return None
         return f"move_by_type source={src} target={tgt} type={params.get('type', 'string')}"
+    if action == 'swap_by_types':
+        return f"swap_by_types moves={_json_token(params.get('moves', []))} replacement={_json_token(params.get('replacement', ''))}"
+    if action == 'join':
+        left, right = _token(params.get('left', '')), _token(params.get('right', ''))
+        if not left or not right:
+            return None
+        return f"join left={left} right={right} keys={_json_token(params.get('keys', []))} fuzzy={str(bool(params.get('fuzzy', False))).lower()}"
+    if action == 'conditional' and column is None:
+        return f"conditional params={_json_token(params)}"
+    if action == 'drop_rows':
+        names = [column] if isinstance(column, str) else list(column or [])
+        quoted_names = _quote(','.join(names)) if names else None
+        if not quoted_names or not params.get('issue'):
+            return None
+        line = f"drop_rows column={quoted_names} issue={params['issue']}"
+        if params.get('values'):
+            line += f" values={_json_token(params['values'])}"
+        for key in ('pattern', 'fmt'):
+            if params.get(key) is not None:
+                quoted = _quote(params[key])
+                if quoted is None:
+                    return None
+                line += f" {key}={quoted}"
+        return line
     if not col:
         return None
     if action == 'normalize':
@@ -178,6 +248,12 @@ def step_to_template(step: dict) -> str | None:
             if source is None:
                 return None
             line += f" source={source}"
+        if params.get('sources'):
+            line += f" sources={_json_token(params['sources'])}"
+        if params.get('model'):
+            line += f" model={_token(params['model'])}"
+        if params.get('group_by'):
+            line += f" group_by={_token(params['group_by'])}"
         return line
     if action == 'map':
         mapping = params.get('mapping') or {}
@@ -205,15 +281,58 @@ def step_to_template(step: dict) -> str | None:
     if action == 'replace':
         old, new = _quote(params.get('old', '')), _quote(params.get('new', ''))
         return None if old is None or new is None else f"replace column={col} old={old} new={new}"
+    if action == 'bucketize':
+        return f"bucketize column={col} buckets={_json_token(params.get('buckets', []))}"
+    if action == 'conditional':
+        return f"conditional column={col} params={_json_token(params)}"
+    if action == 'remove_by_type':
+        line = f"remove_by_type column={col} target_type={params.get('target_type')} replacement={_json_token(params.get('replacement', ''))}"
+        if params.get('exceptions'):
+            line += f" exceptions={_json_token(params['exceptions'])}"
+        return line
     return None
 
 
-def step_to_text(step: dict) -> str | None:
+def _same_step(left: Any, right: Any) -> bool:
+    try:
+        return json.dumps(left, sort_keys=True, separators=(',', ':')) == json.dumps(right, sort_keys=True, separators=(',', ':'))
+    except (TypeError, ValueError):
+        return False
+
+
+def step_to_template(step: dict) -> str | None:
+    template = _step_to_template_legacy(step)
+    if template and _same_step(parse_machine_template(template), step):
+        return template
+    action = step.get('action')
+    if not isinstance(action, str) or action.lower() not in TEMPLATE_ACTIONS:
+        return None
+    return f"{action} step={_json_token(step)}"
+
+
+def _step_to_text_legacy(step: dict) -> str | None:
     """Serialize a step to a plain-English clause that `parse_instruction` reads back."""
     action = step.get('action')
     column = step.get('column')
     params = step.get('params') or {}
     c = column if isinstance(column, str) else None
+    detail = json.dumps(step, separators=(',', ':'), ensure_ascii=True)
+    if action == 'bucketize':
+        return f"Bucketize values in '{c}' into labeled ranges (recipe details: {detail})" if c else None
+    if action == 'conditional':
+        return f"Apply a conditional update (recipe details: {detail})"
+    if action == 'remove_by_type':
+        kind = params.get('target_type')
+        return f"Remove {kind} values from '{c}' (recipe details: {detail})" if c and kind else None
+    if action == 'swap_by_types':
+        return f"Swap values between columns by type (recipe details: {detail})"
+    if action == 'join':
+        kind = 'Fuzzy join' if params.get('fuzzy') else 'Join'
+        return f"{kind} datasets on their matching keys (recipe details: {detail})"
+    if action == 'impute' and params.get('strategy') == 'from_column':
+        return f"Fill missing values in '{c}' from another column (recipe details: {detail})" if c else None
+    if action == 'impute' and params.get('strategy') == 'regression':
+        return f"Impute missing values in '{c}' using regression (recipe details: {detail})" if c else None
     if action == 'deduplicate':
         if column is None:
             return 'remove duplicate rows'
@@ -224,6 +343,25 @@ def step_to_text(step: dict) -> str | None:
         if params.get('exceptions') or params.get('replacement'):
             return None
         return f"move all {kind} values from {params.get('source')} to {params.get('target')}"
+    if action == 'drop_rows' and c:
+        issue = params.get('issue')
+        if issue == 'blank':
+            return f"drop rows where {c} is blank"
+        if issue == 'not_numeric':
+            return f"drop rows where {c} is not a number"
+        if issue == 'not_date':
+            if not params.get('fmt'):
+                return f"drop rows where {c} is not a valid date"
+            fmt = _quote(params['fmt'])
+            return None if fmt is None else f"drop rows where {c} is not a valid date using format {fmt}"
+        if issue == 'values' and params.get('values'):
+            quoted_values = [_quote(v) for v in params['values']]
+            return None if any(v is None for v in quoted_values) else f"drop rows where {c} is one of {', '.join(quoted_values)}"
+        if issue in ('matches', 'not_matches') and params.get('pattern') is not None:
+            pattern = _quote(params['pattern'])
+            verb = 'matches' if issue == 'matches' else 'does not match'
+            return None if pattern is None else f"drop rows where {c} {verb} regex {pattern}"
+        return None
     if not c:
         return None
     if action == 'normalize':
@@ -286,6 +424,42 @@ def step_to_text(step: dict) -> str | None:
     return None
 
 
+def _instruction_columns(step: dict) -> list[str]:
+    columns: list[str] = []
+
+    def add(value: Any) -> None:
+        if isinstance(value, str) and value and value not in columns:
+            columns.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                add(item)
+
+    params = step.get('params') or {}
+    add(step.get('column'))
+    for key in ('source', 'target', 'group_by', 'sources', 'keys'):
+        add(params.get(key))
+    condition = params.get('condition')
+    if isinstance(condition, dict):
+        add(condition.get('column'))
+    for move in params.get('moves') or []:
+        if isinstance(move, dict):
+            add(move.get('source'))
+            add(move.get('target'))
+    return columns
+
+
+def step_to_text(step: dict) -> str | None:
+    text = _step_to_text_legacy(step)
+    if text:
+        parsed = parse_instruction(text, _instruction_columns(step))
+        if parsed and len(parsed) == 1 and _same_step(parsed[0], step):
+            return text
+    action = step.get('action')
+    if not isinstance(action, str):
+        return None
+    return f"Apply the {action} operation (recipe details: {json.dumps(step, separators=(',', ':'), ensure_ascii=True)})"
+
+
 def steps_to_template(steps: list[dict]) -> str | None:
     lines = [step_to_template(step) for step in steps]
     return None if not lines or any(line is None for line in lines) else '\n'.join(lines)
@@ -316,6 +490,40 @@ def _clause_steps(clause: str, cols: list[str], last_col: str | None) -> list[di
         step = parse_machine_template(clause)
         return [step] if step else None
 
+    complete_step = re.fullmatch(r"apply the (?P<action>[a-z][a-z0-9_]*) operation \(recipe details: (?P<step>\{.*\})\)", clause, re.I)
+    if complete_step:
+        try:
+            step = json.loads(complete_step.group('step'))
+            if isinstance(step, dict) and step.get('action') == complete_step.group('action').lower():
+                return [step]
+        except (TypeError, ValueError):
+            return None
+
+    details = re.fullmatch(
+        r"(?P<label>bucketize values in .+ into labeled ranges|apply a conditional update|remove (?:numeric|string) values from .+|swap values between columns by type|join datasets on their matching keys|fuzzy join datasets on their matching keys|fill missing values in .+ from another column|impute missing values in .+ using regression) \(recipe details: (?P<step>\{.*\})\)",
+        clause,
+        re.I,
+    )
+    if details:
+        try:
+            step = json.loads(details.group('step'))
+            action = step.get('action')
+            labels = {
+                'bucketize': 'bucketize values in',
+                'conditional': 'apply a conditional update',
+                'remove_by_type': 'remove ',
+                'swap_by_types': 'swap values between columns by type',
+                'join': 'fuzzy join datasets' if (step.get('params') or {}).get('fuzzy') else 'join datasets',
+            }
+            if action == 'impute':
+                strategy = (step.get('params') or {}).get('strategy')
+                labels['impute'] = 'fill missing values in' if strategy == 'from_column' else 'impute missing values in'
+            expected = labels.get(action)
+            if expected and details.group('label').lower().startswith(expected):
+                return [step]
+        except (AttributeError, TypeError, ValueError):
+            return None
+
     real = {c.lower(): c for c in cols}
     alt = '|'.join(re.escape(c) for c in sorted(cols, key=len, reverse=True)) or r"[A-Za-z_][\w.]*"
     col = r"['\"]?(?P<c>" + alt + r")['\"]?(?:\s+column)?"
@@ -331,6 +539,26 @@ def _clause_steps(clause: str, cols: list[str], last_col: str | None) -> list[di
         return [{'action': action, 'column': column, 'params': params}] if column else None
 
     flags = re.I
+    m = re.fullmatch(rf"drop\s+rows\s+where\s+{colthe}\s+(?:is\s+(?P<blank>blank)|is\s+(?P<num>not\s+a\s+number)"
+                     rf"|is\s+(?P<date>not\s+a\s+valid\s+date)(?:\s+using\s+format\s+(?P<fmt>{_QUOTED}))?"
+                     rf"|is\s+one\s+of\s+(?P<vals>{_QUOTED}(?:\s*,\s*{_QUOTED})*)"
+                     rf"|(?P<neg>does\s+not\s+match|matches)\s+regex\s+(?P<pat>{_QUOTED}))", clause, re.I)
+    if m and resolve(m.group('c')):
+        target = resolve(m.group('c'))
+        if m.group('blank'):
+            return one(target, 'drop_rows', {'issue': 'blank'})
+        if m.group('num'):
+            return one(target, 'drop_rows', {'issue': 'not_numeric'})
+        if m.group('date'):
+            params = {'issue': 'not_date'}
+            if m.group('fmt'):
+                params['fmt'] = _unquote(m.group('fmt'))
+            return one(target, 'drop_rows', params)
+        if m.group('vals'):
+            return one(target, 'drop_rows', {'issue': 'values', 'values': [_unquote(v) for v in re.findall(_QUOTED, m.group('vals'))]})
+        issue = 'not_matches' if m.group('neg').lower().startswith('does') else 'matches'
+        return one(target, 'drop_rows', {'issue': issue, 'pattern': _unquote(m.group('pat'))})
+
     m = re.fullmatch(r"(?:(?:remove|drop|delete|eliminate)\s+(?:all\s+)?(?:exact\s+)?duplicate(?:s|\s+rows?)?(?:\s+rows?)?|dedupe|deduplicate(?:\s+rows)?)"
                      r"(?:\s+(?:based\s+on|by|using|on)\s+(?P<cols>.+))?", clause, flags)
     if m:

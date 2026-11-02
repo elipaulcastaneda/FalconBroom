@@ -1764,6 +1764,9 @@ def explain_recipe(recipe: Recipe, profile: Optional[Dict[str, Dict[str, Any]]] 
                 elif step.action == "drop_column":
                     reason = f"{col} is explicit in the recipe and will be removed exactly."
                     confidence = 0.95
+                elif step.action == "drop_rows":
+                    reason = f"Rows where {col} {(step.params or {}).get('issue', 'has the stated issue')} are removed entirely from the output."
+                    confidence = 0.8
                 else:
                     # Add richer explanations for non-impute/normalize/drop steps
                     if step.action == "cast":

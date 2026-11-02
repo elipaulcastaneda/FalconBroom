@@ -4,6 +4,7 @@ import authFetch from './utils/authFetch'
 import PrivacyAdmin from './PrivacyAdmin'
 import SignIn from './components/SignIn'
 import SignOut from './components/SignOut'
+import SuggestionList from './components/SuggestionList'
 import { useAccountUser } from './auth'
 import tokenStore from './tokenStore'
 
@@ -63,16 +64,18 @@ function DownloadLink({ url, label }){
 }
 
   // end DownloadLink
+// Team collaboration is hidden for the individual-analyst beta. Set to true to re-enable.
+const TEAM_ENABLED = false
+
 const NAV_ITEMS = [
   { section: "Start", id: "source", label: "Source", detail: "Profile and prompt to recipe", icon: "⟡" },
   { section: "Start", id: "uploads", label: "Uploads", detail: "Saved uploads", icon: "⇪" },
   { section: "Build", id: "joins", label: "Joins", detail: "Match and merge hints", icon: "⧉" },
-  { section: "Review", id: "preview", label: "Preview", detail: "Compare before and after", icon: "↔" },
   { section: "Account", id: "settings", label: "Settings", detail: "Account & privacy", icon: "⚙" },
-  { section: "Account", id: "team", label: "Team", detail: "Team members & sharing", icon: "👥" },
+  ...(TEAM_ENABLED ? [{ section: "Account", id: "team", label: "Team", detail: "Team members & sharing", icon: "👥" }] : []),
 ]
 
-const NAV_SECTIONS = ["Start", "Build", "Review", "Account"]
+const NAV_SECTIONS = ["Start", "Build", "Account"]
 
 function Card({ eyebrow, title, subtitle, children, className = "" }) {
   return (
@@ -115,6 +118,25 @@ function loadUploadHistory() {
     const raw = window.localStorage.getItem("falconbroom-upload-history")
     if (!raw) return []
     const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+function loadUploadDrafts() {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem("falconbroom-upload-drafts") || "{}")
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+function loadWorkflowCheckpoints(userId) {
+  try {
+    const key = `falconbroom-workflow-checkpoints:${userId || "local"}`
+    const parsed = JSON.parse(window.localStorage.getItem(key) || "[]")
     return Array.isArray(parsed) ? parsed : []
   } catch {
     return []
@@ -167,7 +189,25 @@ export default function App() {
   const [diagnostics, setDiagnostics] = useState(null)
   const [plainLanguageSuggestions, setPlainLanguageSuggestions] = useState(null)
   const [selectedSuggestionSteps, setSelectedSuggestionSteps] = useState([])
-  const [showAllPlainSuggestions, setShowAllPlainSuggestions] = useState(false)
+
+  function addSuggestionToRecipe(s) {
+    const text = (s && s.text) || ''
+    if (!Array.isArray(s?.json_steps) || !s.json_steps.length) {
+      addToast('This suggestion is review-only and has no automatic recipe step.', 'info')
+      return
+    }
+    setSelectedSuggestionSteps((prev) => {
+      const next = [...(prev || [])]
+      const keys = new Set(next.map((step) => JSON.stringify(step)))
+      s.json_steps.forEach((step) => {
+        const key = JSON.stringify(step)
+        if (!keys.has(key)) { next.push(step); keys.add(key) }
+      })
+      return next
+    })
+    setInstruction((prev) => (prev && prev.trim() ? `${prev}\n${text}` : text))
+    recordWorkflowAction("source", "Suggestion used")
+  }
   const [inspectOffset, setInspectOffset] = useState(0)
   const [preview, setPreview] = useState(null)
   const [applyRes, setApplyRes] = useState(null)
@@ -224,6 +264,7 @@ export default function App() {
       return null
     }
   })
+  const [workflowCheckpoints, setWorkflowCheckpoints] = useState(() => loadWorkflowCheckpoints(userId))
   const [consent, setConsent] = useState(() => {
     try { return JSON.parse(window.localStorage.getItem('falconbroom_consent') || 'null') } catch { return null }
   })
@@ -249,6 +290,8 @@ export default function App() {
   const [signupUsername, setSignupUsername] = useState('')
   const [signupEmail, setSignupEmail] = useState('')
   const [signupPassword, setSignupPassword] = useState('')
+  const [recoveryMode, setRecoveryMode] = useState(false)
+  const [recoveryPassword, setRecoveryPassword] = useState('')
   const [signupRole, setSignupRole] = useState('member')
   const [adminUserIdInput, setAdminUserIdInput] = useState('')
   const [adminRoleInput, setAdminRoleInput] = useState('member')
@@ -322,8 +365,8 @@ export default function App() {
   }, [accountUser])
   const [wsConnected, setWsConnected] = useState(false)
   const [inviteToken, setInviteToken] = useState('')
-  const [acceptUsername, setAcceptUsername] = useState('')
-  const [acceptPasswordLocal, setAcceptPasswordLocal] = useState('')
+  const [newMemberRole, setNewMemberRole] = useState('member')
+  const [lastInviteToken, setLastInviteToken] = useState('')
   const [newMemberEmail, setNewMemberEmail] = useState('')
   const [deletePassword, setDeletePassword] = useState('')
   const [deleteConfirmTextLocal, setDeleteConfirmTextLocal] = useState('')
@@ -390,6 +433,8 @@ export default function App() {
   const [theme, setTheme] = useState(() => window.localStorage.getItem("falconbroom-theme") || "dark")
   const [railCollapsed, setRailCollapsed] = useState(() => window.localStorage.getItem("falconbroom-rail-collapsed") === "true")
   const [activeTab, setActiveTab] = useState("source")
+  const workflowActiveTab = useRef(activeTab)
+  const workflowAutosaveTimer = useRef(null)
 
   const profileCount = profile ? Object.keys(profile).length : 0
   const suggestedCount = suggest ? suggest.length : 0
@@ -402,6 +447,182 @@ export default function App() {
       return 0
     }
   }, [recipeText])
+
+  function captureWorkflowState(kind) {
+    if (kind === "source") {
+      return {
+        path,
+        instruction,
+        recipeText,
+        recipeFromText,
+        recipeId,
+        recipeStatus,
+        selectedSuggestionSteps,
+        regressionModel,
+        regressionFeatures,
+        regressionGroupBy,
+        treatAsMissing,
+        selectedCells,
+        selectedColumns,
+        previewRows,
+      }
+    }
+    return {
+      leftPath,
+      rightPath,
+      joinLeftOn,
+      joinRightOn,
+      joinType,
+      joinSampleSize,
+      suffixLeft,
+      suffixRight,
+      preferResolve,
+      mappingText,
+      joinLeftOnArr,
+      joinRightOnArr,
+      compositePairs,
+      exportFormat,
+      exportFilename,
+      joinTargetUser,
+    }
+  }
+
+  function persistWorkflowCheckpoint(kind, actionLabel = null) {
+    const snapshot = captureWorkflowState(kind)
+    const identity = kind === "source"
+      ? (snapshot.path || "untitled")
+      : `${snapshot.leftPath || "no-left"}::${snapshot.rightPath || "no-right"}`
+    const id = `${kind}:${identity}`
+    const storageKey = `falconbroom-workflow-checkpoints:${userId || "local"}`
+    const checkpoints = loadWorkflowCheckpoints(userId)
+    const existing = checkpoints.find((item) => item.id === id)
+    const timeline = existing?.timeline || []
+    if (actionLabel) {
+      timeline.push({ id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, label: actionLabel, at: new Date().toISOString() })
+    }
+    const checkpoint = {
+      id,
+      kind,
+      updated_at: new Date().toISOString(),
+      state: snapshot,
+      timeline: timeline.slice(-30),
+    }
+    const next = [checkpoint, ...checkpoints.filter((item) => item.id !== id)]
+      .sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")))
+      .slice(0, 12)
+    try {
+      window.localStorage.setItem(storageKey, JSON.stringify(next))
+      setWorkflowCheckpoints(next)
+    } catch (e) {
+      console.warn("Workflow checkpoint could not be saved", e)
+    }
+  }
+
+  function appendWorkflowCheckpointEvent(id, label) {
+    const checkpoints = loadWorkflowCheckpoints(userId)
+    const next = checkpoints.map((item) => item.id === id
+      ? {
+          ...item,
+          updated_at: new Date().toISOString(),
+          timeline: [...(item.timeline || []), { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, label, at: new Date().toISOString() }].slice(-30),
+        }
+      : item)
+    try {
+      window.localStorage.setItem(`falconbroom-workflow-checkpoints:${userId || "local"}`, JSON.stringify(next))
+      setWorkflowCheckpoints(next)
+    } catch (e) {
+      console.warn("Workflow timeline event could not be saved", e)
+    }
+  }
+
+  function recordWorkflowAction(kind, label) {
+    persistWorkflowCheckpoint(kind, label)
+  }
+
+  function resumeWorkflowCheckpoint(checkpoint) {
+    const state = checkpoint?.state || {}
+    appendWorkflowCheckpointEvent(checkpoint.id, "Checkpoint resumed")
+    if (checkpoint.kind === "source") {
+      setPath(state.path || "")
+      setInstruction(state.instruction || "")
+      setRecipeText(state.recipeText || "")
+      setRecipeFromText(state.recipeFromText || null)
+      setRecipeId(state.recipeId || "")
+      setRecipeStatus(state.recipeStatus || "")
+      setSelectedSuggestionSteps(state.selectedSuggestionSteps || [])
+      setRegressionModel(state.regressionModel || "linear")
+      setRegressionFeatures(state.regressionFeatures || "")
+      setRegressionGroupBy(state.regressionGroupBy || "")
+      setTreatAsMissing(state.treatAsMissing || "")
+      setSelectedCells(state.selectedCells || {})
+      setSelectedColumns(state.selectedColumns || null)
+      setPreviewRows(state.previewRows ?? 6)
+      setPreview(null)
+      setGeneratedPreview(null)
+      setShowCustomRevisions(true)
+      setShowRecipeJson(!!state.recipeText)
+      setActiveTab("source")
+      return
+    }
+    setLeftPath(state.leftPath || "")
+    setRightPath(state.rightPath || "")
+    setJoinLeftOn(state.joinLeftOn || "")
+    setJoinRightOn(state.joinRightOn || "")
+    setJoinType(state.joinType || "inner")
+    setJoinSampleSize(state.joinSampleSize ?? 5)
+    setSuffixLeft(state.suffixLeft || "_left")
+    setSuffixRight(state.suffixRight || "_right")
+    setPreferResolve(state.preferResolve || "left")
+    setMappingText(state.mappingText || "")
+    setJoinLeftOnArr(state.joinLeftOnArr || [])
+    setJoinRightOnArr(state.joinRightOnArr || [])
+    setCompositePairs(state.compositePairs || [])
+    setExportFormat(state.exportFormat || "csv")
+    setExportFilename(state.exportFilename || "joined")
+    setJoinTargetUser(state.joinTargetUser || "")
+    setJoinPreviewResult(null)
+    setJoinLeftPreview(null)
+    setJoinRightPreview(null)
+    setActiveTab("joins")
+  }
+
+  function deleteWorkflowCheckpoint(id) {
+    const next = loadWorkflowCheckpoints(userId).filter((item) => item.id !== id)
+    try {
+      window.localStorage.setItem(`falconbroom-workflow-checkpoints:${userId || "local"}`, JSON.stringify(next))
+      setWorkflowCheckpoints(next)
+    } catch (e) {
+      console.warn("Workflow checkpoint could not be deleted", e)
+    }
+  }
+
+  function renderWorkflowCheckpointPanel(kind) {
+    const checkpoints = (workflowCheckpoints || []).filter((item) => item.kind === kind)
+    return (
+      <Card eyebrow="Workflow" title="Saved checkpoints" subtitle="Draft settings and action timeline are stored locally; execution history stays separate.">
+        {checkpoints.length ? checkpoints.slice(0, 5).map((item) => {
+          const label = kind === "source"
+            ? (item.state?.path || "Untitled source workflow")
+            : `${item.state?.leftPath || "No left source"} + ${item.state?.rightPath || "No right source"}`
+          return (
+            <div key={item.id} className="history-item">
+              <div style={{flex: "1 1 0"}}>
+                <strong>{label}</strong>
+                <div><small style={{color:"var(--muted)"}}>Saved {item.updated_at ? new Date(item.updated_at).toLocaleString() : ""}</small></div>
+                {(item.timeline || []).slice(-4).reverse().map((entry) => (
+                  <div key={entry.id}><small style={{color:"var(--muted)"}}>{new Date(entry.at).toLocaleTimeString()} · {entry.label}</small></div>
+                ))}
+              </div>
+              <div className="history-actions">
+                <button onClick={() => resumeWorkflowCheckpoint(item)}>Resume</button>
+                <button onClick={() => deleteWorkflowCheckpoint(item.id)} aria-label="Delete workflow checkpoint">Delete</button>
+              </div>
+            </div>
+          )
+        }) : <div className="empty-state">No checkpoints yet. Changes will be saved as you work.</div>}
+      </Card>
+    )
+  }
 
   const queueDerived = useMemo(() => {
     // If server returned a paged response, use that directly
@@ -834,13 +1055,14 @@ export default function App() {
           <div className="card" style={{flex:1}}>
             <div className="card-header"><h2>Welcome back</h2><p>Log in to access your team, uploads, and recipes.</p></div>
             <div style={{padding:12}}>
-              <label>Username or email</label>
-              <input value={loginIdentity} onChange={(e)=>setLoginIdentity(e.target.value)} placeholder="username or email" />
+              <label>Email</label>
+              <input type="email" value={loginIdentity} onChange={(e)=>setLoginIdentity(e.target.value)} placeholder="you@example.com" />
               <label style={{marginTop:8}}>Password</label>
-              <input type="password" value={loginPassword} onChange={(e)=>setLoginPassword(e.target.value)} placeholder="password" />
-              <div style={{marginTop:12,display:'flex',gap:8}}>
+              <input type="password" value={loginPassword} onChange={(e)=>setLoginPassword(e.target.value)} onKeyDown={(e)=>{ if (e.key === 'Enter') doLogin() }} placeholder="password" />
+              <div style={{marginTop:12,display:'flex',gap:8,flexWrap:'wrap'}}>
                 <button className="primary" onClick={doLogin}>Log in</button>
-                <button onClick={()=>{ setLoginIdentity(''); setLoginPassword('') }}>Clear</button>
+                <button onClick={doPasswordReset}>Forgot password?</button>
+                <button onClick={doResendVerification}>Resend verification email</button>
               </div>
               <div style={{marginTop:12,color:'var(--muted)'}}>If you don't have an account, create one below.</div>
             </div>
@@ -851,17 +1073,12 @@ export default function App() {
               <label>Username</label>
               <input value={signupUsername} onChange={(e)=>setSignupUsername(e.target.value)} placeholder="username" />
               <label style={{marginTop:8}}>Email</label>
-              <input value={signupEmail} onChange={(e)=>setSignupEmail(e.target.value)} placeholder="you@example.com" />
-              <label style={{marginTop:8}}>Password</label>
+              <input type="email" value={signupEmail} onChange={(e)=>setSignupEmail(e.target.value)} placeholder="you@example.com" />
+              <label style={{marginTop:8}}>Password (min 8 characters)</label>
               <input type="password" value={signupPassword} onChange={(e)=>setSignupPassword(e.target.value)} placeholder="password" />
-              <label style={{marginTop:8}}>Role</label>
-              <select value={signupRole} onChange={(e)=>setSignupRole(e.target.value)}>
-                <option value="member">Member</option>
-                <option value="admin">Admin</option>
-              </select>
               <div style={{marginTop:12,display:'flex',gap:8}}>
                 <button className="primary" onClick={doSignup}>Create account</button>
-                <button onClick={()=>{ setSignupUsername(''); setSignupEmail(''); setSignupPassword(''); setSignupRole('member') }}>Clear</button>
+                <button onClick={()=>{ setSignupUsername(''); setSignupEmail(''); setSignupPassword('') }}>Clear</button>
               </div>
             </div>
           </div>
@@ -871,7 +1088,7 @@ export default function App() {
   ) : null
   async function fetchSharedUploads() {
     try {
-      const res = await fetch(`${BACKEND}/uploads/shared`)
+      const res = await authFetch(`${BACKEND}/uploads/shared`)
       if (!res.ok) return
       const j = await res.json()
       setSharedUploads(j.uploads || [])
@@ -880,14 +1097,29 @@ export default function App() {
     }
   }
 
+  async function refreshAccount() {
+    try {
+      const mres = await authFetch(`${BACKEND}/me`, { headers: {} })
+      if (mres.ok) { const mj = await mres.json(); setAccountUser(mj); setTeamName(mj.team_name || ''); setTeamMembers(mj.team_members || []) }
+    } catch (e) {}
+  }
+
   async function inviteTeamMember() {
     if (!newMemberEmail || !newMemberEmail.includes('@')) { addToast('Enter a valid email', 'warn'); return }
     try {
-      const res = await authFetch(`${BACKEND}/team/invite`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: newMemberEmail, team_name: teamName }) })
+      const res = await authFetch(`${BACKEND}/team/invite`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: newMemberEmail, role: newMemberRole, team_name: teamName || undefined }) })
       if (!res.ok) { const t = await res.text(); addToast('Invite failed: ' + t, 'error'); return }
-      addToast('Invite sent', 'success')
-      setTeamMembers((s) => [...(s || []), newMemberEmail])
+      const j = await res.json()
+      if (j.email_sent) {
+        addToast('Invite emailed to ' + newMemberEmail, 'success')
+      } else {
+        addToast('Email is not configured, so the invite was not emailed. Copy the token below and send it to ' + newMemberEmail, 'warn', 8000)
+        if (j.token) setLastInviteToken(j.token)
+      }
       setNewMemberEmail('')
+      await refreshAccount()
+      await fetchTeamInvites()
+      await fetchTeamMembers()
     } catch (e) { addToast('Invite error: ' + e.message, 'error') }
   }
 
@@ -945,14 +1177,18 @@ export default function App() {
   async function acceptInvite() {
     if (!inviteToken) { addToast('Enter invite token', 'warn'); return }
     try {
-      const res = await fetch(`${BACKEND}/team/accept`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: inviteToken, username: acceptUsername || undefined, password: acceptPasswordLocal || undefined }), credentials: 'include' })
-      if (!res.ok) { const t = await res.text(); addToast('Accept failed: ' + t, 'error'); return }
-      const j = await res.json()
-      if (j.access_token) saveToken(j.access_token)
+      const res = await authFetch(`${BACKEND}/team/accept`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: inviteToken.trim() }) })
+      if (!res.ok) {
+        let msg = ''
+        try { const j = await res.json(); msg = j.detail || '' } catch (e) { msg = await res.text() }
+        if (res.status === 401) msg = 'Sign in (Settings tab) with the invited email first.'
+        addToast('Accept failed: ' + msg, 'error', 7000); return
+      }
       addToast('Invite accepted', 'success')
-      setInviteToken(''); setAcceptUsername(''); setAcceptPasswordLocal('')
-      // refresh user info
-      try { const mres = await authFetch(`${BACKEND}/me`, { headers: {} }); if (mres.ok) { const mj = await mres.json(); setAccountUser(mj); setTeamName(mj.team_name || ''); setTeamMembers(mj.team_members || []) } } catch(e){}
+      setInviteToken('')
+      await refreshAccount()
+      await fetchTeamMembers()
+      await fetchTeamInvites()
     } catch (e) { addToast('Accept error: ' + e.message, 'error') }
   }
 
@@ -987,38 +1223,49 @@ export default function App() {
 
   // Open WebSocket when Team tab is active for live updates
   useEffect(() => {
+    // deep link from invite email: /accept-invite?token=...
+    try {
+      const params = new URLSearchParams(window.location.search)
+      const t = params.get('token')
+      if (TEAM_ENABLED && t && window.location.pathname.includes('accept-invite')) { setInviteToken(t); setActiveTab('team') }
+    } catch (e) {}
+  }, [])
+
+  useEffect(() => {
     let ws = null
-    if (activeTab === 'team') {
+    let cancelled = false
+    if (TEAM_ENABLED && activeTab === 'team') {
       fetchTeamInvites()
       fetchTeamMembers()
-      try {
-        const wsUrl = (BACKEND || '').replace(/^http/, 'ws') + '/ws/shared'
-        ws = new WebSocket(wsUrl)
-        ws.onopen = () => {
-          setWsConnected(true)
-          // request initial state via server-initiated init message
-        }
-        ws.onmessage = (ev) => {
-          try {
-            const msg = JSON.parse(ev.data)
-            if (msg.type === 'init' && Array.isArray(msg.uploads)) {
-              setSharedUploads(msg.uploads)
-            } else if (msg.type === 'shared_changed' || msg.type === 'uploads_changed') {
-              // refresh lists when server indicates a change
-              fetchSharedUploads()
-              fetchUploads()
+      fetchSharedUploads()
+      ;(async () => {
+        try {
+          const tok = authToken || await tokenStore.getAccess()
+          if (!tok || cancelled) return
+          const wsUrl = (BACKEND || '').replace(/^http/, 'ws') + '/ws/shared?token=' + encodeURIComponent(tok)
+          ws = new WebSocket(wsUrl)
+          ws.onopen = () => { setWsConnected(true) }
+          ws.onmessage = (ev) => {
+            try {
+              const msg = JSON.parse(ev.data)
+              if (msg.type === 'init' && Array.isArray(msg.uploads)) {
+                setSharedUploads(msg.uploads)
+              } else if (msg.type === 'shared_changed' || msg.type === 'uploads_changed') {
+                fetchSharedUploads()
+                fetchUploads()
+              }
+            } catch (e) {
+              // ignore parse errors
             }
-          } catch (e) {
-            // ignore parse errors
           }
+          ws.onclose = () => { setWsConnected(false) }
+          ws.onerror = () => { setWsConnected(false) }
+        } catch (e) {
+          setWsConnected(false)
         }
-        ws.onclose = () => { setWsConnected(false) }
-        ws.onerror = () => { setWsConnected(false) }
-      } catch (e) {
-        setWsConnected(false)
-      }
+      })()
     }
-    return () => { try { if (ws) ws.close() } catch (e) {} }
+    return () => { cancelled = true; try { if (ws) ws.close() } catch (e) {} }
   }, [activeTab])
 
   async function saveToken(access) {
@@ -1047,21 +1294,76 @@ export default function App() {
   // use global authFetch from ./utils/authFetch
 
   async function doSignup() {
+    const email = (signupEmail || '').trim()
+    if (!email || !/^\S+@\S+\.\S+$/.test(email)) { addToast('Enter a valid email address', 'warn'); return }
+    if (!signupPassword || signupPassword.length < 8) { addToast('Password must be at least 8 characters', 'warn'); return }
     try {
       // Use Supabase client for signup
       const supabase = (await import('./supabaseClient')).default
-      const { data, error } = await supabase.auth.signUp({ email: signupEmail, password: signupPassword, options: { data: { username: signupUsername || signupEmail } } })
+      const { data, error } = await supabase.auth.signUp({ email, password: signupPassword, options: { data: { username: signupUsername || email } } })
       if (error) { addToast('Signup failed: ' + error.message, 'error'); return }
-      addToast('Account created — please check email for verification', 'success')
-      setSignupUsername(''); setSignupEmail(''); setSignupPassword(''); setSignupRole('member')
+      addToast('Account created. Check ' + email + ' for a verification link, then sign in.', 'success', 8000)
+      setLoginIdentity(email)
+      setSignupUsername(''); setSignupEmail(''); setSignupPassword('')
     } catch (e) { addToast('Signup error: ' + e.message, 'error') }
   }
+
+  async function doPasswordReset() {
+    const email = (loginIdentity || '').trim()
+    if (!email || !email.includes('@')) { addToast('Enter your account email in the sign-in box first', 'warn'); return }
+    try {
+      const supabase = (await import('./supabaseClient')).default
+      const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin })
+      if (error) { addToast('Reset failed: ' + error.message, 'error'); return }
+      addToast('Password reset email sent to ' + email, 'success', 6000)
+    } catch (e) { addToast('Reset error: ' + e.message, 'error') }
+  }
+
+  async function doResendVerification() {
+    const email = (loginIdentity || '').trim()
+    if (!email || !email.includes('@')) { addToast('Enter your account email in the sign-in box first', 'warn'); return }
+    try {
+      const supabase = (await import('./supabaseClient')).default
+      const { error } = await supabase.auth.resend({ type: 'signup', email })
+      if (error) { addToast('Resend failed: ' + error.message, 'error'); return }
+      addToast('Verification email re-sent to ' + email, 'success', 6000)
+    } catch (e) { addToast('Resend error: ' + e.message, 'error') }
+  }
+
+  async function doSetNewPassword() {
+    if (!recoveryPassword || recoveryPassword.length < 8) { addToast('Password must be at least 8 characters', 'warn'); return }
+    try {
+      const supabase = (await import('./supabaseClient')).default
+      const { error } = await supabase.auth.updateUser({ password: recoveryPassword })
+      if (error) { addToast('Password update failed: ' + error.message, 'error'); return }
+      addToast('Password updated', 'success')
+      setRecoveryPassword(''); setRecoveryMode(false)
+    } catch (e) { addToast('Password update error: ' + e.message, 'error') }
+  }
+
+  useEffect(() => {
+    let sub = null
+    ;(async () => {
+      try {
+        const supabase = (await import('./supabaseClient')).default
+        const r = supabase.auth.onAuthStateChange((event) => {
+          if (event === 'PASSWORD_RECOVERY') { setRecoveryMode(true); setActiveTab('settings') }
+        })
+        sub = r && r.data && r.data.subscription
+      } catch (e) {}
+    })()
+    return () => { try { if (sub) sub.unsubscribe() } catch (e) {} }
+  }, [])
 
   async function doLogin() {
     try {
       const supabase = (await import('./supabaseClient')).default
-      const { data, error } = await supabase.auth.signInWithPassword({ email: loginIdentity, password: loginPassword })
-      if (error) { addToast('Login failed: ' + error.message, 'error'); return }
+      const { data, error } = await supabase.auth.signInWithPassword({ email: (loginIdentity || '').trim(), password: loginPassword })
+      if (error) {
+        const unconfirmed = /not confirmed/i.test(error.message || '')
+        addToast('Login failed: ' + error.message + (unconfirmed ? ' — use "Resend verification email" below.' : ''), 'error', 7000)
+        return
+      }
       const access = data?.session?.access_token
       const refresh = data?.session?.refresh_token
       if (access) await saveToken(access)
@@ -1378,6 +1680,43 @@ export default function App() {
     fetchUploads()
   }, [])
 
+  React.useEffect(() => {
+    if (activeTab !== "uploads" || !showCustomRevisions || !path) return
+    try {
+      const drafts = loadUploadDrafts()
+      drafts[path] = { instruction, recipeText }
+      window.localStorage.setItem("falconbroom-upload-drafts", JSON.stringify(drafts))
+    } catch {
+      // Draft persistence is best-effort when browser storage is unavailable.
+    }
+  }, [activeTab, showCustomRevisions, path, instruction, recipeText])
+
+  React.useEffect(() => {
+    const previousTab = workflowActiveTab.current
+    if (previousTab !== activeTab) {
+      if ((previousTab === "source" || previousTab === "uploads") && path) persistWorkflowCheckpoint("source")
+      if (previousTab === "joins" && (leftPath || rightPath)) persistWorkflowCheckpoint("joins")
+      workflowActiveTab.current = activeTab
+    }
+  }, [activeTab])
+
+  React.useEffect(() => {
+    const kind = activeTab === "joins" ? "joins" : "source"
+    if (kind === "source" && (!path || (activeTab !== "source" && activeTab !== "uploads"))) return
+    if (kind === "joins" && !leftPath && !rightPath) return
+    workflowAutosaveTimer.current = setTimeout(() => persistWorkflowCheckpoint(kind), 650)
+    return () => {
+      clearTimeout(workflowAutosaveTimer.current)
+      workflowAutosaveTimer.current = null
+    }
+  }, [
+    activeTab, path, instruction, recipeText, recipeFromText, recipeId, recipeStatus, selectedSuggestionSteps,
+    regressionModel, regressionFeatures, regressionGroupBy, treatAsMissing,
+    selectedCells, selectedColumns, previewRows, leftPath, rightPath, joinLeftOn,
+    joinRightOn, joinType, joinSampleSize, suffixLeft, suffixRight, preferResolve,
+    mappingText, joinLeftOnArr, joinRightOnArr, compositePairs, exportFormat, exportFilename, joinTargetUser,
+  ])
+
   // When the generated recipe or the rowsToShow selection changes, refresh the generated preview
   React.useEffect(() => {
     if (!recipeFromText) return
@@ -1611,6 +1950,19 @@ export default function App() {
       else next[k] = true
       return next
     })
+    recordWorkflowAction("source", "Changed-cell selection updated")
+  }
+
+  function selectAllChangedCells() {
+    const selected = ((displayPreview && displayPreview.before || []).slice(0, rowsToShow || undefined).reduce((acc, _, rowIndex) => {
+      visibleColumns.forEach((col) => {
+        const isChanged = String(((displayPreview && displayPreview.before[rowIndex]) || {})[col] ?? '') !== String(((displayPreview && displayPreview.after[rowIndex]) || {})[col] ?? '')
+        if (isChanged) acc[`${rowIndex}|${col}`] = true
+      })
+      return acc
+    }, {}))
+    setSelectedCells(selected)
+    recordWorkflowAction("source", `Selected ${Object.keys(selected).length} changed cells`)
   }
 
   async function applySelectedChanges() {
@@ -1633,6 +1985,7 @@ export default function App() {
       return
     }
     try {
+      persistWorkflowCheckpoint("source")
       const res = await fetch(`${BACKEND}/apply-patch`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path, patches })
@@ -1644,6 +1997,7 @@ export default function App() {
       }
       const j = await res.json()
       addToast(`Applied ${patches.length} selected changes`, 'success')
+      recordWorkflowAction("source", `Applied ${patches.length} selected changes`)
       // if server returned a patched file, add it to uploads list and open it
       if (j && (j.upload_path || j.patched_path)) {
         const usePath = j.upload_path || j.patched_path
@@ -1655,7 +2009,7 @@ export default function App() {
           return [newItem, ...existing]
         })
         // open and inspect the patched file
-        try { await openUploadItem(newItem) } catch (err) { console.warn('Failed opening patched item', err) }
+        try { await openUploadItem(newItem, { preserveRecipe: true }) } catch (err) { console.warn('Failed opening patched item', err) }
       }
       // clear selection and refresh preview/inspection
       setSelectedCells({})
@@ -1675,16 +2029,28 @@ export default function App() {
     return na === nb || na.endsWith(nb) || nb.endsWith(na) || na.includes(nb) || nb.includes(na)
   }
 
-  async function openUploadItem(item) {
+  async function openUploadItem(item, options = {}) {
     // item: {name, path, ...}
+    const preserveRecipe = options.preserveRecipe === true
     setSelectedSuggestionSteps([])
+    const sameFileWorkspace = path === item.path
+    const draft = sameFileWorkspace
+      ? { instruction, recipeText }
+      : loadUploadDrafts()[item.path]
     setPath(item.path)
+    if (!preserveRecipe) {
+      setInstruction(draft?.instruction || "")
+      setRecipeText(draft?.recipeText || "")
+      if (!sameFileWorkspace) setRecipeFromText(null)
+    }
+    setPreview(null)
+    setGeneratedPreview(null)
     // show custom revisions when opening an upload
     setShowCustomRevisions(true)
     // show full data preview for saved uploads
     setShowFullPreview(true)
     // hide raw recipe JSON by default (use instruction -> auto-generate)
-    setShowRecipeJson(false)
+    if (!preserveRecipe) setShowRecipeJson(false)
     setInspectionLoading(true)
     setInspectingPath(item.path)
     // look for an existing inspection saved for this path
@@ -1979,13 +2345,26 @@ export default function App() {
     if (!presentPaths.includes(leftPath)) { addToast('Left path must be an uploaded file', 'error'); return }
     if (!presentPaths.includes(rightPath)) { addToast('Right path must be an uploaded file', 'error'); return }
 
-    const res = await fetch(`${BACKEND}/join-suggestions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ left_path: leftPath, right_path: rightPath }),
-    })
-    const j = await res.json()
+    let j
+    try {
+      const res = await fetch(`${BACKEND}/join-suggestions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ left_path: leftPath, right_path: rightPath }),
+      })
+      if (!res.ok) {
+        let detail = ''
+        try { const ej = await res.json(); detail = ej.detail || '' } catch (e) { detail = await res.text().catch(() => '') }
+        addToast('Join suggestions failed: ' + (detail || res.status), 'error')
+        return
+      }
+      j = await res.json()
+    } catch (e) {
+      addToast('Join suggestions failed: ' + (e.message || e), 'error')
+      return
+    }
     setJoinSuggestions(j.joins)
+    if (!j.joins || j.joins.length === 0) addToast('No likely join keys found between these files. Pick keys manually below.', 'info', 6000)
 
     // auto-fill join keys with top suggestion when available
     try {
@@ -2054,6 +2433,7 @@ export default function App() {
       }
       const j = await res.json()
       setJoinPreviewResult(j)
+      recordWorkflowAction("joins", "Join preview generated")
       // also fetch before-samples for left and right via /inspect to show before/after
       try{
         const [linsp, rins] = await Promise.all([
@@ -2102,6 +2482,7 @@ export default function App() {
       const payload = { left_path: leftPath, right_path: rightPath, left_on, right_on, join_type: joinType, export_format: exportFormat, filename: exportFilename, conflict_resolution: conflict }
       if (joinTargetUser) payload.target_user = joinTargetUser
       console.log('join-export payload:', payload)
+      persistWorkflowCheckpoint("joins")
       const res = await fetch(`${BACKEND}/join-export`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
       })
@@ -2111,6 +2492,7 @@ export default function App() {
       }
       const j = await res.json()
       addToast('Export created: ' + (j.export_path || ''), 'success')
+      recordWorkflowAction("joins", "Join exported")
       // surface download link to user
       setApplyRes((prev)=> ({...(prev||{}), last_export: j.export_path}))
       // Auto-download the created export by opening the backend download endpoint
@@ -2205,6 +2587,7 @@ export default function App() {
       })
       const j = await res.json()
       setPreview(sanitizePreview(j.preview))
+      if (activeTab === "uploads") setGeneratedPreview(null)
       if (j.schema_warnings) {
         // lightweight notification
         setApplyRes((prev) => ({ ...(prev || {}), schema_warnings: j.schema_warnings }))
@@ -2452,6 +2835,7 @@ export default function App() {
       } else {
         throw new Error('No recipe available to apply')
       }
+      persistWorkflowCheckpoint("source")
       const res = await fetch(`${BACKEND}/apply`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2459,6 +2843,7 @@ export default function App() {
       })
       const j = await res.json()
       setApplyRes(j.result)
+      recordWorkflowAction("source", "Recipe applied")
     } catch (e) {
       addToast("Invalid recipe JSON: " + e.message, "error")
     } finally {
@@ -2492,6 +2877,7 @@ export default function App() {
         throw new Error('No recipe to save')
       }
 
+      recordWorkflowAction("source", "Recipe save requested")
       const res = await fetch(`${BACKEND}/recipes`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2519,6 +2905,7 @@ export default function App() {
         }
       }
       addToast(`Saved recipe ${name}`, "success")
+      recordWorkflowAction("source", "Recipe saved")
       // auto-fetch explanations after save to surface step-level rationale
       try {
         await loadExplanations()
@@ -2577,10 +2964,12 @@ export default function App() {
       return
     }
     try {
+      recordWorkflowAction("source", "Run requested")
       const res = await fetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}/run?export_format=${encodeURIComponent(format)}`, { method: "POST" })
       const j = await res.json()
       // add to history UI
       setHistoryList((h) => [j.run, ...h])
+      recordWorkflowAction("source", "Run started")
       addToast(`Run started: ${j.run.id}`, "info")
     } catch (e) {
       addToast("Failed to run recipe: " + e.message, "error")
@@ -2620,6 +3009,7 @@ export default function App() {
       return
     }
     try {
+      recordWorkflowAction("source", "Run and download requested")
       setRunDownloadLoading(true)
       addToast('Running recipe on server...', 'info')
       const res = await fetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}/run?export_format=${encodeURIComponent(format)}`, { method: 'POST' })
@@ -2632,6 +3022,7 @@ export default function App() {
       }
       const j = await res.json()
       console.log('run response', j)
+      recordWorkflowAction("source", "Run started and download requested")
       const out = j.run && j.run.output_path
       if (!out) {
         addToast('Run completed but no output path found', 'warn')
@@ -2876,6 +3267,7 @@ export default function App() {
       a.click()
       a.remove()
       URL.revokeObjectURL(url)
+      recordWorkflowAction("source", "Preview CSV downloaded")
       addToast('Downloaded CSV', 'success')
     } catch (e) {
       console.error(e)
@@ -3088,6 +3480,8 @@ export default function App() {
 
           {/* Custom revisions modal rendered globally */}
 
+          {renderWorkflowCheckpointPanel("source")}
+
           <Card eyebrow="Run history" title="Runs and lineage" subtitle="View previous runs, outputs, and create rollbacks.">
               <div className="button-row">
                   <button onClick={fetchHistory}>Refresh history</button>
@@ -3188,6 +3582,7 @@ export default function App() {
             onChange={onUploadInputChange}
             style={{ display: "none" }}
           />
+          {renderWorkflowCheckpointPanel("joins")}
           <Card eyebrow="Joins" title="Join hints" subtitle="Find the most likely keys before blending datasets.">
             <div className="inline-grid">
               <div>
@@ -3605,42 +4000,6 @@ export default function App() {
       )
     }
 
-    if (activeTab === "preview") {
-      return (
-        <div className="tab-stack tab-panel">
-          <Card eyebrow="Result" title="Preview and apply output" subtitle="Use side-by-side previews to validate transformations before writing data.">
-            <div className="button-row button-row-tight">
-              <span className="chip">Backend: {BACKEND}</span>
-              <span className="chip">Deterministic parser</span>
-              <span className="chip">Tauri-ready</span>
-            </div>
-            {preview ? (
-              <div className="preview-grid">
-                <div>
-                  <h3>Before</h3>
-                  <pre className="json-block json-block-soft">{JSON.stringify(preview.before, null, 2)}</pre>
-                </div>
-                <div>
-                  <h3>After</h3>
-                  <pre className="json-block json-block-soft">{JSON.stringify(preview.after, null, 2)}</pre>
-                </div>
-              </div>
-            ) : (
-              <div className="empty-state">No preview yet. Build a recipe or click Preview.</div>
-            )}
-            <div className="button-row">
-              <button className="primary" onClick={doPreview}>Refresh preview</button>
-              <button onClick={doApply}>Apply</button>
-            </div>
-          </Card>
-
-          <Card eyebrow="Apply" title="Apply result" subtitle="Confirm what was written to disk after the recipe runs.">
-            <JsonBlock value={applyRes} empty="Nothing applied yet." />
-          </Card>
-        </div>
-      )
-    }
-
     if (activeTab === "admin_metrics") {
       return (
         <div className="tab-stack tab-panel">
@@ -3649,7 +4008,7 @@ export default function App() {
       )
     }
 
-    if (activeTab === "team") {
+    if (TEAM_ENABLED && activeTab === "team") {
       return (
         <div className="tab-stack tab-panel">
           <Card eyebrow="Team" title="Team collaboration" subtitle="Invite members and share files with your team">
@@ -3669,7 +4028,7 @@ export default function App() {
                           <small style={{color:'var(--muted)'}}>Role: {role}</small>
                         </div>
                         <div style={{display:'flex',gap:8}}>
-                          {accountUser && accountUser.team_name && <>
+                          {accountUser && accountUser.team_name && role !== 'owner' && <>
                             <select value={role} onChange={(e) => changeMemberRole(email, e.target.value)}>
                               <option value="member">member</option>
                               <option value="admin">admin</option>
@@ -3691,14 +4050,24 @@ export default function App() {
                 <h5>Invite member</h5>
                 <div style={{display:'flex',gap:8}}>
                   <input value={newMemberEmail} onChange={(e)=>setNewMemberEmail(e.target.value)} placeholder="email@example.com" />
+                  <select value={newMemberRole} onChange={(e)=>setNewMemberRole(e.target.value)}>
+                    <option value="member">member</option>
+                    <option value="admin">admin</option>
+                    <option value="guest">guest</option>
+                  </select>
                   <button className="primary" onClick={inviteTeamMember}>Send invite</button>
                 </div>
+                {lastInviteToken ? (
+                  <div style={{marginTop:8}}>
+                    <small style={{color:'var(--muted)'}}>Invite token (share it with the invitee; it expires in 7 days):</small>
+                    <input readOnly value={lastInviteToken} onFocus={(e)=>e.target.select()} />
+                  </div>
+                ) : null}
                 <div style={{marginTop:12}}>
                   <h6>Accept invite (token)</h6>
-                  <div style={{display:'flex',gap:8}}>
+                  <small style={{color:'var(--muted)'}}>Sign in first with the email address that was invited.</small>
+                  <div style={{display:'flex',gap:8,marginTop:4}}>
                     <input value={inviteToken} onChange={(e)=>setInviteToken(e.target.value)} placeholder="invite token" />
-                    <input value={acceptUsername} onChange={(e)=>setAcceptUsername(e.target.value)} placeholder="username (if creating)" />
-                    <input type="password" value={acceptPasswordLocal} onChange={(e)=>setAcceptPasswordLocal(e.target.value)} placeholder="password (if creating)" />
                     <button onClick={acceptInvite}>Accept</button>
                   </div>
                 </div>
@@ -3786,19 +4155,12 @@ export default function App() {
                         <input value={signupUsername} onChange={(e)=>setSignupUsername(e.target.value)} placeholder="username" />
                       </label>
                       <label style={{display:'flex',flexDirection:'column',gap:6,marginTop:8}}>
-                        <span style={{fontSize:12,color:'var(--muted)'}}>Email (optional)</span>
-                        <input value={signupEmail} onChange={(e)=>setSignupEmail(e.target.value)} placeholder="you@example.com" />
+                        <span style={{fontSize:12,color:'var(--muted)'}}>Email</span>
+                        <input type="email" value={signupEmail} onChange={(e)=>setSignupEmail(e.target.value)} placeholder="you@example.com" />
                       </label>
                       <label style={{display:'flex',flexDirection:'column',gap:6,marginTop:8}}>
-                        <span style={{fontSize:12,color:'var(--muted)'}}>Password</span>
+                        <span style={{fontSize:12,color:'var(--muted)'}}>Password (min 8 characters)</span>
                         <input type="password" value={signupPassword} onChange={(e)=>setSignupPassword(e.target.value)} placeholder="choose a password" />
-                      </label>
-                      <label style={{display:'flex',flexDirection:'column',gap:6,marginTop:8}}>
-                        <span style={{fontSize:12,color:'var(--muted)'}}>Role</span>
-                        <select value={signupRole} onChange={(e)=>setSignupRole(e.target.value)}>
-                          <option value="member">Member</option>
-                          <option value="admin">Admin</option>
-                        </select>
                       </label>
                       <div style={{marginTop:10}}>
                         <button className="primary" onClick={doSignup}>Create account</button>
@@ -3807,15 +4169,17 @@ export default function App() {
                     <div>
                       <h5>Sign in</h5>
                       <label style={{display:'flex',flexDirection:'column',gap:6}}>
-                        <span style={{fontSize:12,color:'var(--muted)'}}>Username or email</span>
-                        <input value={loginIdentity} onChange={(e)=>setLoginIdentity(e.target.value)} placeholder="username or email" />
+                        <span style={{fontSize:12,color:'var(--muted)'}}>Email</span>
+                        <input value={loginIdentity} onChange={(e)=>setLoginIdentity(e.target.value)} placeholder="you@example.com" />
                       </label>
                       <label style={{display:'flex',flexDirection:'column',gap:6,marginTop:8}}>
                         <span style={{fontSize:12,color:'var(--muted)'}}>Password</span>
-                        <input type="password" value={loginPassword} onChange={(e)=>setLoginPassword(e.target.value)} placeholder="password" />
+                        <input type="password" value={loginPassword} onChange={(e)=>setLoginPassword(e.target.value)} onKeyDown={(e)=>{ if (e.key === 'Enter') doLogin() }} placeholder="password" />
                       </label>
-                      <div style={{marginTop:10}}>
+                      <div style={{marginTop:10,display:'flex',gap:8,flexWrap:'wrap'}}>
                         <button className="primary" onClick={doLogin}>Sign in</button>
+                        <button onClick={doPasswordReset}>Forgot password?</button>
+                        <button onClick={doResendVerification}>Resend verification email</button>
                       </div>
                     </div>
                   </div>
@@ -3824,21 +4188,23 @@ export default function App() {
                     <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
                       <div>
                         <strong>{accountUser.username}</strong>
-                        <div style={{color:'var(--muted)'}}>Member since {new Date(accountUser.created_at).toLocaleDateString()}</div>
-                      </div>
-                      <div>
-                        <button onClick={doLogout}>Logout</button>
+                        <div style={{color:'var(--muted)'}}>{accountUser.email || ''}</div>
+                        <div style={{color:'var(--muted)'}}>Member since {accountUser.created_at ? new Date(accountUser.created_at).toLocaleDateString() : 'n/a'}</div>
                       </div>
                     </div>
+                    {recoveryMode ? (
+                      <div style={{marginTop:12}}>
+                        <h5>Set a new password</h5>
+                        <div style={{display:'flex',gap:8}}>
+                          <input type="password" value={recoveryPassword} onChange={(e)=>setRecoveryPassword(e.target.value)} placeholder="new password (min 8 characters)" />
+                          <button className="primary" onClick={doSetNewPassword}>Update password</button>
+                        </div>
+                      </div>
+                    ) : null}
                     <div style={{marginTop:12}}>
-                      <label style={{display:'flex',flexDirection:'column',gap:6}}>
-                        <span style={{fontSize:12,color:'var(--muted)'}}>Email (optional)</span>
-                        <input value={accountUser.email||''} onChange={(e)=>setAccountUser({...accountUser,email:e.target.value})} placeholder="you@example.com" />
-                      </label>
                       <div style={{marginTop:8}}>
-                        <button className="primary" onClick={saveAccountUpdates}>Save account</button>
+                        <button className="primary" onClick={doLogout}>Logout</button>
                         <button style={{marginLeft:8}} onClick={doAccountExport}>Export data</button>
-                        <button style={{marginLeft:8}} onClick={doLogout}>Logout</button>
                         <div style={{display:'inline-block',marginLeft:12}}>
                           <button onClick={doOptOut} title="Opt out of sale/targeted sharing">Opt-out of sale/targeting</button>
                           <button style={{marginLeft:8}} onClick={doOptIn} title="Revoke opt-out and opt back in">Revoke opt-out</button>
@@ -4188,7 +4554,6 @@ export default function App() {
           <div className="button-row">
             <button className="primary" onClick={doCleaningSuggestions}>Refresh suggestions</button>
             <button onClick={() => setActiveTab("source")}>Go to source</button>
-            <button onClick={() => setActiveTab("preview")}>Go to preview</button>
           </div>
         </Card>
       </div>
@@ -4488,99 +4853,11 @@ export default function App() {
                     {/* Plain-language suggestions rendered directly under diagnostics for quick use */}
                     {plainLanguageSuggestions && Array.isArray(plainLanguageSuggestions) && plainLanguageSuggestions.length > 0 && (
                       <div style={{marginTop:8}} className="pl-suggestions">
-                        <h4>Suggested plain-English fixes</h4>
-                        <div style={{display:'flex', flexDirection:'column', gap:8}}>
-                          {(() => {
-                            const threshold = 6
-                            const list = showAllPlainSuggestions ? plainLanguageSuggestions : plainLanguageSuggestions.slice(0, threshold)
-                            return (
-                              <>
-                                {list.map((s, idx) => (
-                                  <div key={idx} style={{display:'flex', gap:8, alignItems:'center'}}>
-                                    <button
-                                      onClick={() => {
-                                        try {
-                                          const txt = (s && s.text) ? s.text : (typeof s === 'string' ? s : '');
-                                          if (Array.isArray(s?.json_steps) && s.json_steps.length) {
-                                            setSelectedSuggestionSteps((prev) => {
-                                              const next = [...(prev || [])]
-                                              const keys = new Set(next.map((step) => JSON.stringify(step)))
-                                              s.json_steps.forEach((step) => {
-                                                const key = JSON.stringify(step)
-                                                if (!keys.has(key)) { next.push(step); keys.add(key) }
-                                              })
-                                              return next
-                                            })
-                                            setInstruction((prev) => (prev && prev.trim() ? `${prev}\n${txt}` : txt))
-                                            return
-                                          }
-                                          if (!Array.isArray(s?.json_steps) || !s.json_steps.length) {
-                                            addToast('This suggestion is review-only and has no automatic recipe step.', 'info')
-                                            return
-                                          }
-                                          // Prefer explicit machine_template provided by backend
-                                          const mt = s && s.machine_template ? s.machine_template : null;
-                                          const makeCompactFromText = (t) => {
-                                            if (!t) return null;
-                                            try {
-                                              // look for explicit action: ... params: ... patterns
-                                              const actionMatch = t.match(/action:\s*([a-z_]+)/i);
-                                              const paramsMatch = t.match(/params:\s*([^\)]+)/i);
-                                              const colMatch = t.match(/column ['\"]([^'\"]+)['\"]/i) || t.match(/column\s*=\s*([^\s,]+)/i) || t.match(/'(.+?)' contains/i);
-                                              if (actionMatch) {
-                                                const action = actionMatch[1].toLowerCase();
-                                                const col = colMatch ? (colMatch[1] || colMatch[0]) : '';
-                                                let paramsStr = paramsMatch ? paramsMatch[1].trim() : '';
-                                                paramsStr = paramsStr.replace(/,\s*/g, ' ').replace(/:\s*/g, '=').replace(/\s+/g, ' ').trim();
-                                                let compact = action + (col ? ' column=' + col : '');
-                                                if (paramsStr) compact += ' ' + paramsStr;
-                                                return compact;
-                                              }
-                                              // fallback: try to detect "Cast column \"X\" to integer" patterns
-                                              const castMatch = t.match(/cast column ['\"]?([^'\"]+)['\"]? to (integer|int|float|datetime|str|string)/i);
-                                              if (castMatch) {
-                                                const col = castMatch[1];
-                                                const to = castMatch[2].toLowerCase();
-                                                const mapTo = to === 'integer' || to === 'int' ? 'int' : (to === 'string' || to === 'str' ? 'str' : (to === 'datetime' ? 'datetime' : 'float'));
-                                                return 'cast column=' + col + ' to=' + mapTo;
-                                              }
-                                            } catch (e) {
-                                              return null;
-                                            }
-                                            return null;
-                                          };
-
-                                          const compact = mt || makeCompactFromText(txt);
-                                          const toInsert = compact ? (compact + '\n' + txt) : txt;
-                                          setInstruction(prev => (prev && prev.trim().length ? prev + '\n' + toInsert : toInsert));
-                                        } catch (e) {
-                                          const txt = (s && s.text) ? s.text : (typeof s === 'string' ? s : '');
-                                          setInstruction(prev => (prev && prev.trim().length ? prev + '\n' + txt : txt));
-                                        }
-                                      }}
-                                      style={{padding:'6px 10px'}}
-                                    >
-                                      Use
-                                    </button>
-                                    <div style={{flex:1, display:'flex', alignItems:'center', gap:8}}>
-                                      <div style={{flex:1}}>{s.text}</div>
-                                      {s && (s.confidence !== undefined) && (
-                                        <div style={{fontSize:'0.8rem', color:'var(--muted)'}}> {Math.round((s.confidence||0)*100)}% </div>
-                                      )}
-                                    </div>
-                                  </div>
-                                ))}
-                                {plainLanguageSuggestions.length > threshold && (
-                                  <div style={{marginTop:6}}>
-                                    <button className="secondary" onClick={() => setShowAllPlainSuggestions((v) => !v)}>
-                                      {showAllPlainSuggestions ? 'Show less' : `Show full list (${plainLanguageSuggestions.length})`}
-                                    </button>
-                                  </div>
-                                )}
-                              </>
-                            )
-                          })()}
-                        </div>
+                        <SuggestionList
+                          suggestions={plainLanguageSuggestions}
+                          selectedSteps={selectedSuggestionSteps}
+                          onUse={addSuggestionToRecipe}
+                        />
                       </div>
                     )}
                   </div>
@@ -4612,6 +4889,7 @@ export default function App() {
                   </label>
                   <button onClick={() => setInstruction("Predict AGE from HEIGHT and WEIGHT using regression")}>Regression example</button>
                   <button onClick={() => setInstruction("Impute AGE from BIRTH_YEAR using mean")}>Mean impute example</button>
+                  <button onClick={() => setInstruction("drop rows where AGE is blank")}>Drop rows example</button>
                 </div>
                 <div style={{marginTop:8}}>
                   <button className="primary" onClick={() => doRecipeFromText()} disabled={recipeGenerating || !instruction || instruction.trim().length===0}>
@@ -4776,13 +5054,7 @@ export default function App() {
                         </div>
                     </div>
                     <div style={{display:'flex',gap:8}}>
-                      <button onClick={() => setSelectedCells(((displayPreview && displayPreview.before||[]).slice(0, rowsToShow || undefined).reduce((acc,_,i)=>{
-                        visibleColumns.forEach((col)=>{
-                          const isChanged = String(((displayPreview && displayPreview.before[i])||{})[col] ?? '') !== String(((displayPreview && displayPreview.after[i])||{})[col] ?? '')
-                          if(isChanged) acc[`${i}|${col}`] = true
-                        })
-                        return acc
-                      },{})))}>Select all changes</button>
+                      <button onClick={selectAllChangedCells}>Select all changes</button>
                       <button onClick={() => setSelectedCells({})}>Clear selection</button>
                       <button onClick={applySelectedChanges} className="primary">Apply Selected</button>
                     </div>
@@ -4876,8 +5148,17 @@ export default function App() {
                     <h5>Schema changes</h5>
                     <div className="schema-diff">
                       {(() => {
-                        const beforeCols = (displayPreview && displayPreview.before[0]) ? Object.keys(displayPreview.before[0]) : []
-                        const afterCols = (displayPreview && displayPreview.after[0]) ? Object.keys(displayPreview.after[0]) : []
+                        const typesBefore = (displayPreview && displayPreview.types_before) || {}
+                        const typesAfter = (displayPreview && displayPreview.types_after) || {}
+                        const rowColumns = (rows) => (rows || []).flatMap((row) => Object.keys(row || {}))
+                        const beforeCols = Array.from(new Set([
+                          ...Object.keys(typesBefore),
+                          ...rowColumns(displayPreview && displayPreview.before),
+                        ]))
+                        const afterCols = Array.from(new Set([
+                          ...Object.keys(typesAfter),
+                          ...rowColumns(displayPreview && displayPreview.after),
+                        ]))
                         const added = afterCols.filter(c=>!beforeCols.includes(c))
                         const removed = beforeCols.filter(c=>!afterCols.includes(c))
                         return (
@@ -4899,10 +5180,29 @@ export default function App() {
                           try {
                             const tb = (displayPreview && displayPreview.types_before) || {}
                             const ta = (displayPreview && displayPreview.types_after) || {}
-                            const allCols = Array.from(new Set([...(Object.keys(tb || {})), ...(Object.keys(ta || {}))])).sort()
+                            const typeChanges = (displayPreview && displayPreview.type_changes) || {}
+                            const allCols = Array.from(new Set([
+                              ...Object.keys(tb || {}),
+                              ...Object.keys(ta || {}),
+                              ...Object.keys(typeChanges || {}),
+                            ])).sort()
+                            const changedTypes = allCols.filter((column) => {
+                              const change = typeChanges[column]
+                              return !!change || tb[column] !== ta[column]
+                            })
                             if (!allCols || allCols.length === 0) return <div style={{color:'var(--muted)'}}>No type information available</div>
                             return (
                               <div style={{display:'flex',flexDirection:'column',gap:8}}>
+                                {changedTypes.length > 0 ? (
+                                  <div style={{color:'#10b981'}}>
+                                    Changed: {changedTypes.map((column) => {
+                                      const change = typeChanges[column] || { before: tb[column], after: ta[column] }
+                                      return `${column}: ${change.before ?? '—'} => ${change.after ?? '—'}`
+                                    }).join('; ')}
+                                  </div>
+                                ) : (
+                                  <div style={{color:'var(--muted)'}}>No type changes detected</div>
+                                )}
                                 <table style={{width:'100%',borderCollapse:'collapse'}}>
                                   <thead>
                                     <tr>
@@ -4915,7 +5215,7 @@ export default function App() {
                                     {allCols.map((c) => {
                                       const beforeType = tb[c] == null ? '—' : String(tb[c])
                                       const afterType = ta[c] == null ? '—' : String(ta[c])
-                                      const isTypeChanged = beforeType !== afterType
+                                      const isTypeChanged = !!typeChanges[c] || beforeType !== afterType
                                       return (
                                         <tr key={c} style={{borderTop:'1px solid rgba(255,255,255,0.03)'}}>
                                           <td style={{padding:6,width:260}}><strong>{c}</strong></td>
