@@ -6,6 +6,7 @@ import json
 import os
 import re
 import unicodedata
+from collections import Counter
 from pathlib import Path
 from uuid import uuid4
 from typing import Any
@@ -716,12 +717,17 @@ def _value_shape(value: str) -> str:
 
 
 def _shape_regex(shape: str) -> str:
-    return ''.join({'9': r'\d+', 'A': r'[A-Z]+', 'a': r'[a-z]+'}.get(ch) or re.escape(ch) for ch in shape)
+    return ''.join({'9': r'\d+', 'A': r'[A-Z]+', 'a': r'[A-Za-z]+'}.get(ch) or re.escape(ch) for ch in shape)
+
+
+def _swap_shape(value: str) -> str:
+    """Case-insensitive shape for swap detection: 'ORLANDO' and 'Orlando' are the same shape."""
+    return _value_shape(re.sub(r'[A-Za-z]', 'a', value))
 
 
 def _column_shapes(raw_values: list) -> tuple[list, set, set] | None:
     """Per-row shapes, the core shapes covering 75% of values, and every recurring shape."""
-    shapes = [_value_shape(v) if v else None for v in raw_values]
+    shapes = [_swap_shape(v) if v else None for v in raw_values]
     counts: dict[str, int] = {}
     for shape in shapes:
         if shape is not None:
@@ -756,13 +762,55 @@ def _belongs(shape: str, accepted: set, home: set) -> bool:
     return kind != 'mixed' and any(_shape_class(h) == kind for h in home)
 
 
+_MIN_VOCAB_SUPPORT = 5
+_VOCAB_DOMINANCE = 3
+_MAX_EXACT_SWAP_VALUES = 200
+
+
+def _lives_in(key: str, here: Counter, there: Counter) -> bool:
+    """A value 'lives in' a column when it recurs there and clearly dominates its count in the other column."""
+    return here[key] >= _MIN_VOCAB_SUPPORT and here[key] >= _VOCAB_DOMINANCE * there[key]
+
+
+def _vocabulary_swap(left: str, right: str, left_raw: list, right_raw: list, left_seen: Counter, right_seen: Counter) -> dict[str, Any] | None:
+    """Text-vs-text swaps can't be told apart by shape, so judge each row by which column its values live in."""
+    crossed: list[int] = []
+    home_rows = 0
+    for index in range(min(len(left_raw), len(right_raw))):
+        if not left_raw[index] or not right_raw[index]:
+            continue
+        a, b = left_raw[index].casefold(), right_raw[index].casefold()
+        if _lives_in(a, left_seen, right_seen) and _lives_in(b, right_seen, left_seen):
+            home_rows += 1
+        elif _lives_in(a, right_seen, left_seen) and _lives_in(b, left_seen, right_seen):
+            crossed.append(index)
+    if len(crossed) < 5 or home_rows < 10 or home_rows < len(crossed) * 2:
+        return None
+    exact_left = {left_raw[i] for i in crossed}
+    exact_right = {right_raw[i] for i in crossed}
+    if len(exact_left) > _MAX_EXACT_SWAP_VALUES or len(exact_right) > _MAX_EXACT_SWAP_VALUES:
+        return None
+    moves = [
+        {'source': left, 'target': right, 'type': 'pattern', 'pattern': '(?i:' + '|'.join(re.escape(v) for v in sorted(exact_left)) + ')', 'exceptions': []},
+        {'source': right, 'target': left, 'type': 'pattern', 'pattern': '(?i:' + '|'.join(re.escape(v) for v in sorted(exact_right)) + ')', 'exceptions': []},
+    ]
+    return {
+        'left': left, 'right': right, 'rows': len(crossed), 'home_rows': home_rows,
+        'left_examples': _uniq([left_raw[i] for i in crossed], 3),
+        'right_examples': _uniq([right_raw[i] for i in crossed], 3),
+        'step': {'action': 'swap_by_types', 'column': None, 'params': {'moves': moves, 'replacement': ''}},
+    }
+
+
 def _shape_swaps(col_stats: dict[str, dict[str, Any]], skip_pairs: set) -> list[dict[str, Any]]:
     """Find column pairs whose values sit in each other's place on the same rows."""
     profiles = {}
+    vocabularies = {}
     for col, stats in col_stats.items():
         profile = _column_shapes(stats.get('raw_values') or [])
         if profile:
             profiles[col] = profile
+            vocabularies[col] = Counter(v.casefold() for v in stats['raw_values'] if v)
     found: list[dict[str, Any]] = []
     names = list(profiles)
     for left_index, left in enumerate(names):
@@ -771,6 +819,12 @@ def _shape_swaps(col_stats: dict[str, dict[str, Any]], skip_pairs: set) -> list[
                 continue
             left_shapes, left_home, left_accepted = profiles[left]
             right_shapes, right_home, right_accepted = profiles[right]
+            left_raw, right_raw = col_stats[left]['raw_values'], col_stats[right]['raw_values']
+            if all(_shape_class(shape) != 'digit' for shape in left_home | right_home):
+                match = _vocabulary_swap(left, right, left_raw, right_raw, vocabularies[left], vocabularies[right])
+                if match:
+                    found.append(match)
+                continue
             if left_home & right_home:
                 continue
             crossed: list[int] = []
@@ -785,7 +839,6 @@ def _shape_swaps(col_stats: dict[str, dict[str, Any]], skip_pairs: set) -> list[
                     crossed.append(index)
             if len(crossed) < 5 or home_rows < 10 or home_rows < len(crossed) * 2:
                 continue
-            left_raw, right_raw = col_stats[left]['raw_values'], col_stats[right]['raw_values']
             left_set = sorted({left_shapes[i] for i in crossed})
             right_set = sorted({right_shapes[i] for i in crossed})
             if len(left_set) > 12 or len(right_set) > 12:
@@ -801,7 +854,6 @@ def _shape_swaps(col_stats: dict[str, dict[str, Any]], skip_pairs: set) -> list[
                 'step': {'action': 'swap_by_types', 'column': None, 'params': {'moves': moves, 'replacement': ''}},
             })
     return found
-
 
 def _preferred_abbreviation_case(col: str, vals: list[str]) -> str | None:
     if not vals or not all(re.fullmatch(r"(?=.*[A-Za-z])[A-Za-z0-9]{2,6}", value) for value in vals):

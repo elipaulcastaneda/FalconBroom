@@ -622,6 +622,52 @@ def test_shape_swap_is_general_not_zip_specific(tmp_path):
     assert result["phone"].to_list()[0] == "200-555-0100"
 
 
+def test_text_columns_that_only_differ_in_casing_are_not_offered_as_swaps(tmp_path):
+    import random
+    from fbroom.ingest import generate_plain_language_suggestions
+
+    random.seed(7)
+    columns = {
+        "builder_name": ["Cedar Ridge Homes", "Valley Stone Homes", "Summit House Builders", "Blue Oak Construction"],
+        "city": ["Orlando", "Salt Lake City", "Boston", "Atlanta", "Austin"],
+        "state": ["Massachusetts", "New Jersey", "Georgia", "Utah", "Texas"],
+        "home_type": ["single-family", "townhouse", "Town home", "condo"],
+    }
+
+    def messy(value):
+        return random.choice([value, value.lower(), value.upper(), value.title()])
+
+    rows = [",".join(columns)]
+    for _ in range(2000):
+        rows.append(",".join(messy(random.choice(values)) for values in columns.values()))
+    path = tmp_path / "clean_but_messy_case.csv"
+    path.write_text("\n".join(rows), encoding="utf-8")
+    suggestions = generate_plain_language_suggestions({"path": str(path), "normalized_path": str(path)})
+    assert not any(item.get("source") in ("cross_column_shape_swap", "cross_column_type_swap") for item in suggestions)
+
+
+def test_genuinely_swapped_text_columns_are_still_found_and_fixed_only_on_those_rows(tmp_path):
+    import random
+    from fbroom.engine import _read_table, _swap_by_types
+
+    random.seed(11)
+    builders = ["Cedar Ridge Homes", "Valley Stone Homes", "Summit House Builders", "Blue Oak Construction"]
+    cities = ["Orlando", "Salt Lake City", "Boston", "Atlanta", "Austin"]
+    pairs = [(random.choice(builders), random.choice(cities)) for _ in range(300)]
+    swapped_rows = set(range(10, 310, 25))
+    rows = ["builder_name,city"]
+    for index, (builder, city) in enumerate(pairs):
+        rows.append(f"{city},{builder}" if index in swapped_rows else f"{builder},{city}")
+    path = tmp_path / "text_swap.csv"
+    path.write_text("\n".join(rows), encoding="utf-8")
+    _, entry, step = _shape_swap_step(path)
+    assert set(entry["columns"]) == {"builder_name", "city"}
+    result, info = _swap_by_types(_read_table(str(path)), step["params"]["moves"], "")
+    assert result["builder_name"].to_list() == [b for b, _ in pairs]
+    assert result["city"].to_list() == [c for _, c in pairs]
+    assert info["rows_changed"] == len(swapped_rows)
+
+
 def test_shape_swap_does_not_fire_for_street_addresses_in_the_other_column(tmp_path):
     from fbroom.ingest import generate_plain_language_suggestions
 
