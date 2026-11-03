@@ -19,6 +19,7 @@ except Exception:
 
 from datetime import datetime, timezone
 from .formats import EXTRA_DATE_FORMATS as _EXTRA_DATE_FORMATS
+from .standardize import convert_dates as _convert_dates, convert_values as _convert_values
 try:
     from dateutil import parser as _dateutil_parser  # type: ignore
 except Exception:
@@ -1610,7 +1611,7 @@ def _map_values(df, col, mapping: dict):
                     expr = pl.col(col)
                     for k, v in mapping.items():
                         # compare as string to be robust across types
-                        expr = pl.when(pl.col(col).cast(pl.Utf8) == str(k)).then(v).otherwise(expr)
+                        expr = pl.when(pl.col(col).cast(pl.Utf8) == str(k)).then(pl.lit(v)).otherwise(expr)
                     return df.with_columns(expr.alias(col))
                 except Exception:
                     # fallback to per-key replace
@@ -2433,21 +2434,7 @@ def _strict_dates_to_iso(values, fmt):
 
 
 def _multi_dates(values, spec):
-    """Read each value with the first source layout that fits and rewrite it in the target layout."""
-    sources, target = spec.split("=>", 1)
-    layouts = [s for s in sources.split("|") if s]
-    out = []
-    for value in values:
-        text = "" if value is None else str(value).strip()
-        result = None
-        for layout in layouts:
-            try:
-                result = datetime.strptime(text, layout).strftime(target)
-                break
-            except ValueError:
-                continue
-        out.append(result)
-    return out
+    return _convert_dates(values, spec)
 
 
 def _cast_column(df, col, to_type: str, fmt: str = None, errors: str = "coerce"):
@@ -2460,6 +2447,14 @@ def _cast_column(df, col, to_type: str, fmt: str = None, errors: str = "coerce")
     to_type = (to_type or "").lower()
     if col not in (df.columns if _is_polars_df(df) else list(df.columns)):
         return df, None
+
+    if fmt and fmt.startswith(("num:", "unit:")) and _is_polars_df(df):
+        before = df[col].to_list()
+        out = _convert_values(before, fmt, to_type)
+        dtype = {"int": pl.Int64, "integer": pl.Int64, "str": pl.Utf8, "string": pl.Utf8}.get(to_type, pl.Float64)
+        lost = sum(1 for b, a in zip(before, out) if b not in (None, "") and a is None)
+        return df.with_columns(pl.Series(col, out, dtype=dtype)), {
+            "step": "cast", "column": col, "to_type": to_type, "rows_changed": lost}
 
     try:
         if _is_polars_df(df):

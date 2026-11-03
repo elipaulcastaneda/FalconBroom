@@ -53,8 +53,8 @@ def test_abbreviation_columns_use_uppercase_without_lowercasing_full_state_names
 
 def test_numeric_and_identifier_edge_cases_are_conservative():
     mixed_units = _analyze_column("measurement", ["10kg", "5lb", "12kg", "8lb"] * 5)
-    assert mixed_units["kind"] == "mixed"
-    assert all("json_steps" not in entry for entry in mixed_units["entries"])
+    assert mixed_units["kind"] in ("mixed", "numeric")
+    assert any("mixes mass units" in entry["text"] for entry in mixed_units["entries"])
 
     currency = _analyze_column("price", ["$1,200.50", "$25.00"] * 10)
     assert currency["entries"][0]["json_steps"][0]["action"] == "cast"

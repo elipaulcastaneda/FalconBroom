@@ -27,7 +27,7 @@ from .semantics import (
     _MISSING as _SEMANTIC_MISSING,
 )
 from .formats import EXTRA_DATE_FORMATS, numeric_format_entry as _numeric_format_entry
-from .standardize import mixed_date_entries as _mixed_date_entries, mixed_phone_entries as _mixed_phone_entries, boolean_choice_entries as _boolean_choice_entries
+from .standardize import mixed_date_entries as _mixed_date_entries, mixed_phone_entries as _mixed_phone_entries, boolean_choice_entries as _boolean_choice_entries, mixed_datetime_entries as _mixed_datetime_entries, mixed_number_entries as _mixed_number_entries, mixed_decimal_entries as _mixed_decimal_entries, mixed_unit_entries as _mixed_unit_entries, intl_phone_entries as _intl_phone_entries, mixed_zip_entries as _mixed_zip_entries, mixed_region_entries as _mixed_region_entries
 from .step_catalog import parse_machine_template, steps_to_template, steps_to_text
 import threading
 import traceback
@@ -1008,6 +1008,7 @@ def _zip_entries(col: str, vals: list[str]) -> list[dict[str, Any]]:
         ents.append(_entry(
             f"{len(words)} values in '{col}' are text, not ZIP codes (e.g. {', '.join(_uniq(words))}). They probably belong in another column, so review them; '{col}' is kept as text and is not cast to a number",
             None, 0.6))
+    ents.extend(_mixed_zip_entries(col, vals, _entry))
     return ents
 
 
@@ -1116,6 +1117,9 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
     pending_drops: list[dict[str, Any]] = []
     european_numbers = [s for s in vals if _LOCALE_NUMBER_RE.fullmatch(re.sub(r"[€£$¥₹\s]", "", s))]
     if european_numbers:
+        mixed_numbers = _mixed_number_entries(col, vals, _entry)
+        if mixed_numbers:
+            return {'kind': 'numeric', 'entries': mixed_numbers}
         entries = [_entry(
             f"'{col}' contains comma-decimal values such as {', '.join(_uniq(european_numbers))}. Review the number locale before converting; automatic comma removal could change their magnitude",
             None, 0.45)]
@@ -1165,6 +1169,9 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
         mixed_dates = _mixed_date_entries(col, vals, _DATE_FORMATS, _entry)
         if mixed_dates:
             return {'kind': 'date', 'entries': mixed_dates}
+        mixed_datetimes = _mixed_datetime_entries(col, vals, _entry)
+        if mixed_datetimes:
+            return {'kind': 'date', 'entries': mixed_datetimes}
     if date_matches / n >= 0.75:
         iso = sum(1 for s in vals if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s))
         if iso / n >= 0.9 and not _is_identifier_name(col):
@@ -1206,22 +1213,27 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
         malformed = [s for s, v in zip(vals, compact) if not re.fullmatch(r"\+?\d{7,15}", v)]
         punctuation = any(re.search(r'[\s().-]', s) for s in vals)
         if not malformed and punctuation:
-            ents = _mixed_phone_entries(col, vals, _entry)
             text = f"Remove display punctuation and spaces from phone numbers in '{col}' while preserving the leading country-code plus sign"
-            ents.append(_entry(text, None, 0.8, [{'action': 'regex_replace', 'column': col, 'params': {'pattern': r'[\s().-]', 'replace': ''}}]))
+            ents = [_entry(text, None, 0.8, [{'action': 'regex_replace', 'column': col, 'params': {'pattern': r'[\s().-]', 'replace': ''}}])]
         else:
             ents = [_entry(f"Review {len(malformed)} phone values in '{col}' with extensions or unusual formats before normalizing; examples: {', '.join(_uniq(malformed))}", None, 0.5)] if malformed else []
+        ents = (_mixed_phone_entries(col, vals, _entry) or _intl_phone_entries(col, vals, _entry)) + ents
         result = {'kind': 'identifier', 'entries': ents}
     elif _is_identifier_name(col) or leading_zero_ids:
         entries = []
         result = {'kind': 'identifier', 'entries': entries}
     else:
-        formatted = _numeric_format_entry(col, vals, lambda s: _classify_cell(s)[0] in ('numeric', 'formatted'))
-        if formatted:
+        standardized = _mixed_number_entries(col, vals, _entry) or _mixed_unit_entries(col, vals, _entry)
+        formatted = None if standardized else _numeric_format_entry(col, vals, lambda s: _classify_cell(s)[0] in ('numeric', 'formatted'))
+        if standardized:
+            result = {'kind': 'numeric', 'entries': standardized}
+        elif formatted:
             result = {'kind': 'numeric', 'entries': [_entry(formatted['text'], None, formatted['confidence'], formatted['steps'])]}
         else:
             result = _numeric_entries(col, vals, kinds, cnt)
         bad_numbers = [s for s, (k, _, _) in zip(vals, kinds) if k in ('text', 'zip4')]
+        if result.get('kind') == 'numeric' and not standardized:
+            result['entries'].extend(_mixed_decimal_entries(col, vals, _entry))
         if result.get('kind') == 'numeric' and not cnt['affix'] and bad_numbers:
             pending_drops.extend(drop_entries([("is not a number", {'issue': 'not_numeric'}, len(bad_numbers), bad_numbers)]))
 
@@ -1297,6 +1309,8 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
     # Suggest normalization only for low-cardinality labels with case/space variants.
     preferred_case = _preferred_abbreviation_case(col, vals)
     proper_name_field = bool(_GEOGRAPHIC_FIELD_RE.search(col) or _ORGANIZATION_FIELD_RE.search(col)) and preferred_case is None
+    if result.get('kind') not in ('identifier', 'date', 'date_review', 'numeric') and n >= 2:
+        result['entries'].extend(_mixed_region_entries(col, vals, raw_values, _entry))
     if result.get('kind') not in ('identifier', 'date', 'date_review') and n >= 2:
         groups: dict[str, set[str]] = {}
         for s in raw_values:
@@ -1327,8 +1341,9 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
             'disabled': 'false', 'inactive': 'false', 'off': 'false', 'declined': 'false', 'absent': 'false',
         }
         boolean_field = bool(re.search(r'active|enabled|verified|consent|is_|^has_|^on_|passed|failed|approved|paid|subscribed|accepted|confirmed|opted|flag|bool', col, re.I))
-        word_labels = {'yes', 'no', 'true', 'false', 'pass', 'fail', 'passed', 'failed', 'approved', 'rejected', 'paid', 'unpaid'}
-        true_words = {'yes', 'true', 'pass', 'passed', 'approved', 'paid'}
+        word_labels = {'yes', 'no', 'true', 'false', 'pass', 'fail', 'passed', 'failed', 'approved', 'rejected', 'paid', 'unpaid',
+                       'on', 'off', 'enabled', 'disabled', 'present', 'absent', 'accepted', 'declined'}
+        true_words = {'yes', 'true', 'pass', 'passed', 'approved', 'paid', 'on', 'enabled', 'present', 'accepted'}
         value_driven = bool(lowered) and lowered <= word_labels and bool(lowered & true_words) and bool(lowered - true_words)
         bool_labels.update({'pass': 'true', 'passed': 'true', 'approved': 'true', 'paid': 'true', 'verified': 'true', 'confirmed': 'true',
                             'fail': 'false', 'failed': 'false', 'rejected': 'false', 'unpaid': 'false', 'denied': 'false'})
