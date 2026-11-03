@@ -1009,10 +1009,23 @@ def _fetch_exchange_rate(provider, frm, to, api_key=None, cache_ttl=3600, timeou
 
 
 def _is_date_str(val: str) -> bool:
-    """Best-effort date detection: use dateutil if available, else try common formats and iso regex."""
+    """Best-effort date detection; cached per stripped text because the result depends on nothing else."""
     if val is None:
         return False
     s = str(val).strip()
+    hit = _DATE_STR_CACHE.get(s)
+    if hit is None:
+        if len(_DATE_STR_CACHE) >= 500_000:
+            _DATE_STR_CACHE.clear()
+        hit = _DATE_STR_CACHE[s] = _is_date_text(s)
+    return hit
+
+
+_DATE_STR_CACHE: dict = {}
+
+
+def _is_date_text(s: str) -> bool:
+    """Date detection: use dateutil if available, else try common formats and iso regex."""
     if s == "":
         return False
     # quick ISO-like regex
@@ -1897,6 +1910,72 @@ def _remove_by_type(df, col, params=None):
         return df, None
 
 
+def _swap_by_types_vectorized(df, moves, replacement, matches, partnered_ids):
+    """Column-wise replay of the row-wise swap logic for all-string frames; returns None when it cannot apply exactly."""
+    if not _is_polars_df(df) or not isinstance(replacement, str):
+        return None
+    cols = []
+    for m in moves:
+        for c in (m.get('source'), m.get('target')):
+            if c not in df.columns:
+                return None
+            if c not in cols:
+                cols.append(c)
+    if any(df.schema[c] != pl.Utf8 or df.get_column(c).null_count() == df.height for c in cols):
+        return None
+
+    original = {c: df.get_column(c) for c in cols}
+    mask_cache = {}
+
+    def value_mask(col, mov):
+        key = (col, id(mov))
+        if key not in mask_cache:
+            s = original[col]
+            hits = [v for v in s.unique().drop_nulls().to_list() if matches(mov, v)]
+            mask_cache[key] = s.is_in(hits).fill_null(False) if hits else pl.Series([False] * len(s))
+        return mask_cache[key]
+
+    blank_cache = {}
+
+    def blank_mask(col):
+        if col not in blank_cache:
+            s = original[col]
+            blanks = [v for v in s.unique().drop_nulls().to_list() if v.strip() == '']
+            blank_cache[col] = s.is_null() | (s.is_in(blanks).fill_null(False) if blanks else pl.Series([False] * len(s)))
+        return blank_cache[col]
+
+    new = dict(original)
+    swapped = pl.Series([False] * df.height)
+    rows_changed = 0
+
+    for a in moves:
+        for b in moves:
+            if a is b or not (a.get('source') == b.get('target') and a.get('target') == b.get('source')):
+                continue
+            src_col, tgt_col = a.get('source'), a.get('target')
+            cond = (~swapped) & value_mask(src_col, a) & value_mask(tgt_col, b)
+            count = int(cond.sum())
+            if count:
+                new[src_col] = pl.select(pl.when(cond).then(original[tgt_col]).otherwise(new[src_col])).to_series().alias(src_col)
+                new[tgt_col] = pl.select(pl.when(cond).then(original[src_col]).otherwise(new[tgt_col])).to_series().alias(tgt_col)
+                rows_changed += count
+                swapped = swapped | cond
+
+    for mov in moves:
+        src, tgt = mov.get('source'), mov.get('target')
+        ok = (~swapped) & value_mask(src, mov)
+        if id(mov) in partnered_ids:
+            ok = ok & blank_mask(tgt)
+        count = int(ok.sum())
+        if count:
+            new[tgt] = pl.select(pl.when(ok).then(original[src]).otherwise(new[tgt])).to_series().alias(tgt)
+            new[src] = pl.select(pl.when(ok).then(pl.lit(replacement)).otherwise(new[src])).to_series().alias(src)
+            rows_changed += count
+
+    df_new = df.with_columns([new[c].alias(c) for c in cols])
+    return df_new, {"step": "swap_by_types", "moves": moves, "rows_changed": rows_changed}
+
+
 def _swap_by_types(df, moves, replacement=""):
     """Perform bidirectional swaps/moves between columns based on type matches.
     `moves` is a list of dicts: {source, target, type, exceptions: []}
@@ -1942,6 +2021,45 @@ def _swap_by_types(df, moves, replacement=""):
         if is_num_val(x):
             return False
         return True
+
+    def matches_uncached(mov, val):
+        pattern = mov.get('pattern')
+        if pattern:
+            return val is not None and bool(_re.fullmatch(pattern, str(val).strip()))
+        typ = mov.get('type')
+        exc = mov.get('exceptions') or []
+        if typ == 'numeric':
+            if 'date' in exc and is_date_val(val):
+                return False
+            return is_num_val(val)
+        if typ == 'string':
+            if 'date' in exc and is_date_val(val):
+                return False
+            return is_string_val(val)
+        if typ == 'date':
+            return is_date_val(val)
+        return False
+
+    match_cache = {}
+
+    def matches(mov, val):
+        try:
+            key = (id(mov), val)
+            hit = match_cache.get(key)
+        except TypeError:
+            return matches_uncached(mov, val)
+        if hit is None:
+            hit = match_cache[key] = matches_uncached(mov, val)
+        return hit
+
+    partnered_ids = {
+        id(m) for m in moves
+        if any(o is not m and o.get('source') == m.get('target') and o.get('target') == m.get('source') for o in moves)
+    }
+
+    fast = _swap_by_types_vectorized(df, moves, replacement, matches, partnered_ids)
+    if fast is not None:
+        return fast
 
     # Try a vectorized pandas-backed implementation when Polars DF available
     try:
@@ -2047,26 +2165,8 @@ def _swap_by_types(df, moves, replacement=""):
     rows_changed = 0
     new_data = {c: list(data[c]) for c in cols}
 
-    def matches(mov, val):
-        pattern = mov.get('pattern')
-        if pattern:
-            return val is not None and bool(_re.fullmatch(pattern, str(val).strip()))
-        typ = mov.get('type')
-        exc = mov.get('exceptions') or []
-        if typ == 'numeric':
-            if 'date' in exc and is_date_val(val):
-                return False
-            return is_num_val(val)
-        if typ == 'string':
-            if 'date' in exc and is_date_val(val):
-                return False
-            return is_string_val(val)
-        if typ == 'date':
-            return is_date_val(val)
-        return False
-
     def partnered(mov):
-        return any(o is not mov and o.get('source') == mov.get('target') and o.get('target') == mov.get('source') for o in moves)
+        return id(mov) in partnered_ids
 
     for i in range(n):
         applied_swap = False
@@ -2424,13 +2524,17 @@ _ISO_OUTPUT_FORMATS = frozenset(item[0] for item in _EXTRA_DATE_FORMATS)
 def _strict_dates_to_iso(values, fmt):
     """Parse with an exact layout and write ISO text; values that do not fit become empty."""
     with_time = any(token in fmt for token in ("%H", "%I"))
+    layout = "%Y-%m-%d %H:%M:%S" if with_time else "%Y-%m-%d"
+    seen: dict = {}
     out = []
     for value in values:
-        try:
-            parsed = datetime.strptime(str(value).strip(), fmt)
-            out.append(parsed.strftime("%Y-%m-%d %H:%M:%S" if with_time else "%Y-%m-%d"))
-        except (ValueError, TypeError):
-            out.append(None)
+        key = str(value).strip()
+        if key not in seen:
+            try:
+                seen[key] = datetime.strptime(key, fmt).strftime(layout)
+            except (ValueError, TypeError):
+                seen[key] = None
+        out.append(seen[key])
     return out
 
 
