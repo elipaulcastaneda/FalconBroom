@@ -29,6 +29,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "windows": {
+      "nsis": { "installerHooks": "installer-hooks.nsh" }
+    },
     "licenseFile": "../LICENSE",
     "publisher": "FalconBroom",
     "shortDescription": "Data profiling and cleaning"
