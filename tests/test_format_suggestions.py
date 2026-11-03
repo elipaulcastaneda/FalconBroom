@@ -95,3 +95,40 @@ def test_ids_and_short_columns_are_handled_by_kind(tmp_path):
 def test_metres_are_not_read_as_millions(tmp_path):
     source, found = _run(tmp_path, "height", ["12 m", "15 m", "9 m", "30 m", "8 m", "21 m"])
     assert not any("magnitude" in s["text"] for s in found)
+
+
+def test_mixed_date_layouts_offer_a_choice_of_target(tmp_path):
+    values = ["2024-01-05", "03/25/2024", "31.12.2023", "2022-07-04", "14/02/2024", "Mar 05, 2021", "2020-11-30", "2019-06-15"]
+    source, found = _run(tmp_path, "signup", values)
+    offers = [s for s in found if "=>" in str(s["json_steps"][0]["params"].get("fmt", ""))]
+    assert len(offers) >= 4 and all("mixes" in s["text"] for s in offers)
+    iso = next(s for s in offers if s["json_steps"][0]["params"]["fmt"].endswith("=>%Y-%m-%d"))
+    rows = _apply(tmp_path, source, iso["json_steps"])
+    assert [r["signup"] for r in rows][:4] == ["2024-01-05", "2024-03-25", "2023-12-31", "2022-07-04"]
+    us = next(s for s in offers if s["json_steps"][0]["params"]["fmt"].endswith("=>%m/%d/%Y"))
+    assert _apply(tmp_path, source, us["json_steps"])[0]["signup"] == "01/05/2024"
+
+
+def test_single_date_layout_is_not_called_mixed(tmp_path):
+    source, found = _run(tmp_path, "signup", ["2024-01-05", "2024-02-10", "2023-03-01", "2022-04-04"])
+    assert not any("mixes" in s["text"] for s in found)
+
+
+def test_mixed_phone_styles_offer_a_choice(tmp_path):
+    values = ["(555) 123-4567", "555-987-6543", "555.222.3333", "+1 555 444 5555", "5558889999"]
+    source, found = _run(tmp_path, "phone", values)
+    offers = [s for s in found if "several styles" in s["text"]]
+    assert len(offers) == 4
+    dashed = next(s for s in offers if "555-123-4567" in s["text"].split("to ")[-1])
+    assert [r["phone"] for r in _apply(tmp_path, source, dashed["json_steps"])] == [
+        "555-123-4567", "555-987-6543", "555-222-3333", "555-444-5555", "555-888-9999"]
+    source, found = _run(tmp_path, "phone", ["555-123-4567", "555-987-6543", "555-222-3333"])
+    assert not any("several styles" in s["text"] for s in found)
+
+
+def test_mixed_yes_no_spellings_offer_a_choice(tmp_path):
+    source, found = _run(tmp_path, "active", ["Yes", "y", "No", "N", "true", "FALSE", "yes", "no"])
+    offers = [s for s in found if "mixes spellings" in s["text"]]
+    assert len(offers) == 3
+    yn = next(s for s in offers if s["text"].endswith("Y/N"))
+    assert [r["active"] for r in _apply(tmp_path, source, yn["json_steps"])][:6] == ["Y", "Y", "N", "N", "Y", "N"]

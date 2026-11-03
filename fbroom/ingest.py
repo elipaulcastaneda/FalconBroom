@@ -27,6 +27,7 @@ from .semantics import (
     _MISSING as _SEMANTIC_MISSING,
 )
 from .formats import EXTRA_DATE_FORMATS, numeric_format_entry as _numeric_format_entry
+from .standardize import mixed_date_entries as _mixed_date_entries, mixed_phone_entries as _mixed_phone_entries, boolean_choice_entries as _boolean_choice_entries
 from .step_catalog import parse_machine_template, steps_to_template, steps_to_text
 import threading
 import traceback
@@ -1160,6 +1161,10 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
                 [s for s in vals if not _parses_with(s, fmt)],
             )] if invalid_count else [])}
     date_matches = sum(1 for s in vals if _DATE_LIKE_RE.match(s))
+    if not _is_identifier_name(col):
+        mixed_dates = _mixed_date_entries(col, vals, _DATE_FORMATS, _entry)
+        if mixed_dates:
+            return {'kind': 'date', 'entries': mixed_dates}
     if date_matches / n >= 0.75:
         iso = sum(1 for s in vals if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s))
         if iso / n >= 0.9 and not _is_identifier_name(col):
@@ -1201,8 +1206,9 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
         malformed = [s for s, v in zip(vals, compact) if not re.fullmatch(r"\+?\d{7,15}", v)]
         punctuation = any(re.search(r'[\s().-]', s) for s in vals)
         if not malformed and punctuation:
+            ents = _mixed_phone_entries(col, vals, _entry)
             text = f"Remove display punctuation and spaces from phone numbers in '{col}' while preserving the leading country-code plus sign"
-            ents = [_entry(text, None, 0.8, [{'action': 'regex_replace', 'column': col, 'params': {'pattern': r'[\s().-]', 'replace': ''}}])]
+            ents.append(_entry(text, None, 0.8, [{'action': 'regex_replace', 'column': col, 'params': {'pattern': r'[\s().-]', 'replace': ''}}]))
         else:
             ents = [_entry(f"Review {len(malformed)} phone values in '{col}' with extensions or unusual formats before normalizing; examples: {', '.join(_uniq(malformed))}", None, 0.5)] if malformed else []
         result = {'kind': 'identifier', 'entries': ents}
@@ -1335,6 +1341,7 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
                 result['entries'].append(_entry(
                     f"Standardize yes/no variants in '{col}' to true/false",
                     None, 0.8, [{'action': 'map', 'column': col, 'params': {'mapping': mapping}}]))
+                result['entries'].extend(_boolean_choice_entries(col, mapping, _entry))
 
     metric_field = bool(re.search(r"age|amount|price|cost|total|quantity|count|score|rate|weight|height|balance|duration", col, re.I))
     if metric_field and result.get('kind') == 'numeric' and n >= 20:

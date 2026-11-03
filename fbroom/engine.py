@@ -2432,6 +2432,24 @@ def _strict_dates_to_iso(values, fmt):
     return out
 
 
+def _multi_dates(values, spec):
+    """Read each value with the first source layout that fits and rewrite it in the target layout."""
+    sources, target = spec.split("=>", 1)
+    layouts = [s for s in sources.split("|") if s]
+    out = []
+    for value in values:
+        text = "" if value is None else str(value).strip()
+        result = None
+        for layout in layouts:
+            try:
+                result = datetime.strptime(text, layout).strftime(target)
+                break
+            except ValueError:
+                continue
+        out.append(result)
+    return out
+
+
 def _cast_column(df, col, to_type: str, fmt: str = None, errors: str = "coerce"):
     """Cast column `col` to `to_type`.
     to_type: 'int','float','str','datetime','bool','category'
@@ -2465,6 +2483,12 @@ def _cast_column(df, col, to_type: str, fmt: str = None, errors: str = "coerce")
                 elif to_type in ("str", "string"):
                     df_new = df.with_columns(pl.col(col).cast(pl.Utf8).alias(col))
                 elif to_type in ("datetime", "date", "ts"):
+                    if fmt and "=>" in fmt:
+                        before_vals = df[col].to_list()
+                        out = _multi_dates(before_vals, fmt)
+                        lost = sum(1 for b, a in zip(before_vals, out) if b not in (None, "") and a is None)
+                        return df.with_columns(pl.Series(col, out, dtype=pl.Utf8)), {
+                            "step": "cast", "column": col, "to_type": to_type, "rows_changed": lost}
                     if fmt and fmt in _ISO_OUTPUT_FORMATS:
                         out = _strict_dates_to_iso(df[col].to_list(), fmt)
                         before = sum(1 for v in df[col].to_list() if v not in (None, ""))
