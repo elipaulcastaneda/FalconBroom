@@ -103,7 +103,9 @@ _STATUS_WORDS = frozenset(
     "pending active inactive completed complete incomplete in progress on hold approved rejected denied cancelled "
     "canceled open closed new draft failed passed pass fail permitted planned delayed started not paused scheduled "
     "submitted review reviewed resolved unresolved overdue paid unpaid refunded shipped delivered processing "
-    "ready done waiting expired suspended terminated queued running stopped finished ongoing underway of".split()
+    "ready done waiting expired suspended terminated queued running stopped finished ongoing underway of returned "
+    "backordered ordered stock in out fulfilled unfulfilled abandoned dispatched transit hired probation enrolled "
+    "graduated withdrawn dropped accepted waitlisted onboarding".split()
 )
 _JOB_WORDS = frozenset(
     "manager engineer director analyst assistant developer nurse teacher clerk supervisor coordinator specialist "
@@ -111,14 +113,42 @@ _JOB_WORDS = frozenset(
     "driver operator mechanic electrician plumber carpenter architect foreman laborer inspector estimator "
     "superintendent designer executive intern lead senior junior principal chief head physician surgeon pharmacist "
     "dentist lawyer attorney paralegal programmer scientist researcher professor instructor trainer recruiter "
+    "buyer planner payroll bookkeeper stylist barista server chef cook therapist counselor tutor merchandiser "
     "salesperson cashier receptionist secretary janitor custodian guard".split()
 )
 _DEPARTMENT_WORDS = frozenset(
     "sales marketing finance hr human resources engineering operations it legal support accounting procurement "
     "logistics production quality research development customer service services admin administration facilities "
-    "security purchasing maintenance training compliance communications design product management and".split()
+    "security purchasing maintenance training compliance communications design product management returns shipping "
+    "receiving inventory merchandising warehouse payroll recruiting and".split()
 )
 _STRIP_TITLE_PUNCT = re.compile(r"[.,]+$")
+_EMPLOYMENT_PHRASES = frozenset(
+    "full-time part-time full time part time contract contractor temporary temp seasonal intern internship permanent "
+    "freelance casual per diem fulltime parttime salaried hourly exempt non-exempt".split()
+)
+_CARRIER_WORDS = frozenset("ups fedex usps dhl ontrac lasership purolator tnt aramex royal canada amazon".split())
+_UOM_WORDS = frozenset(
+    "ea each pcs pc piece pieces box boxes case cases pack packs pallet pallets dozen doz oz gal unit units set sets "
+    "pair pairs roll rolls carton cartons bag bags drum drums".split()
+)
+_PAYMENT_PHRASES = frozenset(
+    "visa mastercard amex american express discover paypal apple pay google pay cash check cheque credit card debit "
+    "wire transfer ach venmo zelle gift cod".split()
+)
+_PROPERTY_WORDS = frozenset(
+    "single-family single family townhouse townhome town home condo condominium apartment duplex triplex multi-family "
+    "multifamily mobile manufactured land lot commercial industrial residential retail office warehouse villa "
+    "bungalow cottage loft studio house".split()
+)
+_TERM_RE = re.compile(
+    r"(?i)(?:(?:fall|spring|summer|winter|autumn)\s?'?\d{2,4}|(?:fy|ay|sy)\s?\d{2,4}(?:[-/]\d{2,4})?"
+    r"|\d{4}\s?[-/]\s?(?:\d{4}|1[3-9]|[2-9]\d))"
+)
+_COURSE_RE = re.compile(r"(?i)[A-Z]{2,4}[ -]?\d{3,4}[A-Z]?")
+_DURATION_RE = re.compile(
+    r"(?i)(?:\d+(?:\.\d+)?\s?(?:hours?|hrs?|h|minutes?|mins?|seconds?|secs?|days?|weeks?|wks?|months?|years?|yrs?)\b\s?)+"
+)
 
 _BINARY_WORDS = frozenset("yes no y n true false t f on off x ok active inactive enabled disabled".split())
 _WEATHER_WORDS = frozenset(
@@ -173,13 +203,15 @@ SEMANTIC_KINDS = frozenset({
     'date', 'time', 'phone', 'zip', 'email', 'url', 'uuid', 'temperature', 'percent', 'money', 'place', 'binary',
     'weather', 'company', 'org', 'ssn', 'ip', 'mac', 'latlong', 'financial_id', 'card', 'bloodpressure', 'quantity',
     'address', 'icd', 'routing', 'barcode', 'epoch', 'id', 'hex', 'currency_code', 'gender', 'title', 'status',
-    'color', 'size', 'person', 'name', 'job_title', 'department', 'grade',
+    'color', 'size', 'person', 'name', 'job_title', 'department', 'grade', 'employment', 'carrier', 'uom',
+    'payment_method', 'property', 'term', 'course', 'duration',
 })
 _PRIORITY = (
-    'email', 'url', 'uuid', 'ssn', 'ip', 'mac', 'latlong', 'financial_id', 'card', 'date', 'time', 'temperature',
-    'percent', 'money', 'bloodpressure', 'quantity', 'address', 'icd', 'routing', 'barcode', 'zip', 'phone', 'epoch',
-    'id', 'hex', 'year', 'decimal', 'integer', 'currency_code', 'binary', 'gender', 'title', 'weather', 'status',
-    'color', 'size', 'grade', 'person', 'place', 'company', 'org', 'job_title', 'department', 'name',
+    'email', 'url', 'uuid', 'ssn', 'ip', 'mac', 'latlong', 'financial_id', 'card', 'term', 'date', 'time', 'temperature',
+    'percent', 'money', 'bloodpressure', 'duration', 'quantity', 'address', 'icd', 'routing', 'barcode', 'zip', 'phone', 'epoch',
+    'id', 'course', 'hex', 'year', 'decimal', 'integer', 'currency_code', 'binary', 'gender', 'title', 'weather', 'status',
+    'color', 'size', 'grade', 'employment', 'payment_method', 'property', 'uom', 'carrier', 'person', 'place',
+    'company', 'org', 'job_title', 'department', 'name',
 )
 
 
@@ -351,6 +383,10 @@ def value_kinds(value: str) -> frozenset:
         return frozenset({'phone'})
     if _LATLONG_RE.fullmatch(text):
         return frozenset({'latlong'})
+    if _TERM_RE.fullmatch(text):
+        return frozenset({'term'})
+    if _DURATION_RE.fullmatch(text):
+        return frozenset({'duration', 'quantity', 'number'})
     if any(pattern.fullmatch(text) for pattern in _DATE_RES):
         return frozenset({'date'})
     if _TIME_RE.fullmatch(text):
@@ -409,6 +445,8 @@ def value_kinds(value: str) -> frozenset:
             kinds.add('address')
         if _ID_RE.fullmatch(text):
             kinds.add('id')
+        if _COURSE_RE.fullmatch(text):
+            kinds.add('course')
         if _HEX_RE.fullmatch(text) and re.search(r"[a-fA-F]", text):
             kinds.add('hex')
     else:
@@ -430,6 +468,16 @@ def value_kinds(value: str) -> frozenset:
             kinds.add('grade')
         if words and len(words) <= 4 and all(w in _STATUS_WORDS for w in words):
             kinds.add('status')
+        if lowered.replace('.', '') in _EMPLOYMENT_PHRASES or (words and len(words) <= 3 and all(w in _EMPLOYMENT_PHRASES for w in words)):
+            kinds.add('employment')
+        if words and len(words) <= 3 and words[0] in _CARRIER_WORDS:
+            kinds.add('carrier')
+        if lowered in _UOM_WORDS:
+            kinds.add('uom')
+        if words and len(words) <= 3 and all(w in _PAYMENT_PHRASES for w in words):
+            kinds.add('payment_method')
+        if words and len(words) <= 3 and all(w in _PROPERTY_WORDS for w in words):
+            kinds.add('property')
         if lowered in _WEATHER_WORDS or _WEATHER_PHRASES.fullmatch(text) or (words and all(w in _WEATHER_WORDS or w in ('and', 'with', 'partly', 'mostly') for w in words)):
             kinds.add('weather')
         person = _name_kind(text)
@@ -512,7 +560,21 @@ def widen(main) -> frozenset:
     if 'quantity' in main:
         widened.update({'integer', 'decimal', 'number'})
     if 'id' in main:
-        widened.update({'hex', 'uuid'})
+        widened.update({'hex', 'uuid', 'course'})
+    if 'course' in main:
+        widened.add('id')
+    if 'term' in main:
+        widened.update({'year', 'date'})
+    if 'duration' in main:
+        widened.update({'quantity', 'time', 'number', 'integer', 'decimal'})
+    if 'employment' in main:
+        widened.add('status')
+    if 'status' in main:
+        widened.add('employment')
+    if 'carrier' in main:
+        widened.update({'company', 'org'})
+    if 'company' in main:
+        widened.add('carrier')
     if 'epoch' in main:
         widened.add('date')
     if 'person' in main:
@@ -585,8 +647,21 @@ _HEADER_RULES: tuple[tuple[frozenset, frozenset], ...] = tuple(
         ("contractor builder vendor supplier company organization organisation org employer business firm agency "
          "dealer brand manufacturer client customer", {'company', 'org', 'person'}),
         ("firstname lastname surname fullname givenname familyname forename maiden", {'person', 'name'}),
+        ("carrier shipper courier", {'carrier', 'company', 'org'}),
+        ("employee staff worker student patient", {'person', 'name'}),
+        ("uom", {'uom'}),
+        ("employment", {'employment', 'status'}),
+        ("payment tender", {'payment_method', 'money'} | _NUMERIC),
+        ("property", {'property', 'address'}),
+        ("term semester quarter academic schoolyear fiscal", {'term', 'year', 'date'}),
+        ("course subject module", {'course', 'id', 'department'}),
+        ("duration elapsed runtime lifetime tenure uptime", {'duration', 'time', 'quantity'} | _NUMERIC),
+        ("hiredate hired joined termination", {'date', 'time', 'epoch'}),
+        ("humidity moisture battery", {'percent', 'quantity'} | _NUMERIC),
+        ("pressure voltage current ph ppm reading measurement elevation altitude frequency hours hrs overtime "
+         "inventory stock", {'quantity'} | _NUMERIC),
         ("id ids key guid uuid sku order invoice tracking shipment permit parcel apn serial vin license plate "
-         "reference ref ticket case mrn npi", {'id', 'integer', 'uuid', 'hex', 'barcode', 'card', 'routing'}),
+         "reference ref ticket case mrn npi mls zoning", {'id', 'integer', 'uuid', 'hex', 'barcode', 'card', 'routing', 'course'}),
     )
 )
 _NAME_PARTS = frozenset("first last middle given family maiden".split())
