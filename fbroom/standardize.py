@@ -30,6 +30,14 @@ _NANP = re.compile(r'1?([2-9]\d{2})(\d{3})(\d{4})')
 
 from functools import lru_cache as _memo
 
+try:
+    # strptime keeps only 5 compiled formats by default; this module cycles through dozens
+    import _strptime as _strptime_module
+    if getattr(_strptime_module, '_CACHE_MAX_SIZE', 0) < 256:
+        _strptime_module._CACHE_MAX_SIZE = 256
+except Exception:
+    pass
+
 
 @_memo(maxsize=65536)
 def _parses(value: str, fmt: str, pattern: re.Pattern) -> bool:
