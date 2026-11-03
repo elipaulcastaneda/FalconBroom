@@ -679,6 +679,35 @@ def test_shape_swap_does_not_fire_for_street_addresses_in_the_other_column(tmp_p
     assert not any(item.get("source") == "cross_column_shape_swap" for item in suggestions)
 
 
+def test_messy_but_correct_dates_counts_and_costs_are_not_offered_as_swaps(tmp_path):
+    import random
+    from fbroom.ingest import generate_plain_language_suggestions
+
+    random.seed(3)
+    dates = ["2024-08-26", "2023-12-10", "Apr 17", "03/04/2024", "5 May 2023", "2023", "2024", "2025", "March 2022"]
+    costs = ["USD 359975", "USD 1007000", "1.156.250", "$420,000", "355000", "512000.50"]
+    rows = ["start_date,bedrooms,stories,lot_size_sqft,actual_cost_usd"]
+    for _ in range(1500):
+        rows.append(",".join([
+            random.choice(dates), random.choice(["2", "3", "4", "5", "4675.0"] * 12 + ["2024-08-26", "2023-12-10"]),
+            random.choice(["1", "2", "2.5", "3.5", "1.5"]), random.choice(["5000", "7200.5", "9100", "1.5"]),
+            random.choice(costs),
+        ]))
+    path = tmp_path / "messy_correct.csv"
+    path.write_text("\n".join(rows), encoding="utf-8")
+    suggestions = generate_plain_language_suggestions({"path": str(path), "normalized_path": str(path)})
+    assert not any(item.get("source") == "cross_column_shape_swap" for item in suggestions)
+
+
+def test_dates_and_numbers_really_swapped_are_still_found(tmp_path):
+    dates = ["2024-08-26", "2023-12-10", "2022-01-05", "2021-07-19"]
+    crossed = [(str(2 + i % 4), dates[i % 4]) for i in range(8)]
+    home = [(dates[i % 4], str(2 + i % 4)) for i in range(40)]
+    path = _write_pairs(tmp_path, "date_beds.csv", "start_date,bedrooms", crossed, home)
+    _, entry, _ = _shape_swap_step(path)
+    assert set(entry["columns"]) == {"start_date", "bedrooms"}
+
+
 def test_swap_pair_only_fills_blank_cells_for_unmatched_rows():
     from fbroom.engine import _swap_by_types
 

@@ -762,6 +762,78 @@ def _belongs(shape: str, accepted: set, home: set) -> bool:
     return kind != 'mixed' and any(_shape_class(h) == kind for h in home)
 
 
+_MONTHS = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
+_DATE_KIND_RES = (
+    re.compile(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?"),
+    re.compile(r"\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}"),
+    re.compile(rf"(?i){_MONTHS}[ -]\d{{1,2}}(?:(?:st|nd|rd|th)?,?[ -]\d{{2,4}})?"),
+    re.compile(rf"(?i)\d{{1,2}}(?:st|nd|rd|th)?[ -]{_MONTHS}(?:,?[ -]\d{{2,4}})?"),
+    re.compile(rf"(?i){_MONTHS},?[ -]\d{{4}}"),
+    re.compile(r"\d{4}[-/]\d{1,2}"),
+    re.compile(r"(?i)q[1-4][ -]?\d{2,4}"),
+)
+_CURRENCY_RE = re.compile(r"(?i)(?:[$€£¥₹]|\b(?:usd|eur|gbp|cad|aud|jpy|inr|mxn)\b)")
+_GROUPED_NUMBER_RE = re.compile(r"[-+(]?\d{1,3}(?:[.,' ]\d{3})+(?:[.,]\d+)?\)?")
+
+
+def _value_kinds(value: str) -> frozenset:
+    """Coarse meaning of a value (date, money, whole number, ...); a value can belong to several kinds."""
+    text = value.strip()
+    if not text:
+        return frozenset()
+    if any(pattern.fullmatch(text) for pattern in _DATE_KIND_RES):
+        return frozenset({'date'})
+    if _CURRENCY_RE.search(text) and re.search(r"\d", text):
+        return frozenset({'money', 'number'})
+    if _GROUPED_NUMBER_RE.fullmatch(text):
+        return frozenset({'money', 'number'})
+    if re.fullmatch(r"[-+]?\d+%|[-+]?\d+(?:\.\d+)?\s?%", text):
+        return frozenset({'percent'})
+    if re.fullmatch(r"[-+]?\d+", text):
+        kinds = {'integer', 'number'}
+        if re.fullmatch(r"(?:1[5-9]|20)\d{2}", text):
+            kinds.add('year')
+        return frozenset(kinds)
+    if re.fullmatch(r"[-+]?(?:\d+\.\d*|\.\d+)(?:[eE][-+]?\d+)?", text):
+        return frozenset({'decimal', 'number'})
+    return frozenset({'other:' + _swap_shape(text)})
+
+
+def _accepted_kinds(raw_values: list) -> frozenset:
+    """The main kinds of a column (together covering 75% of values), widened by what each kind legitimately sits beside."""
+    counts: Counter = Counter()
+    total = 0
+    for value in raw_values:
+        if not value:
+            continue
+        kinds = _value_kinds(value)
+        total += 1
+        counts['year' if 'year' in kinds else next(iter(sorted(kinds - {'number'})))] += 1
+    accepted: set = set()
+    covered = 0
+    for kind, count in counts.most_common():
+        accepted.add(kind)
+        covered += count
+        if covered / max(total, 1) >= 0.75:
+            break
+    primary = set(accepted)
+    if 'date' in primary:
+        accepted.add('year')
+    if 'year' in primary:
+        accepted.update({'date', 'integer', 'number'})
+    if primary & {'money', 'decimal', 'integer', 'percent'}:
+        accepted.add('number')
+    if 'money' in primary:
+        accepted.update({'integer', 'decimal'})
+    if 'decimal' in primary:
+        accepted.add('integer')
+    return frozenset(accepted)
+
+
+def _kind_fits(value: str, accepted: frozenset) -> bool:
+    return bool(_value_kinds(value) & accepted)
+
+
 _MIN_VOCAB_SUPPORT = 5
 _VOCAB_DOMINANCE = 3
 _MAX_EXACT_SWAP_VALUES = 200
@@ -827,6 +899,7 @@ def _shape_swaps(col_stats: dict[str, dict[str, Any]], skip_pairs: set) -> list[
                 continue
             if left_home & right_home:
                 continue
+            left_kinds, right_kinds = _accepted_kinds(left_raw), _accepted_kinds(right_raw)
             crossed: list[int] = []
             home_rows = 0
             for index in range(min(len(left_shapes), len(right_shapes))):
@@ -835,7 +908,12 @@ def _shape_swaps(col_stats: dict[str, dict[str, Any]], skip_pairs: set) -> list[
                     continue
                 if a in left_home and b in right_home:
                     home_rows += 1
-                elif a not in left_home and _belongs(a, right_accepted, right_home) and b not in right_home and _belongs(b, left_accepted, left_home):
+                elif (
+                    a not in left_home and _belongs(a, right_accepted, right_home)
+                    and b not in right_home and _belongs(b, left_accepted, left_home)
+                    and not _kind_fits(left_raw[index], left_kinds)
+                    and not _kind_fits(right_raw[index], right_kinds)
+                ):
                     crossed.append(index)
             if len(crossed) < 5 or home_rows < 10 or home_rows < len(crossed) * 2:
                 continue
