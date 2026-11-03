@@ -20,6 +20,7 @@ except Exception:
 from datetime import datetime, timezone
 from .formats import EXTRA_DATE_FORMATS as _EXTRA_DATE_FORMATS
 from .standardize import convert_dates as _convert_dates, convert_values as _convert_values
+from .niche import convert_special as _convert_special
 try:
     from dateutil import parser as _dateutil_parser  # type: ignore
 except Exception:
@@ -2448,9 +2449,9 @@ def _cast_column(df, col, to_type: str, fmt: str = None, errors: str = "coerce")
     if col not in (df.columns if _is_polars_df(df) else list(df.columns)):
         return df, None
 
-    if fmt and fmt.startswith(("num:", "unit:")) and _is_polars_df(df):
+    if fmt and fmt.startswith(("num:", "unit:", "conv:")) and _is_polars_df(df):
         before = df[col].to_list()
-        out = _convert_values(before, fmt, to_type)
+        out = _convert_special(before, fmt, to_type) if fmt.startswith("conv:") else _convert_values(before, fmt, to_type)
         dtype = {"int": pl.Int64, "integer": pl.Int64, "str": pl.Utf8, "string": pl.Utf8}.get(to_type, pl.Float64)
         lost = sum(1 for b, a in zip(before, out) if b not in (None, "") and a is None)
         return df.with_columns(pl.Series(col, out, dtype=dtype)), {

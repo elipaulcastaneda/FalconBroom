@@ -90,9 +90,9 @@ ROUND_TRIP_ACTIONS = {
 }
 SCAN_SUPPORTED_ACTIONS = {
     "normalize", "impute", "cast", "regex_replace", "map", "numeric_transform",
-    "deduplicate", "drop_column", "drop_rows", "unicode_normalize", "move_by_type", "remove_by_type", "swap_by_types",
+    "deduplicate", "drop_column", "drop_rows", "unicode_normalize", "move_by_type", "remove_by_type", "swap_by_types", "rename",
 }
-PARSER_ONLY_ACTIONS = {"bucketize", "conditional", "join", "rename", "replace"}
+PARSER_ONLY_ACTIONS = {"bucketize", "conditional", "join", "replace"}
 
 
 def _norm(step):
@@ -223,7 +223,7 @@ def test_every_executable_suggestion_is_readable_by_the_parser(tmp_path):
 
 
 def test_uploaded_data_emits_each_evidence_supported_action_only(tmp_path):
-    rows = ["number,rate,is_active,state,notes,created_at,flag,mixed,label,amount,unicode_label"]
+    rows = ["number,rate,is_active,state,notes,created_at,flag,mixed,label,amount,unicode_label,weight"]
     for i in range(60):
         if i < 30 or i >= 42:
             label, amount = f"item-{i}", str(i * 10)
@@ -232,7 +232,7 @@ def test_uploaded_data_emits_each_evidence_supported_action_only(tmp_path):
         rows.append(",".join([
             str(i), f"{10 + i % 5}%", ["Yes", "no", "1", "0"][i % 4], ["oh", "PA"][i % 2],
             ["N/A", "ok"][i % 2], f"2025-01-{i % 28 + 1:02d}", "constant",
-            f"label-{i}" if i < 55 else str(i), label, amount, "ＡＢＣ" if i % 2 else "Ｆｏｏ",
+            f"label-{i}" if i < 55 else str(i), label, amount, "ＡＢＣ" if i % 2 else "Ｆｏｏ", f"{i + 3} kg",
         ]))
     source = tmp_path / "action_inventory.csv"
     source.write_text("\n".join(rows), encoding="utf-8")

@@ -27,6 +27,7 @@ from .semantics import (
     _MISSING as _SEMANTIC_MISSING,
 )
 from .formats import EXTRA_DATE_FORMATS, numeric_format_entry as _numeric_format_entry
+from .niche import exclusive_entries as _niche_exclusive, extra_entries as _niche_extra, cross_column_entries as _niche_cross, fuzzy_row_entries as _niche_fuzzy_rows
 from .standardize import mixed_date_entries as _mixed_date_entries, mixed_phone_entries as _mixed_phone_entries, boolean_choice_entries as _boolean_choice_entries, mixed_datetime_entries as _mixed_datetime_entries, mixed_number_entries as _mixed_number_entries, mixed_decimal_entries as _mixed_decimal_entries, mixed_unit_entries as _mixed_unit_entries, intl_phone_entries as _intl_phone_entries, mixed_zip_entries as _mixed_zip_entries, mixed_region_entries as _mixed_region_entries
 from .step_catalog import parse_machine_template, steps_to_template, steps_to_text
 import threading
@@ -1075,6 +1076,17 @@ def _numeric_entries(col: str, vals: list[str], kinds: list[tuple[str, str, str]
 
 
 def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
+    result = _analyze_column_core(col, values)
+    if result is None:
+        return None
+    if not result.pop('extras_done', False) and result.get('kind') in ('date', 'date_review', 'numeric', 'locale_number_review', 'mixed'):
+        texts = [str(v) for v in values if v is not None and str(v).strip() != '' and str(v).strip().lower() not in _MISSING_MARKERS]
+        if texts:
+            result['entries'].extend(_niche_extra(col, [t.strip() for t in texts], texts, result['kind'], _entry))
+    return result
+
+
+def _analyze_column_core(col: str, values: list) -> dict[str, Any] | None:
     vals: list[str] = []
     raw_values: list[str] = []
     markers: list[str] = []
@@ -1115,6 +1127,9 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
         ]
 
     pending_drops: list[dict[str, Any]] = []
+    niche = _niche_exclusive(col, vals, _entry, _is_identifier_name(col))
+    if niche:
+        return {'kind': niche[0], 'entries': niche[1] + drop_entries([])}
     european_numbers = [s for s in vals if _LOCALE_NUMBER_RE.fullmatch(re.sub(r"[€£$¥₹\s]", "", s))]
     if european_numbers:
         mixed_numbers = _mixed_number_entries(col, vals, _entry)
@@ -1383,7 +1398,9 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
                         None,
                         0.55,
                     ))
+    result['entries'].extend(_niche_extra(col, vals, raw_values, result.get('kind', ''), _entry))
     result['entries'].extend(pending_drops)
+    result['extras_done'] = True
     return result
 
 
@@ -1479,6 +1496,14 @@ def _analyze_columns(path: str | None, df=None) -> dict[str, dict[str, Any]]:
             continue
     if pair_notes:
         out.setdefault('__dataset__', {'kind': 'integrity', 'entries': []})['entries'].extend(pair_notes)
+    try:
+        sample_rows = df.head(5000).to_dicts() if _is_polars_df(df) else df.head(5000).to_dict('records')
+        visible = [c for c in df.columns if isinstance(c, str) and c not in _META_COLS and not c.startswith('_')]
+        niche_notes = _niche_cross(sample_rows, visible, _entry) + _niche_fuzzy_rows(sample_rows, visible, _entry)
+        if niche_notes:
+            out.setdefault('__dataset__', {'kind': 'integrity', 'entries': []})['entries'].extend(niche_notes)
+    except Exception:
+        pass
     return out
 
 
