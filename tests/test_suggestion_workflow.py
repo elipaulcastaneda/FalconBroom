@@ -1066,7 +1066,7 @@ def test_swap_gate_accepts_a_clean_consistent_swap_and_rejects_scattered_noise()
 
 
 def test_swap_gate_needs_more_evidence_for_unrecognised_columns():
-    left = [f"item-{i}" for i in range(120)]
-    right = [f"code{i}x" for i in range(120)]
+    left = [f"lorem ipsum {i}" for i in range(120)]
+    right = [f"dolor sit {i}" for i in range(120)]
     assert not _gate("alpha", "beta", left, right, list(range(6)), home=400)
     assert not _gate("alpha", "beta", left, right, list(range(12)), home=30)
