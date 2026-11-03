@@ -143,61 +143,6 @@ function loadWorkflowCheckpoints(userId) {
   }
 }
 
-const PREVIEW_CHECKPOINT_MAX_SELECTED = 500
-const EMPTY_ROWS = []
-
-// Memoized so hover/selection state changes elsewhere in App don't rebuild thousands of cells.
-const PreviewTable = React.memo(function PreviewTable({ side, before, after, columns, limit, selectedCells, typeChanges, onToggle, onTip }) {
-  const rows = side === 'before' ? before : after
-  const count = limit ? Math.min(limit, rows.length) : rows.length
-  const changed = useMemo(() => {
-    const out = new Array(count)
-    for (let i = 0; i < count; i++) {
-      const b = before[i] || {}
-      const a = after[i] || {}
-      const flags = new Array(columns.length)
-      for (let j = 0; j < columns.length; j++) {
-        flags[j] = String(b[columns[j]] ?? '') !== String(a[columns[j]] ?? '')
-      }
-      out[i] = flags
-    }
-    return out
-  }, [before, after, columns, count])
-  const body = []
-  for (let i = 0; i < count; i++) {
-    const row = rows[i] || {}
-    const cells = []
-    for (let j = 0; j < columns.length; j++) {
-      const col = columns[j]
-      const isChanged = changed[i][j]
-      const isTypeChanged = !!(typeChanges && typeChanges[col])
-      const isSelected = isChanged && !!selectedCells[`${i}|${col}`]
-      const style = isTypeChanged ? { background: '#ecfdf5', border: '1px solid #10b981' } : (isChanged ? { background: 'linear-gradient(90deg, rgba(245,158,11,0.12), rgba(245,158,11,0.06))' } : undefined)
-      cells.push(
-        <td key={col} className={isChanged ? (isSelected ? 'cell-changed cell-selected' : 'cell-changed') : ''}
-          style={style}
-          data-r={i} data-c={col}
-          onClick={isChanged ? () => onToggle(i, col) : undefined}
-          onMouseEnter={isChanged ? (e) => onTip({ x: e.clientX, y: e.clientY, before: String((before[i] || {})[col] ?? ''), after: String((after[i] || {})[col] ?? ''), typeChanged: isTypeChanged }) : undefined}
-          onMouseLeave={isChanged ? () => onTip(null) : undefined}
-        >{String(row[col] ?? '')}</td>
-      )
-    }
-    body.push(<tr key={i}><td>{i + 1}</td>{cells}</tr>)
-  }
-  return (
-    <table className="source-table">
-      <thead>
-        <tr>
-          <th>#</th>
-          {columns.map((col) => (<th key={col}>{col}</th>))}
-        </tr>
-      </thead>
-      <tbody>{body}</tbody>
-    </table>
-  )
-})
-
 export default function App() {
   const uploadInputRef = useRef(null)
   const recipeNameRef = useRef(null)
@@ -455,20 +400,13 @@ export default function App() {
   const [showColumnPicker, setShowColumnPicker] = useState(false)
   const [selectedCells, setSelectedCells] = useState({})
   const [tooltip, setTooltip] = useState(null)
-  const previewColumns = useMemo(() => {
-    const seen = new Set()
+  const previewColumns = (() => {
+    const seen = []
     const rows = [...((displayPreview && displayPreview.before) || []), ...((displayPreview && displayPreview.after) || [])]
-    rows.forEach((r) => Object.keys(r || {}).forEach((c) => seen.add(c)))
-    return Array.from(seen)
-  }, [displayPreview])
-  const visibleColumns = useMemo(
-    () => (selectedColumns ? previewColumns.filter((c) => selectedColumns.includes(c)) : previewColumns),
-    [previewColumns, selectedColumns]
-  )
-  const [showRawPreview, setShowRawPreview] = useState(false)
-  const tableHandlers = useRef({})
-  const onTableToggle = React.useCallback((r, c) => tableHandlers.current.toggle && tableHandlers.current.toggle(r, c), [])
-  const onTableTip = React.useCallback((t) => setTooltip(t), [])
+    rows.forEach((r) => Object.keys(r || {}).forEach((c) => { if (!seen.includes(c)) seen.push(c) }))
+    return seen
+  })()
+  const visibleColumns = selectedColumns ? previewColumns.filter((c) => selectedColumns.includes(c)) : previewColumns
   const [showFullPreview, setShowFullPreview] = useState(false)
   const [showRecipeJson, setShowRecipeJson] = useState(false)
   const [showConfirmModal, setShowConfirmModal] = useState(false)
@@ -510,8 +448,13 @@ export default function App() {
     }
   }, [recipeText])
 
+  // Large selections are transient (they point at preview rows that aren't restored on resume),
+  // and serializing them into localStorage on every save freezes the UI.
+  const MAX_PERSISTED_SELECTED_CELLS = 200
+
   function captureWorkflowState(kind) {
     if (kind === "source") {
+      const persistedSelection = Object.keys(selectedCells || {}).length > MAX_PERSISTED_SELECTED_CELLS ? {} : selectedCells
       return {
         path,
         instruction,
@@ -524,8 +467,7 @@ export default function App() {
         regressionFeatures,
         regressionGroupBy,
         treatAsMissing,
-        // Large selections are not persisted; serializing thousands of keys on each save freezes the UI.
-        selectedCells: Object.keys(selectedCells || {}).length <= PREVIEW_CHECKPOINT_MAX_SELECTED ? selectedCells : {},
+        selectedCells: persistedSelection,
         selectedColumns,
         previewRows,
       }
@@ -1775,7 +1717,7 @@ export default function App() {
   }, [
     activeTab, path, instruction, recipeText, recipeFromText, recipeId, recipeStatus, selectedSuggestionSteps,
     regressionModel, regressionFeatures, regressionGroupBy, treatAsMissing,
-    selectedColumns, previewRows, leftPath, rightPath, joinLeftOn,
+    selectedCells, selectedColumns, previewRows, leftPath, rightPath, joinLeftOn,
     joinRightOn, joinType, joinSampleSize, suffixLeft, suffixRight, preferResolve,
     mappingText, joinLeftOnArr, joinRightOnArr, compositePairs, exportFormat, exportFilename, joinTargetUser,
   ])
@@ -2013,19 +1955,23 @@ export default function App() {
       else next[k] = true
       return next
     })
+    recordWorkflowAction("source", "Changed-cell selection updated")
   }
-  tableHandlers.current.toggle = toggleCellSelection
 
   function selectAllChangedCells() {
-    const selected = ((displayPreview && displayPreview.before || []).slice(0, rowsToShow || undefined).reduce((acc, _, rowIndex) => {
-      visibleColumns.forEach((col) => {
-        const isChanged = String(((displayPreview && displayPreview.before[rowIndex]) || {})[col] ?? '') !== String(((displayPreview && displayPreview.after[rowIndex]) || {})[col] ?? '')
-        if (isChanged) acc[`${rowIndex}|${col}`] = true
-      })
-      return acc
-    }, {}))
+    const beforeRows = (displayPreview && displayPreview.before) || []
+    const afterRows = (displayPreview && displayPreview.after) || []
+    const selected = {}
+    const limit = rowsToShow ? Math.min(rowsToShow, beforeRows.length) : beforeRows.length
+    for (let rowIndex = 0; rowIndex < limit; rowIndex++) {
+      const b = beforeRows[rowIndex] || {}
+      const a = afterRows[rowIndex] || {}
+      for (const col of visibleColumns) {
+        if (String(b[col] ?? '') !== String(a[col] ?? '')) selected[`${rowIndex}|${col}`] = true
+      }
+    }
     setSelectedCells(selected)
-    addToast(`Selected ${Object.keys(selected).length} changed cells`, 'info')
+    recordWorkflowAction("source", `Selected ${Object.keys(selected).length} changed cells`)
   }
 
   async function applySelectedChanges() {
@@ -5061,15 +5007,13 @@ export default function App() {
                     </div>
                   )}
                   <div style={{marginTop:8}}>
-                    <button onClick={() => setShowRawPreview((s) => !s)}>Toggle raw preview JSON</button>
-                    {showRawPreview && (
-                      <div id="fb-raw-previews" style={{marginTop:8}}>
-                        <div style={{marginTop:6}}><strong>generatedPreview</strong></div>
-                        <pre style={{maxHeight:200, overflow:'auto'}}>{JSON.stringify(generatedPreview, null, 2)}</pre>
-                        <div style={{marginTop:6}}><strong>preview</strong></div>
-                        <pre style={{maxHeight:200, overflow:'auto'}}>{JSON.stringify(preview, null, 2)}</pre>
-                      </div>
-                    )}
+                    <button onClick={() => { const el = document.getElementById('fb-raw-previews'); if(el) el.style.display = el.style.display === 'none' ? 'block' : 'none' }}>Toggle raw preview JSON</button>
+                    <div id="fb-raw-previews" style={{display:'none', marginTop:8}}>
+                      <div style={{marginTop:6}}><strong>generatedPreview</strong></div>
+                      <pre style={{maxHeight:200, overflow:'auto'}}>{JSON.stringify(generatedPreview, null, 2)}</pre>
+                      <div style={{marginTop:6}}><strong>preview</strong></div>
+                      <pre style={{maxHeight:200, overflow:'auto'}}>{JSON.stringify(preview, null, 2)}</pre>
+                    </div>
                   </div>
                   <div style={{display:'flex',gap:12,alignItems:'center',marginBottom:8}}>
                     <div style={{display:'flex',gap:8,alignItems:'center'}}>
@@ -5129,13 +5073,81 @@ export default function App() {
                     <div>
                       <h5>Before</h5>
                       <div className="table-wrap" style={{maxHeight:320, overflow:'auto'}}>
-                        <PreviewTable side="before" before={(displayPreview && displayPreview.before) || EMPTY_ROWS} after={(displayPreview && displayPreview.after) || EMPTY_ROWS} columns={visibleColumns} limit={rowsToShow} selectedCells={selectedCells} typeChanges={displayPreview && displayPreview.type_changes} onToggle={onTableToggle} onTip={onTableTip} />
+                        <table className="source-table">
+                          <thead>
+                            <tr>
+                              <th>#</th>
+                              {visibleColumns.map((col) => (
+                                <th key={col}>{col}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(displayPreview && displayPreview.before || []).slice(0, rowsToShow || undefined).map((row, i) => (
+                              <tr key={i}>
+                                <td>{i+1}</td>
+                                {visibleColumns.map((col) => {
+                                  const beforeVal = String(((displayPreview && displayPreview.before[i])||{})[col] ?? '')
+                                  const afterVal = String(((displayPreview && displayPreview.after[i])||{})[col] ?? '')
+                                  const isChanged = beforeVal !== afterVal
+                                  const isSelected = !!selectedCells[_cellKey(i,col)]
+                                  const typeChanges = (displayPreview && displayPreview.type_changes) || {}
+                                  const isTypeChanged = !!(typeChanges && typeChanges[col])
+                                  const style = isTypeChanged ? { background: '#ecfdf5', border: '1px solid #10b981' } : (isChanged ? { background: 'linear-gradient(90deg, rgba(245,158,11,0.12), rgba(245,158,11,0.06))' } : {})
+                                  const cls = isChanged ? (isSelected ? 'cell-changed cell-selected' : 'cell-changed') : ''
+                                  return (
+                                    <td key={col} className={cls}
+                                      style={style}
+                                      onClick={() => { if(isChanged) toggleCellSelection(i,col) }}
+                                      onMouseEnter={(e)=>{ if(isChanged) setTooltip({x:e.clientX,y:e.clientY, before:beforeVal, after:afterVal, typeChanged:isTypeChanged}) }}
+                                      onMouseLeave={()=>setTooltip(null)}
+                                    >{String(row[col] ?? '')}</td>
+                                  )
+                                })}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
                       </div>
                     </div>
                     <div>
                       <h5>After</h5>
                       <div className="table-wrap" style={{maxHeight:320, overflow:'auto'}}>
-                        <PreviewTable side="after" before={(displayPreview && displayPreview.before) || EMPTY_ROWS} after={(displayPreview && displayPreview.after) || EMPTY_ROWS} columns={visibleColumns} limit={rowsToShow} selectedCells={selectedCells} typeChanges={displayPreview && displayPreview.type_changes} onToggle={onTableToggle} onTip={onTableTip} />
+                        <table className="source-table">
+                          <thead>
+                            <tr>
+                              <th>#</th>
+                              {visibleColumns.map((col) => (
+                                <th key={col}>{col}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {(displayPreview && displayPreview.after || []).slice(0, rowsToShow || undefined).map((row, i) => (
+                              <tr key={i}>
+                                <td>{i+1}</td>
+                                {visibleColumns.map((col) => {
+                                  const beforeVal = String(((displayPreview && displayPreview.before[i])||{})[col] ?? '')
+                                  const afterVal = String(((displayPreview && displayPreview.after[i])||{})[col] ?? '')
+                                  const isChanged = beforeVal !== afterVal
+                                  const isSelected = !!selectedCells[_cellKey(i,col)]
+                                  const typeChanges = (displayPreview && displayPreview.type_changes) || {}
+                                  const isTypeChanged = !!(typeChanges && typeChanges[col])
+                                  const style = isTypeChanged ? { background: '#ecfdf5', border: '1px solid #10b981' } : (isChanged ? { background: 'linear-gradient(90deg, rgba(245,158,11,0.12), rgba(245,158,11,0.06))' } : {})
+                                  const cls = isChanged ? (isSelected ? 'cell-changed cell-selected' : 'cell-changed') : ''
+                                  return (
+                                    <td key={col} className={cls}
+                                      style={style}
+                                      onClick={() => { if(isChanged) toggleCellSelection(i,col) }}
+                                      onMouseEnter={(e)=>{ if(isChanged) setTooltip({x:e.clientX,y:e.clientY, before:beforeVal, after:afterVal, typeChanged:isTypeChanged}) }}
+                                      onMouseLeave={()=>setTooltip(null)}
+                                    >{String(row[col] ?? '')}</td>
+                                  )
+                                })}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
                       </div>
                     </div>
                   </div>
