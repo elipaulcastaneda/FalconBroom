@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 import io
@@ -21,7 +21,12 @@ except Exception:  # pragma: no cover - optional dependency
 
 from .engine import Cleaner, _read_table, _is_polars_df, _fuzzy_dedupe, _spell_correct_column
 from .workflow_rules import suggest_columns_to_clean
-from .semantics import column_kinds as _column_kinds, fits as _kind_fits, same_meaning as _same_meaning, swap_is_safe as _swap_is_safe
+from .semantics import (
+    column_kinds as _column_kinds, fits as _kind_fits, same_meaning as _same_meaning, swap_is_safe as _swap_is_safe,
+    header_kinds as _header_kinds, _header_words, is_email as _is_email, is_formatted_phone as _is_formatted_phone,
+    _MISSING as _SEMANTIC_MISSING,
+)
+from .formats import EXTRA_DATE_FORMATS, numeric_format_entry as _numeric_format_entry
 from .step_catalog import parse_machine_template, steps_to_template, steps_to_text
 import threading
 import traceback
@@ -665,11 +670,32 @@ def compute_extended_diags(norm_path: str, meta_path: str) -> None:
 
 
 _ID_NAME_RE = re.compile(r"zip_?code|post(al)?_?code|(^|_)(zip|postal|phone|tel|ssn|sku|upc|isbn|account|acct|ein|npi)(_|$)|(^|_)id$", re.I)
+_ID_KINDS = frozenset({'id', 'barcode', 'card', 'routing', 'ssn', 'financial_id', 'icd', 'uuid', 'hex'})
+_VALUE_KINDS = frozenset({'money', 'percent', 'date', 'quantity', 'temperature'})
+_BARE_CODE_WORDS = frozenset("code codes number numbers num no nbr".split())
+
+
+def _is_identifier_name(col: str) -> bool:
+    """Columns whose digits are labels, not amounts (leading zeros matter, nothing should be summed or cast)."""
+    if _ID_NAME_RE.search(col):
+        return True
+    if all(word in _BARE_CODE_WORDS for word in _header_words(col)):
+        return False
+    kinds = _header_kinds(col)
+    return bool(kinds and kinds & _ID_KINDS and not kinds & _VALUE_KINDS)
+
+
 _UNIQUE_KEY_NAME_RE = re.compile(r"email|(^|_)(id|key|sku|upc|isbn|account|acct|ssn|order|customer)(_|$)", re.I)
 _NUM_RE = re.compile(r"^[-+]?(?:\d+\.?\d*|\.\d+)$")
 _AFFIX_RE = re.compile(r"^(?P<pre>[^\d\-+.]*?)\s*(?P<num>[-+]?\d[\d,]*(?:\.\d+)?)\s*(?P<suf>[^\d]*)$")
-_KNOWN_SUFFIXES = {'yr', 'yrs', 'year', 'years', 'kg', 'g', 'mg', 'lb', 'lbs', 'oz', 'km', 'm', 'cm', 'mm', 'mi', 'ft', 'in', '°c', '°f', 'c', 'f', '%'}
-_MISSING_MARKERS = {'n/a', 'na', 'null', 'none', 'unknown', 'unk', 'tbd', 'not available', 'not provided', '--'}
+_KNOWN_SUFFIXES = {
+    'yr', 'yrs', 'year', 'years', 'kg', 'g', 'mg', 'lb', 'lbs', 'oz', 'km', 'm', 'cm', 'mm', 'mi', 'ft', 'in', '°c', '°f',
+    'c', 'f', '%', 'sqft', 'sq ft', 'sq.ft', 'sf', 'ft2', 'sqm', 'm2', 'sq m', 'acre', 'acres', 'ac', 'ha', 'gal', 'l',
+    'ml', 'mph', 'kph', 'km/h', 'kmh', 'mmhg', 'bpm', 'hz', 'kwh', 'kw', 'w', 'v', 'psi', 'ppm', 'mol', 'mg/dl', 'day',
+    'days', 'hr', 'hrs', 'hour', 'hours', 'min', 'mins', 'sec', 'secs', 'month', 'months', 'mo', 'wk', 'wks', 'week',
+    'weeks', 'pcs', 'units', 'items', 'bd', 'ba', 'beds', 'baths',
+}
+_MISSING_MARKERS = {'n/a', 'na', 'null', 'none', 'unknown', 'unk', 'tbd', 'not available', 'not provided', '--'} | set(_SEMANTIC_MISSING)
 _DATE_LIKE_RE = re.compile(r"^(?:\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|\d{1,2}[- ][A-Za-z]{3,9}[- ,]\d{2,4})", re.I)
 _DATE_FORMATS = (
     ("%Y-%m-%d", re.compile(r"^\d{4}-\d{2}-\d{2}$")),
@@ -684,7 +710,8 @@ _DATE_FORMATS = (
     ("%Y-%m-%dT%H:%M:%S%z", re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:?\d{2})$", re.I)),
     ("%b %d, %Y", re.compile(r"^[A-Za-z]{3} \d{1,2}, \d{4}$", re.I)),
     ("%B %d, %Y", re.compile(r"^[A-Za-z]{3,9} \d{1,2}, \d{4}$", re.I)),
-)
+) + tuple((fmt, pattern) for fmt, pattern, _ in EXTRA_DATE_FORMATS)
+_DATE_FORMAT_NOTES = {fmt: note for fmt, _, note in EXTRA_DATE_FORMATS if note}
 _LOCALE_NUMBER_RE = re.compile(r"^[+-]?(?:\d{1,3}(?:\.\d{3})+|\d+),\d+$")
 _META_COLS = {'container_name', 'sheet_name', 'slide_number', 'paragraph_index', 'table_index', 'column_index', 'cell_label', 'source_kind', 'source_name', 'source_path', 'unit_kind', 'row_index'}
 _GEOGRAPHIC_FIELD_RE = re.compile(r"(?:^|_)(?:state|province|country)(?:_|$)", re.I)
@@ -1066,7 +1093,7 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
         raw_values.append(raw)
         vals.append(s)
     n = len(vals)
-    if n < 10:
+    if n < 1:
         return {'kind': 'text', 'entries': []}
     total_rows = n + missing_count
     blank_count = missing_count - len(markers)
@@ -1088,11 +1115,20 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
     pending_drops: list[dict[str, Any]] = []
     european_numbers = [s for s in vals if _LOCALE_NUMBER_RE.fullmatch(re.sub(r"[€£$¥₹\s]", "", s))]
     if european_numbers:
-        return {'kind': 'locale_number_review', 'entries': [_entry(
+        entries = [_entry(
             f"'{col}' contains comma-decimal values such as {', '.join(_uniq(european_numbers))}. Review the number locale before converting; automatic comma removal could change their magnitude",
-            None, 0.45)]}
+            None, 0.45)]
+        converted = _numeric_format_entry(
+            col, vals,
+            lambda s: not _LOCALE_NUMBER_RE.fullmatch(re.sub(r"[€£$¥₹\s]", "", s)) and _classify_cell(s)[0] in ('numeric', 'formatted'))
+        if converted:
+            entries.append(_entry(converted['text'], None, 0.5, converted['steps']))
+        return {'kind': 'locale_number_review', 'entries': entries}
+    header_kinds_here = _header_kinds(col) or frozenset()
     date_format_counts = []
     for date_fmt, pattern in _DATE_FORMATS:
+        if date_fmt == '%Y%m%d' and 'date' not in header_kinds_here:
+            continue
         valid_count = 0
         for value in vals:
             if not pattern.fullmatch(value):
@@ -1103,13 +1139,15 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
             except ValueError:
                 continue
         date_format_counts.append((date_fmt, valid_count))
-    if not _ID_NAME_RE.search(col) and date_format_counts:
+    if not _is_identifier_name(col) and date_format_counts:
         ranked_date_formats = sorted(date_format_counts, key=lambda item: item[1], reverse=True)
         fmt, matched = ranked_date_formats[0]
         runner_up = ranked_date_formats[1][1] if len(ranked_date_formats) > 1 else 0
         if matched / n >= 0.9 and matched > runner_up:
             invalid_count = n - matched
             text = f"Parse consistently formatted dates in '{col}' using {fmt}"
+            if _DATE_FORMAT_NOTES.get(fmt):
+                text += f" ({_DATE_FORMAT_NOTES[fmt]})"
             if invalid_count:
                 text += f"; {invalid_count} other value(s) will become empty"
             return {'kind': 'date', 'entries': [_entry(
@@ -1124,7 +1162,7 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
     date_matches = sum(1 for s in vals if _DATE_LIKE_RE.match(s))
     if date_matches / n >= 0.75:
         iso = sum(1 for s in vals if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s))
-        if iso / n >= 0.9 and not _ID_NAME_RE.search(col):
+        if iso / n >= 0.9 and not _is_identifier_name(col):
             bad_dates = [s for s in vals if not _parses_with(s, '%Y-%m-%d')]
             return {'kind': 'date', 'entries': [_entry(
                 f"Parse ISO dates in '{col}' as dates; invalid values will become empty",
@@ -1139,12 +1177,15 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
         cnt[k] += 1
     digits5 = sum(1 for s in vals if re.fullmatch(r"\d{5}", s))
     zip_like = bool(re.search(r"zip|postal|post_?code", col, re.I)) or (cnt['zip4'] > 0 and (cnt['zip4'] + digits5) / n >= 0.5)
+    email_like = bool(re.search(r'email|e_mail', col, re.I)) or sum(_is_email(s) for s in vals) / n >= 0.6
+    phone_like = bool(re.search(r'phone|mobile|telephone|\btel\b', col, re.I)) or sum(_is_formatted_phone(s) for s in vals) / n >= 0.6
+    leading_zero_ids = n >= 3 and sum(1 for s in vals if re.fullmatch(r"0\d{2,}", s)) / n >= 0.3
     if zip_like:
         result = {'kind': 'identifier', 'entries': _zip_entries(col, vals)}
         words = [s for s in vals if not re.search(r"\d", s)]
         if words:
             pending_drops.extend(drop_entries([("is text with no digits", {'issue': 'matches', 'pattern': r"\D+"}, len(words), words)]))
-    elif re.search(r'email|e_mail', col, re.I):
+    elif email_like:
         spaced = [s for s in raw_values if s != s.strip()]
         invalid = [s.strip() for s in vals if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", s.strip())]
         ents = []
@@ -1155,7 +1196,7 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
             ents.append(_entry(f"Review {len(invalid)} email-shaped values in '{col}' that do not match a basic email format; examples: {', '.join(_uniq(invalid))}", None, 0.5))
             pending_drops.extend(drop_entries([("is not a valid email address", {'issue': 'not_matches', 'pattern': r"[^\s@]+@[^\s@]+\.[^\s@]+"}, len(invalid), invalid)]))
         result = {'kind': 'identifier', 'entries': ents}
-    elif re.search(r'phone|mobile|telephone|\btel\b', col, re.I):
+    elif phone_like:
         compact = [re.sub(r'[^\d+]', '', s) for s in vals]
         malformed = [s for s, v in zip(vals, compact) if not re.fullmatch(r"\+?\d{7,15}", v)]
         punctuation = any(re.search(r'[\s().-]', s) for s in vals)
@@ -1165,11 +1206,15 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
         else:
             ents = [_entry(f"Review {len(malformed)} phone values in '{col}' with extensions or unusual formats before normalizing; examples: {', '.join(_uniq(malformed))}", None, 0.5)] if malformed else []
         result = {'kind': 'identifier', 'entries': ents}
-    elif _ID_NAME_RE.search(col):
+    elif _is_identifier_name(col) or leading_zero_ids:
         entries = []
         result = {'kind': 'identifier', 'entries': entries}
     else:
-        result = _numeric_entries(col, vals, kinds, cnt)
+        formatted = _numeric_format_entry(col, vals, lambda s: _classify_cell(s)[0] in ('numeric', 'formatted'))
+        if formatted:
+            result = {'kind': 'numeric', 'entries': [_entry(formatted['text'], None, formatted['confidence'], formatted['steps'])]}
+        else:
+            result = _numeric_entries(col, vals, kinds, cnt)
         bad_numbers = [s for s, (k, _, _) in zip(vals, kinds) if k in ('text', 'zip4')]
         if result.get('kind') == 'numeric' and not cnt['affix'] and bad_numbers:
             pending_drops.extend(drop_entries([("is not a number", {'issue': 'not_numeric'}, len(bad_numbers), bad_numbers)]))
@@ -1213,10 +1258,9 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
         if cast_step:
             target = cast_step['params'].get('to', 'float')
             text = f"Treat {', '.join(_uniq(markers, 12))} in '{col}' as missing, then cast to {target}; review any other values that cannot be parsed"
-            steps = [
-                {'action': 'regex_replace', 'column': col, 'params': {'pattern': marker_pattern, 'replace': ''}},
-                {'action': 'cast', 'column': col, 'params': {'to': target}},
-            ]
+            steps = [{'action': 'regex_replace', 'column': col, 'params': {'pattern': marker_pattern, 'replace': ''}}]
+            steps += [s for s in (first.get('json_steps') or []) if s.get('action') == 'regex_replace']
+            steps.append({'action': 'cast', 'column': col, 'params': {'to': target}})
             result['entries'].insert(0, _entry(text, None, 0.8, steps))
     elif markers and result.get('kind') == 'numeric':
         marker_pattern = r'(?i)^(?:' + '|'.join(re.escape(x) for x in _uniq(markers, 12)) + r')$'
@@ -1247,7 +1291,7 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
     # Suggest normalization only for low-cardinality labels with case/space variants.
     preferred_case = _preferred_abbreviation_case(col, vals)
     proper_name_field = bool(_GEOGRAPHIC_FIELD_RE.search(col) or _ORGANIZATION_FIELD_RE.search(col)) and preferred_case is None
-    if result.get('kind') not in ('identifier', 'date', 'date_review') and n >= 10:
+    if result.get('kind') not in ('identifier', 'date', 'date_review') and n >= 2:
         groups: dict[str, set[str]] = {}
         for s in raw_values:
             groups.setdefault(s.strip().casefold(), set()).add(s)
@@ -1276,8 +1320,13 @@ def _analyze_column(col: str, values: list) -> dict[str, Any] | None:
             'no': 'false', 'n': 'false', 'false': 'false', 'f': 'false', '0': 'false',
             'disabled': 'false', 'inactive': 'false', 'off': 'false', 'declined': 'false', 'absent': 'false',
         }
-        boolean_field = bool(re.search(r'active|enabled|verified|consent|is_|^has_|^on_', col, re.I))
-        if boolean_field and lowered and lowered <= set(bool_labels):
+        boolean_field = bool(re.search(r'active|enabled|verified|consent|is_|^has_|^on_|passed|failed|approved|paid|subscribed|accepted|confirmed|opted|flag|bool', col, re.I))
+        word_labels = {'yes', 'no', 'true', 'false', 'pass', 'fail', 'passed', 'failed', 'approved', 'rejected', 'paid', 'unpaid'}
+        true_words = {'yes', 'true', 'pass', 'passed', 'approved', 'paid'}
+        value_driven = bool(lowered) and lowered <= word_labels and bool(lowered & true_words) and bool(lowered - true_words)
+        bool_labels.update({'pass': 'true', 'passed': 'true', 'approved': 'true', 'paid': 'true', 'verified': 'true', 'confirmed': 'true',
+                            'fail': 'false', 'failed': 'false', 'rejected': 'false', 'unpaid': 'false', 'denied': 'false'})
+        if (boolean_field or value_driven) and lowered and lowered <= set(bool_labels):
             mapping = {
                 raw: bool_labels[raw.strip().lower()]
                 for raw in raw_values
@@ -1678,7 +1727,7 @@ def generate_plain_language_suggestions(metadata: dict[str, Any], df=None) -> li
                     string_count = counts.get('string', 0)
                     typed_count = numeric_count + string_count
                     if (
-                        _ID_NAME_RE.search(col)
+                        _is_identifier_name(col)
                         or counts.get('date', 0)
                         or typed_count < 20
                         or not numeric_count
@@ -1711,13 +1760,13 @@ def generate_plain_language_suggestions(metadata: dict[str, Any], df=None) -> li
                     left_stats = col_stats[left]
                     left_counts = left_stats.get('type_counts') or {}
                     left_total = left_counts.get('numeric', 0) + left_counts.get('string', 0)
-                    if _ID_NAME_RE.search(left) or left_counts.get('date') or left_total < 20:
+                    if _is_identifier_name(left) or left_counts.get('date') or left_total < 20:
                         continue
                     for right in columns[left_index + 1:]:
                         right_stats = col_stats[right]
                         right_counts = right_stats.get('type_counts') or {}
                         right_total = right_counts.get('numeric', 0) + right_counts.get('string', 0)
-                        if _ID_NAME_RE.search(right) or right_counts.get('date') or right_total < 20:
+                        if _is_identifier_name(right) or right_counts.get('date') or right_total < 20:
                             continue
                         orientations = (
                             ('string', 'numeric', 'numeric', 'string'),
@@ -1797,14 +1846,14 @@ def generate_plain_language_suggestions(metadata: dict[str, Any], df=None) -> li
                 for source, source_stats in col_stats.items():
                     source_counts = source_stats.get('type_counts') or {}
                     source_total = source_counts.get('numeric', 0) + source_counts.get('string', 0)
-                    if _ID_NAME_RE.search(source) or source_counts.get('date') or source_total < 20:
+                    if _is_identifier_name(source) or source_counts.get('date') or source_total < 20:
                         continue
                     for target_type in ('numeric', 'string'):
                         minority_count = source_counts.get(target_type, 0)
                         if minority_count < 5 or minority_count / source_total > 0.2:
                             continue
                         for target, target_stats in col_stats.items():
-                            if target == source or target in swap_columns or _ID_NAME_RE.search(target):
+                            if target == source or target in swap_columns or _is_identifier_name(target):
                                 continue
                             target_counts = target_stats.get('type_counts') or {}
                             target_total = target_counts.get('numeric', 0) + target_counts.get('string', 0)
@@ -1958,7 +2007,7 @@ def generate_plain_language_suggestions(metadata: dict[str, Any], df=None) -> li
                             if re.match(r'^\d{4}-\d{2}-\d{2}$', s):
                                 iso_like += 1
                             # common non-ISO date patterns: slashes, month names, dots, or month name words
-                            elif re.search(r'[\./]|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b', s, re.I) or re.search(r'\d{1,2}[\-/]\d{1,2}[\-/]\d{2,4}', s):
+                            elif re.search(r'\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b', s, re.I) or re.search(r'\d{1,4}[\-/.]\d{1,2}[\-/.]\d{2,4}', s):
                                 date_like += 1
                         if total >= 10 and date_like >= max(5, 0.2 * total) and iso_like < date_like:
                             text = f"Normalize the values of '{c}' to the ISO format YYYY-MM-DD. The day/month order is ambiguous in these values, so confirm it before converting"

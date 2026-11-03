@@ -18,6 +18,7 @@ except Exception:
     pl = None
 
 from datetime import datetime, timezone
+from .formats import EXTRA_DATE_FORMATS as _EXTRA_DATE_FORMATS
 try:
     from dateutil import parser as _dateutil_parser  # type: ignore
 except Exception:
@@ -2415,6 +2416,22 @@ def _clean_to_numeric(series, errors="coerce"):
     return _pd.to_numeric(s, errors=errors)
 
 
+_ISO_OUTPUT_FORMATS = frozenset(item[0] for item in _EXTRA_DATE_FORMATS)
+
+
+def _strict_dates_to_iso(values, fmt):
+    """Parse with an exact layout and write ISO text; values that do not fit become empty."""
+    with_time = any(token in fmt for token in ("%H", "%I"))
+    out = []
+    for value in values:
+        try:
+            parsed = datetime.strptime(str(value).strip(), fmt)
+            out.append(parsed.strftime("%Y-%m-%d %H:%M:%S" if with_time else "%Y-%m-%d"))
+        except (ValueError, TypeError):
+            out.append(None)
+    return out
+
+
 def _cast_column(df, col, to_type: str, fmt: str = None, errors: str = "coerce"):
     """Cast column `col` to `to_type`.
     to_type: 'int','float','str','datetime','bool','category'
@@ -2448,6 +2465,12 @@ def _cast_column(df, col, to_type: str, fmt: str = None, errors: str = "coerce")
                 elif to_type in ("str", "string"):
                     df_new = df.with_columns(pl.col(col).cast(pl.Utf8).alias(col))
                 elif to_type in ("datetime", "date", "ts"):
+                    if fmt and fmt in _ISO_OUTPUT_FORMATS:
+                        out = _strict_dates_to_iso(df[col].to_list(), fmt)
+                        before = sum(1 for v in df[col].to_list() if v not in (None, ""))
+                        after = sum(1 for v in out if v is not None)
+                        return df.with_columns(pl.Series(col, out, dtype=pl.Utf8)), {
+                            "step": "cast", "column": col, "to_type": to_type, "rows_changed": max(0, before - after)}
                     # Prefer pandas-style loose parsing for datetimes (handles many free-form inputs)
                     raise Exception("use_pandas_datetime")
                 elif to_type in ("bool", "boolean"):

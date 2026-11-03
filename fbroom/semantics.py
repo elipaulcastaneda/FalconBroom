@@ -215,6 +215,15 @@ _PRIORITY = (
 )
 
 
+def is_email(value: str) -> bool:
+    return bool(_EMAIL_RE.fullmatch(value.strip()))
+
+
+def is_formatted_phone(value: str) -> bool:
+    """A phone number written with separators; bare digit strings are too easily amounts or ids."""
+    return bool(_PHONE_STRICT_RE.fullmatch(value.strip()))
+
+
 def _shape(value: str) -> str:
     out: list[str] = []
     for ch in re.sub(r"[A-Za-z]", "a", value.strip()):
