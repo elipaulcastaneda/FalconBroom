@@ -28,6 +28,10 @@ PHONE_TARGETS = (
 _NANP = re.compile(r'1?([2-9]\d{2})(\d{3})(\d{4})')
 
 
+from functools import lru_cache as _memo
+
+
+@_memo(maxsize=65536)
 def _parses(value: str, fmt: str, pattern: re.Pattern) -> bool:
     if not pattern.fullmatch(value):
         return False
@@ -159,15 +163,23 @@ def _split_zone(text: str):
     return match.group('body'), -minutes if tz[0] == '-' else minutes, True
 
 
+_LAYOUT_CACHE: dict[str, tuple] = {}
+
+
 def _layouts_for(body: str) -> list[str]:
-    found = []
-    for layout in DATETIME_LAYOUTS:
-        try:
-            datetime.strptime(body, layout)
-            found.append(layout)
-        except ValueError:
-            continue
-    return found
+    hit = _LAYOUT_CACHE.get(body)
+    if hit is None:
+        found = []
+        for layout in DATETIME_LAYOUTS:
+            try:
+                datetime.strptime(body, layout)
+                found.append(layout)
+            except ValueError:
+                continue
+        if len(_LAYOUT_CACHE) >= 200_000:
+            _LAYOUT_CACHE.clear()
+        hit = _LAYOUT_CACHE[body] = tuple(found)
+    return list(hit)
 
 
 def convert_dates(values, spec: str):
@@ -265,6 +277,7 @@ _CODE_SYMBOL = {'USD': '$', 'EUR': '€', 'GBP': '£', 'JPY': '¥', 'INR': '₹'
 _PREFIXED = re.compile(r'^([A-Za-z]{1,2})\$')
 
 
+@_memo(maxsize=65536)
 def _split_number(text: str):
     """(currency marker or None, is negative, digits with separators) for one value, or None."""
     t = text.strip()

@@ -180,6 +180,10 @@ _DENOMINATORS = {2, 3, 4, 5, 6, 8, 10, 12, 16, 32, 64}
 _UF_CLASS = ''.join(_UF)
 
 
+from functools import lru_cache as _memo
+
+
+@_memo(maxsize=65536)
 def parse_fraction(text: str):
     s = text.strip().rstrip('"\u2033').strip()
     s = re.sub(r'\s*(?:inch(?:es)?|in\.?)$', '', s, flags=re.I)
@@ -203,6 +207,7 @@ def parse_fraction(text: str):
 _CRDR = re.compile(r'^(?:(?P<p>cr|dr)\.?\s*)?(?P<n>[-+(]?[\d.,\s]*\d\)?)\s*(?:(?P<s>cr|dr)\.?)?$', re.I)
 
 
+@_memo(maxsize=65536)
 def parse_crdr(text: str):
     s = re.sub(r'[$\u20ac\u00a3\u00a5\u20b9]', '', text.strip())
     m = _CRDR.match(s)
@@ -1074,6 +1079,7 @@ _CORP = {'inc', 'llc', 'ltd', 'corp', 'co', 'company', 'corporation', 'limited',
 _FUZZY_SKIP = re.compile(r'(^|_)(id|uuid|guid|code|sku|email|phone|zip|postal|url|date|time|hash|key|number|num|no)($|_)', re.I)
 
 
+@_memo(maxsize=65536)
 def _norm_label(s: str) -> str:
     s = unicodedata.normalize('NFKD', s).casefold().replace('&', ' and ')
     s = ''.join(c for c in s if not unicodedata.combining(c))

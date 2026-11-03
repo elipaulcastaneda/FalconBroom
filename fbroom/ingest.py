@@ -736,6 +736,10 @@ def _uniq(vals, k: int = 3) -> list:
     return seen
 
 
+from functools import lru_cache as _memo
+
+
+@_memo(maxsize=65536)
 def _value_shape(value: str) -> str:
     """Digits -> 9, upper -> A, lower -> a; runs of the same class collapse ('68113-3892' -> '9-9')."""
     out: list[str] = []
@@ -750,6 +754,7 @@ def _shape_regex(shape: str) -> str:
     return ''.join({'9': r'\d+', 'A': r'[A-Z]+', 'a': r'[A-Za-z]+'}.get(ch) or re.escape(ch) for ch in shape)
 
 
+@_memo(maxsize=65536)
 def _swap_shape(value: str) -> str:
     """Case-insensitive shape for swap detection: 'ORLANDO' and 'Orlando' are the same shape."""
     return _value_shape(re.sub(r'[A-Za-z]', 'a', value))
@@ -911,6 +916,7 @@ def _preferred_abbreviation_case(col: str, vals: list[str]) -> str | None:
     return None
 
 
+@_memo(maxsize=65536)
 def _classify_cell(s: str) -> tuple[str, str, str]:
     """Classify a cell as numeric, formatted numeric, known-unit numeric, ZIP+4, or text."""
     if re.fullmatch(r"\d{5}-\d{4}", s):

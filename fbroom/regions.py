@@ -32,6 +32,10 @@ _COUNTRIES = (
 _DOTS = re.compile(r"[.,]")
 
 
+from functools import lru_cache as _memo
+
+
+@_memo(maxsize=65536)
 def _key(value: str) -> str:
     return re.sub(r"\s+", " ", _DOTS.sub(" ", value.lower())).strip()
 
