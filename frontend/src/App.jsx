@@ -652,7 +652,11 @@ export default function App() {
       setShowCustomRevisions(true)
       setShowRecipeJson(!!state.recipeText)
       setActiveTab("source")
-      if (state.path) { try { doInspectSource(state.path, 0) } catch (e) {} }
+      if (state.path) {
+        setPlainLanguageSuggestions(null)
+        try { doInspectSource(state.path, 0) } catch (e) {}
+        loadPlainSuggestions(state.path)
+      }
       return
     }
     setLeftPath(state.leftPath || "")
@@ -1012,6 +1016,18 @@ export default function App() {
     } catch (err) {
       console.error('Inspect request failed', err)
       addToast('Inspect request failed: ' + (err.message || String(err)), 'error', 6000)
+    }
+  }
+
+  async function loadPlainSuggestions(nextPath) {
+    try {
+      const mdRes = await fetch(`${BACKEND}/metadata`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: nextPath }) })
+      if (!mdRes.ok) return
+      const md = await mdRes.json()
+      const pls = md?.metadata?.plain_language_suggestions || []
+      if (Array.isArray(pls)) setPlainLanguageSuggestions(pls)
+    } catch (e) {
+      // suggestions are optional; the rest of the workflow still works
     }
   }
 
