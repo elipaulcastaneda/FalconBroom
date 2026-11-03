@@ -21,7 +21,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 from .engine import Cleaner, _read_table, _is_polars_df, _fuzzy_dedupe, _spell_correct_column
 from .workflow_rules import suggest_columns_to_clean
-from .semantics import column_kinds as _column_kinds, fits as _kind_fits, same_meaning as _same_meaning
+from .semantics import column_kinds as _column_kinds, fits as _kind_fits, same_meaning as _same_meaning, swap_is_safe as _swap_is_safe
 from .step_catalog import parse_machine_template, steps_to_template, steps_to_text
 import threading
 import traceback
@@ -796,7 +796,7 @@ def _vocabulary_swap(left: str, right: str, left_raw: list, right_raw: list, lef
         {'source': right, 'target': left, 'type': 'pattern', 'pattern': '(?i:' + '|'.join(re.escape(v) for v in sorted(exact_right)) + ')', 'exceptions': []},
     ]
     return {
-        'left': left, 'right': right, 'rows': len(crossed), 'home_rows': home_rows,
+        'left': left, 'right': right, 'rows': len(crossed), 'home_rows': home_rows, 'crossed': crossed,
         'left_examples': _uniq([left_raw[i] for i in crossed], 3),
         'right_examples': _uniq([right_raw[i] for i in crossed], 3),
         'step': {'action': 'swap_by_types', 'column': None, 'params': {'moves': moves, 'replacement': ''}},
@@ -828,7 +828,7 @@ def _shape_swaps(col_stats: dict[str, dict[str, Any]], skip_pairs: set) -> list[
             left_raw, right_raw = col_stats[left]['raw_values'], col_stats[right]['raw_values']
             if all(_shape_class(shape) != 'digit' for shape in left_home | right_home):
                 match = _vocabulary_swap(left, right, left_raw, right_raw, vocabularies[left], vocabularies[right])
-                if match:
+                if match and _swap_is_safe(left, right, left_raw, right_raw, match['crossed'], match['home_rows'], meanings[left], meanings[right]):
                     found.append(match)
                 continue
             if left_home & right_home:
@@ -853,6 +853,8 @@ def _shape_swaps(col_stats: dict[str, dict[str, Any]], skip_pairs: set) -> list[
             left_set = sorted({left_shapes[i] for i in crossed})
             right_set = sorted({right_shapes[i] for i in crossed})
             if len(left_set) > 12 or len(right_set) > 12:
+                continue
+            if not _swap_is_safe(left, right, left_raw, right_raw, crossed, home_rows, meanings[left], meanings[right]):
                 continue
             moves = [
                 {'source': left, 'target': right, 'type': 'pattern', 'pattern': '|'.join(_shape_regex(s) for s in left_set), 'exceptions': []},
@@ -1739,13 +1741,16 @@ def generate_plain_language_suggestions(metadata: dict[str, Any], df=None) -> li
                                 if _same_meaning(meanings[left][0], meanings[right][0]):
                                     continue
                                 left_values, right_values = left_stats['raw_values'], right_stats['raw_values']
-                                foreign_rows = sum(
-                                    left_stats['type_values'][i] == left_wrong and right_stats['type_values'][i] == right_wrong
+                                crossed_rows = [
+                                    i for i in range(min(comparable, len(left_values), len(right_values)))
+                                    if left_stats['type_values'][i] == left_wrong and right_stats['type_values'][i] == right_wrong
                                     and not _kind_fits(left_values[i] or '', meanings[left][1])
                                     and not _kind_fits(right_values[i] or '', meanings[right][1])
-                                    for i in range(min(comparable, len(left_values), len(right_values)))
-                                )
+                                ]
+                                foreign_rows = len(crossed_rows)
                                 if foreign_rows < 5 or foreign_rows < wrong_rows * 0.9:
+                                    continue
+                                if not _swap_is_safe(left, right, left_values, right_values, crossed_rows, expected_rows, meanings[left], meanings[right]):
                                     continue
                             moves = [
                                 {'source': left, 'target': right, 'type': left_wrong, 'exceptions': []},

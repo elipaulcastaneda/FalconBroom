@@ -32,7 +32,7 @@ function isAdded(s, selectedKeys) {
   return isReady(s) && s.json_steps.every((step) => selectedKeys.has(JSON.stringify(step)))
 }
 
-export default function SuggestionList({ suggestions, selectedSteps, onUse }) {
+export default function SuggestionList({ suggestions, selectedSteps, onUse, onUndo }) {
   const [filter, setFilter] = useState('all')
   const [query, setQuery] = useState('')
 
@@ -140,14 +140,21 @@ export default function SuggestionList({ suggestions, selectedSteps, onUse }) {
                     <span className={`sg-badge sg-badge-${s.__category}`} title={meta.hint}>{meta.badge}</span>
                     <span className="sg-text">{s.text}</span>
                     {isReady(s) ? (
-                      <button
-                        type="button"
-                        className={added ? 'secondary' : ''}
-                        disabled={added}
-                        onClick={() => onUse(s)}
-                      >
-                        {added ? 'Added' : 'Use'}
-                      </button>
+                      added ? (
+                        <>
+                          <span className="sg-note">Added</span>
+                          <button
+                            type="button"
+                            className="secondary"
+                            title="Remove this suggestion from the instruction box and the selected steps"
+                            onClick={() => onUndo && onUndo(s)}
+                          >
+                            Undo
+                          </button>
+                        </>
+                      ) : (
+                        <button type="button" onClick={() => onUse(s)}>Use</button>
+                      )
                     ) : (
                       <span className="sg-note">Review</span>
                     )}

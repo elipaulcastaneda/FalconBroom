@@ -281,6 +281,18 @@ export default function App() {
     setInstruction((prev) => (prev && prev.trim() ? `${prev}\n${text}` : text))
     recordWorkflowAction("source", "Suggestion used")
   }
+  function removeSuggestionFromRecipe(s) {
+    const text = ((s && s.text) || '').trim()
+    const removed = new Set((s?.json_steps || []).map((step) => JSON.stringify(step)))
+    setSelectedSuggestionSteps((prev) => (prev || []).filter((step) => !removed.has(JSON.stringify(step))))
+    setInstruction((prev) => {
+      const lines = (prev || '').split('\n')
+      const index = lines.findIndex((line) => line.trim() === text)
+      if (index >= 0) lines.splice(index, 1)
+      return lines.join('\n')
+    })
+    addToast('Suggestion removed from the instruction box.', 'info')
+  }
   const [inspectOffset, setInspectOffset] = useState(0)
   const [preview, setPreview] = useState(null)
   const [applyRes, setApplyRes] = useState(null)
@@ -4822,6 +4834,17 @@ export default function App() {
             <button onClick={doProfile}>Profile data</button>
             <button className="primary" onClick={doSuggest}>Suggest recipe</button>
           </div>
+          {!railCollapsed && (
+            <details className="data-credits" style={{ fontSize: '0.75rem', color: 'var(--muted)', marginTop: 8 }}>
+              <summary style={{ cursor: 'pointer' }}>Data credits</summary>
+              <p style={{ margin: '6px 0 0' }}>
+                Place names used to recognise cities, regions and countries come from{' '}
+                <a href="https://www.geonames.org" target="_blank" rel="noreferrer">GeoNames</a>, licensed under{' '}
+                <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noreferrer">CC BY 4.0</a>.
+                The data was reduced to a name list.
+              </p>
+            </details>
+          )}
         </div>
       </aside>
 
@@ -4940,6 +4963,7 @@ export default function App() {
                           suggestions={plainLanguageSuggestions}
                           selectedSteps={selectedSuggestionSteps}
                           onUse={addSuggestionToRecipe}
+                          onUndo={removeSuggestionFromRecipe}
                         />
                       </div>
                     )}

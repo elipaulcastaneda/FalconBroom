@@ -249,6 +249,12 @@ def column_kinds(raw_values: list) -> tuple[frozenset, frozenset]:
         covered += count
         if covered / max(total, 1) >= 0.75:
             break
+    return frozenset(main), widen(main)
+
+
+def widen(main) -> frozenset:
+    """What each kind legitimately sits beside (a date column also holds bare years, money holds plain numbers, ...)."""
+    main = set(main)
     widened = set(main)
     if 'date' in main:
         widened.add('year')
@@ -272,7 +278,7 @@ def column_kinds(raw_values: list) -> tuple[frozenset, frozenset]:
         widened.add('company')
     if 'binary' in main:
         widened.update({'integer'})
-    return frozenset(main), frozenset(widened)
+    return frozenset(widened)
 
 
 def fits(value: str, widened: frozenset) -> bool:
@@ -282,3 +288,99 @@ def fits(value: str, widened: frozenset) -> bool:
 def same_meaning(left_main: frozenset, right_main: frozenset) -> bool:
     """Two columns whose main kinds share a semantic kind (two dates, two phones, two places...) are siblings, not swaps."""
     return bool(left_main & right_main & SEMANTIC_KINDS)
+
+
+_HEADER_KINDS = (
+    (re.compile(r"(?i)e-?mail"), {'email'}),
+    (re.compile(r"(?i)\b(?:url|website|web_?site|link|homepage)\b"), {'url'}),
+    (re.compile(r"(?i)phone|mobile|\bfax\b|\btel\b|telephone|\bcell\b"), {'phone'}),
+    (re.compile(r"(?i)\bzip|postal|post_?code"), {'zip'}),
+    (re.compile(r"(?i)\byear\b|\byr\b"), {'year'}),
+    (re.compile(r"(?i)(?<!up)(?<!candi)date|timestamp|\bdob\b|birth ?(?:date|day)|\b(?:created|updated|modified)\b"), {'date', 'time'}),
+    (re.compile(r"(?i)\btime\b"), {'time'}),
+    (re.compile(r"(?i)cost|price|amount|salary|revenue|budget|\bfee\b|\busd\b|\bwage\b|\bpay\b|\bbalance\b"), {'money'}),
+    (re.compile(r"(?i)percent|\bpct\b"), {'percent'}),
+    (re.compile(r"(?i)\btemp(?:erature)?\b|\bcelsius\b|\bfahrenheit\b"), {'temperature'}),
+    (re.compile(r"(?i)\bweather\b"), {'weather'}),
+    (re.compile(r"(?i)\b(?:city|town|municipality|county|state|province|country|region|nation)\b"), {'place'}),
+)
+
+
+def _header_words(name: str) -> str:
+    return re.sub(r"[_\-\s]+", " ", re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", str(name))).lower()
+
+
+def header_kinds(name: str) -> frozenset | None:
+    """What a column's name promises ('city' -> places, 'phone' -> phones); None when the name says nothing."""
+    words = _header_words(name)
+    for pattern, kinds in _HEADER_KINDS:
+        if pattern.search(words):
+            return widen(kinds)
+    return None
+
+
+def _unknown(main: frozenset) -> bool:
+    return not main or all(kind.startswith('other:') for kind in main)
+
+
+def _coarse(value: str) -> str:
+    kind = primary_kind(value_kinds(value))
+    if kind.startswith('other:'):
+        return 'other:digit' if not re.search(r"[A-Za-z]", value) else 'other:text'
+    return kind
+
+
+def _dominant_share(values: list) -> float:
+    if not values:
+        return 0.0
+    return Counter(_coarse(v) for v in values).most_common(1)[0][1] / len(values)
+
+
+def swap_is_safe(
+    left: str, right: str, left_values: list, right_values: list, crossed: list, home_rows: int,
+    left_meaning: tuple, right_meaning: tuple,
+) -> bool:
+    """Final checks on a candidate swap; any doubt rejects it (a missed swap costs far less than a false one).
+
+    1. Header: values moved must not already suit the column they sit in, and must suit the target's header.
+    2. Purity: nearly every moved value must fit the kinds the other column usually holds.
+    3. Unknown kinds: columns we can't classify need many more rows and a clearer majority.
+    4. Consistency: moved values must be one kind of thing, not scattered noise.
+    """
+    rows = [i for i in crossed if i < len(left_values) and i < len(right_values)]
+    if not rows:
+        return False
+    left_main, left_wide = left_meaning
+    right_main, right_wide = right_meaning
+    left_header, right_header = header_kinds(left), header_kinds(right)
+
+    violations = 0
+    for i in rows:
+        a, b = left_values[i] or '', right_values[i] or ''
+        bad = False
+        for value, own, other in ((a, left_header, right_header), (b, right_header, left_header)):
+            if own and fits(value, own):
+                bad = True
+            if other and other != widen({'place'}) and not fits(value, other):
+                bad = True
+        violations += bad
+    if violations > 0.3 * len(rows):
+        return False
+
+    left_unknown, right_unknown = _unknown(left_main), _unknown(right_main)
+    impure = 0
+    for i in rows:
+        a, b = left_values[i] or '', right_values[i] or ''
+        if (not right_unknown and not fits(a, right_wide)) or (not left_unknown and not fits(b, left_wide)):
+            impure += 1
+    if impure > 0.3 * len(rows):
+        return False
+
+    if left_unknown or right_unknown:
+        if len(rows) < 10 or home_rows < 4 * len(rows):
+            return False
+
+    return (
+        _dominant_share([left_values[i] for i in rows if left_values[i]]) >= 0.5
+        and _dominant_share([right_values[i] for i in rows if right_values[i]]) >= 0.5
+    )

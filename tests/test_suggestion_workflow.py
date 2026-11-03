@@ -483,8 +483,8 @@ def test_cross_column_type_swap_suggestion_is_previewable_and_ids_are_excluded(t
 
     source = tmp_path / "swapped.csv"
     rows = ["label,amount,id"]
-    rows.extend(f"{i * 10},item-{i},ID-{i}" for i in range(8))
-    rows.extend(f"item-{i},{i * 10},ID-{i}" for i in range(30))
+    rows.extend(f"{i * 10},item-{i},ID-{i}" for i in range(12))
+    rows.extend(f"item-{i},{i * 10},ID-{i}" for i in range(60))
     rows.extend(f"item-{i},{i * 10},12345" for i in range(5))
     source.write_text("\n".join(rows), encoding="utf-8")
 
@@ -609,15 +609,15 @@ def test_zip_and_city_values_swap_on_corresponding_rows_including_zip4(tmp_path)
 
 def test_shape_swap_is_general_not_zip_specific(tmp_path):
     names = ["Alice Smith", "Bob Jones", "Carol White", "Dan Brown", "Erin Green", "Frank Hall"]
-    crossed = [(f"{200 + i}-555-01{i:02d}", names[i % 6]) for i in range(8)]
-    home = [(names[i % 6], f"{300 + i % 7}-555-02{i:02d}") for i in range(40)]
+    crossed = [(f"{200 + i}-555-01{i:02d}", names[i % 6]) for i in range(12)]
+    home = [(names[i % 6], f"{300 + i % 7}-555-02{i:02d}") for i in range(60)]
     path = _write_pairs(tmp_path, "phone_name.csv", "name,phone", crossed, home)
     _, entry, step = _shape_swap_step(path)
     assert {move["source"] for move in step["params"]["moves"]} == {"name", "phone"}
     from fbroom.engine import _read_table, _swap_by_types
 
     result, info = _swap_by_types(_read_table(str(path)), step["params"]["moves"], "")
-    assert info["rows_changed"] == 8
+    assert info["rows_changed"] == 12
     assert result["name"].to_list()[0] == names[0]
     assert result["phone"].to_list()[0] == "200-555-0100"
 
@@ -1036,3 +1036,37 @@ def test_preview_and_apply_match_for_numeric_and_unicode_steps(tmp_path):
     assert result["amount"].to_list() == [1.236, 2.345]
     assert result["label"].to_list() == ["ABC", "Foo"]
     assert result["rate"].to_list() == [0.1, 0.25]
+
+
+def _gate(left, right, left_values, right_values, crossed, home=200):
+    from fbroom.semantics import column_kinds, swap_is_safe
+
+    return swap_is_safe(left, right, left_values, right_values, crossed, home, column_kinds(left_values), column_kinds(right_values))
+
+
+def test_swap_gate_header_veto_blocks_values_that_already_suit_their_column():
+    years = ["2023", "2024", "2025"] * 40
+    dates = ["2024-08-26", "2023-12-10", "2022-01-05"] * 40
+    crossed = list(range(15))
+    assert not _gate("start_date", "end_date", dates[:], years[:], crossed)
+    left = ["2023"] * 15 + ["2024-08-26"] * 105
+    right = ["2024-08-26"] * 15 + ["12"] * 105
+    assert not _gate("start_date", "bedrooms", left, right, crossed)
+
+
+def test_swap_gate_accepts_a_clean_consistent_swap_and_rejects_scattered_noise():
+    zips = [f"{10000 + i}" for i in range(120)]
+    cities = ["Dallas", "Houston", "Austin", "Denver", "Reno", "Boston"] * 20
+    left = cities[:12] + zips[12:]
+    right = zips[:12] + cities[12:]
+    assert _gate("zipcode", "city", left, right, list(range(12)))
+    mixed_left = ["Dallas", "42", "x@y.com", "12/05/2020", "Reno", "$5"] * 20
+    mixed_right = ["(555) 123-4567", "Boston", "12345", "yes", "n/a", "2.5"] * 20
+    assert not _gate("zipcode", "city", mixed_left, mixed_right, list(range(12)))
+
+
+def test_swap_gate_needs_more_evidence_for_unrecognised_columns():
+    left = [f"item-{i}" for i in range(120)]
+    right = [f"code{i}x" for i in range(120)]
+    assert not _gate("alpha", "beta", left, right, list(range(6)), home=400)
+    assert not _gate("alpha", "beta", left, right, list(range(12)), home=30)

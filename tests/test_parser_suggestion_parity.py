@@ -225,7 +225,7 @@ def test_every_executable_suggestion_is_readable_by_the_parser(tmp_path):
 def test_uploaded_data_emits_each_evidence_supported_action_only(tmp_path):
     rows = ["number,rate,is_active,state,notes,created_at,flag,mixed,label,amount,unicode_label"]
     for i in range(60):
-        if i < 30 or i >= 38:
+        if i < 30 or i >= 42:
             label, amount = f"item-{i}", str(i * 10)
         else:
             label, amount = str(i * 10), f"item-{i}"
