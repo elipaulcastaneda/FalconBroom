@@ -1230,6 +1230,29 @@ def _unique_df(df, subset=None):
             return df
 
 
+def _make_difflib_finder(right_keys, cutoff):
+    """Best difflib match per left value. Exact keys short-circuit (ratio 1.0 only occurs for identical text) and results are memoized per distinct value."""
+    exact = set(right_keys)
+    cache: dict = {}
+    usable = 0.0 <= cutoff <= 1.0
+
+    def find_best(v):
+        if v is None:
+            return None
+        s = str(v)
+        if s in cache:
+            return cache[s]
+        if usable and s in exact:
+            res = s
+        else:
+            matches = difflib.get_close_matches(s, right_keys, n=1, cutoff=cutoff)
+            res = matches[0] if matches else None
+        cache[s] = res
+        return res
+
+    return find_best
+
+
 def _fuzzy_dedupe(df, subset=None, threshold: float = 0.85, method: str = 'difflib'):
     """Perform fuzzy deduplication on `subset` columns (list or single column name).
     Returns (df_new, info) where info contains cluster report and rows removed.
@@ -4363,12 +4386,7 @@ class Cleaner:
                                         find_best = None
 
                                 if find_best is None:
-                                    def find_best(v):
-                                        if v is None:
-                                            return None
-                                        s = str(v)
-                                        matches = difflib.get_close_matches(s, right_keys, n=1, cutoff=cutoff)
-                                        return matches[0] if matches else None
+                                    find_best = _make_difflib_finder(right_keys, cutoff)
 
                                 if _is_polars_df(df):
                                     try:
@@ -4875,12 +4893,7 @@ class Cleaner:
                                         find_best = None
 
                                 if find_best is None:
-                                    def find_best(v):
-                                        if v is None:
-                                            return None
-                                        s = str(v)
-                                        matches = difflib.get_close_matches(s, right_keys, n=1, cutoff=cutoff)
-                                        return matches[0] if matches else None
+                                    find_best = _make_difflib_finder(right_keys, cutoff)
 
                                 if _is_polars_df(df_after):
                                     try:
