@@ -21,6 +21,7 @@ except Exception:  # pragma: no cover - optional dependency
 
 from .engine import Cleaner, _read_table, _is_polars_df, _fuzzy_dedupe, _spell_correct_column
 from .workflow_rules import suggest_columns_to_clean
+from .semantics import column_kinds as _column_kinds, fits as _kind_fits, same_meaning as _same_meaning
 from .step_catalog import parse_machine_template, steps_to_template, steps_to_text
 import threading
 import traceback
@@ -762,78 +763,6 @@ def _belongs(shape: str, accepted: set, home: set) -> bool:
     return kind != 'mixed' and any(_shape_class(h) == kind for h in home)
 
 
-_MONTHS = r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?"
-_DATE_KIND_RES = (
-    re.compile(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)?"),
-    re.compile(r"\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}"),
-    re.compile(rf"(?i){_MONTHS}[ -]\d{{1,2}}(?:(?:st|nd|rd|th)?,?[ -]\d{{2,4}})?"),
-    re.compile(rf"(?i)\d{{1,2}}(?:st|nd|rd|th)?[ -]{_MONTHS}(?:,?[ -]\d{{2,4}})?"),
-    re.compile(rf"(?i){_MONTHS},?[ -]\d{{4}}"),
-    re.compile(r"\d{4}[-/]\d{1,2}"),
-    re.compile(r"(?i)q[1-4][ -]?\d{2,4}"),
-)
-_CURRENCY_RE = re.compile(r"(?i)(?:[$€£¥₹]|\b(?:usd|eur|gbp|cad|aud|jpy|inr|mxn)\b)")
-_GROUPED_NUMBER_RE = re.compile(r"[-+(]?\d{1,3}(?:[.,' ]\d{3})+(?:[.,]\d+)?\)?")
-
-
-def _value_kinds(value: str) -> frozenset:
-    """Coarse meaning of a value (date, money, whole number, ...); a value can belong to several kinds."""
-    text = value.strip()
-    if not text:
-        return frozenset()
-    if any(pattern.fullmatch(text) for pattern in _DATE_KIND_RES):
-        return frozenset({'date'})
-    if _CURRENCY_RE.search(text) and re.search(r"\d", text):
-        return frozenset({'money', 'number'})
-    if _GROUPED_NUMBER_RE.fullmatch(text):
-        return frozenset({'money', 'number'})
-    if re.fullmatch(r"[-+]?\d+%|[-+]?\d+(?:\.\d+)?\s?%", text):
-        return frozenset({'percent'})
-    if re.fullmatch(r"[-+]?\d+", text):
-        kinds = {'integer', 'number'}
-        if re.fullmatch(r"(?:1[5-9]|20)\d{2}", text):
-            kinds.add('year')
-        return frozenset(kinds)
-    if re.fullmatch(r"[-+]?(?:\d+\.\d*|\.\d+)(?:[eE][-+]?\d+)?", text):
-        return frozenset({'decimal', 'number'})
-    return frozenset({'other:' + _swap_shape(text)})
-
-
-def _accepted_kinds(raw_values: list) -> frozenset:
-    """The main kinds of a column (together covering 75% of values), widened by what each kind legitimately sits beside."""
-    counts: Counter = Counter()
-    total = 0
-    for value in raw_values:
-        if not value:
-            continue
-        kinds = _value_kinds(value)
-        total += 1
-        counts['year' if 'year' in kinds else next(iter(sorted(kinds - {'number'})))] += 1
-    accepted: set = set()
-    covered = 0
-    for kind, count in counts.most_common():
-        accepted.add(kind)
-        covered += count
-        if covered / max(total, 1) >= 0.75:
-            break
-    primary = set(accepted)
-    if 'date' in primary:
-        accepted.add('year')
-    if 'year' in primary:
-        accepted.update({'date', 'integer', 'number'})
-    if primary & {'money', 'decimal', 'integer', 'percent'}:
-        accepted.add('number')
-    if 'money' in primary:
-        accepted.update({'integer', 'decimal'})
-    if 'decimal' in primary:
-        accepted.add('integer')
-    return frozenset(accepted)
-
-
-def _kind_fits(value: str, accepted: frozenset) -> bool:
-    return bool(_value_kinds(value) & accepted)
-
-
 _MIN_VOCAB_SUPPORT = 5
 _VOCAB_DOMINANCE = 3
 _MAX_EXACT_SWAP_VALUES = 200
@@ -878,16 +807,21 @@ def _shape_swaps(col_stats: dict[str, dict[str, Any]], skip_pairs: set) -> list[
     """Find column pairs whose values sit in each other's place on the same rows."""
     profiles = {}
     vocabularies = {}
+    meanings = {}
     for col, stats in col_stats.items():
         profile = _column_shapes(stats.get('raw_values') or [])
         if profile:
             profiles[col] = profile
             vocabularies[col] = Counter(v.casefold() for v in stats['raw_values'] if v)
+            meanings[col] = _column_kinds(stats['raw_values'])
     found: list[dict[str, Any]] = []
     names = list(profiles)
     for left_index, left in enumerate(names):
         for right in names[left_index + 1:]:
             if (left, right) in skip_pairs:
+                continue
+            left_kinds, right_kinds = meanings[left][1], meanings[right][1]
+            if _same_meaning(meanings[left][0], meanings[right][0]):
                 continue
             left_shapes, left_home, left_accepted = profiles[left]
             right_shapes, right_home, right_accepted = profiles[right]
@@ -899,7 +833,6 @@ def _shape_swaps(col_stats: dict[str, dict[str, Any]], skip_pairs: set) -> list[
                 continue
             if left_home & right_home:
                 continue
-            left_kinds, right_kinds = _accepted_kinds(left_raw), _accepted_kinds(right_raw)
             crossed: list[int] = []
             home_rows = 0
             for index in range(min(len(left_shapes), len(right_shapes))):
@@ -1768,6 +1701,7 @@ def generate_plain_language_suggestions(metadata: dict[str, Any], df=None) -> li
                 # Recommend reciprocal swaps only when off-type values align across rows
                 # and each column has a strong, opposite dominant type.
                 columns = list(col_stats)
+                meanings = {col: _column_kinds(stats['raw_values']) for col, stats in col_stats.items() if stats.get('raw_values')}
                 swap_columns: set[str] = set()
                 swap_pairs: set[tuple[str, str]] = set()
                 shape_swap_columns: set[str] = set()
@@ -1801,6 +1735,18 @@ def generate_plain_language_suggestions(metadata: dict[str, Any], df=None) -> li
                             )
                             if wrong_rows < 5 or expected_rows < 10 or expected_rows < wrong_rows * 2:
                                 continue
+                            if meanings.get(left) and meanings.get(right):
+                                if _same_meaning(meanings[left][0], meanings[right][0]):
+                                    continue
+                                left_values, right_values = left_stats['raw_values'], right_stats['raw_values']
+                                foreign_rows = sum(
+                                    left_stats['type_values'][i] == left_wrong and right_stats['type_values'][i] == right_wrong
+                                    and not _kind_fits(left_values[i] or '', meanings[left][1])
+                                    and not _kind_fits(right_values[i] or '', meanings[right][1])
+                                    for i in range(min(comparable, len(left_values), len(right_values)))
+                                )
+                                if foreign_rows < 5 or foreign_rows < wrong_rows * 0.9:
+                                    continue
                             moves = [
                                 {'source': left, 'target': right, 'type': left_wrong, 'exceptions': []},
                                 {'source': right, 'target': left, 'type': right_wrong, 'exceptions': []},

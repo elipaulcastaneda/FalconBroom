@@ -708,6 +708,87 @@ def test_dates_and_numbers_really_swapped_are_still_found(tmp_path):
     assert set(entry["columns"]) == {"start_date", "bedrooms"}
 
 
+def _suggestions_for(tmp_path, name, columns, rows=1200, seed=5):
+    import random
+    from fbroom.ingest import generate_plain_language_suggestions
+
+    random.seed(seed)
+    lines = [",".join(columns)]
+    for _ in range(rows):
+        lines.append(",".join(random.choice(values) for values in columns.values()))
+    path = tmp_path / name
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return generate_plain_language_suggestions({"path": str(path), "normalized_path": str(path)})
+
+
+def _swap_sources(suggestions):
+    return [item for item in suggestions if item.get("source") in ("cross_column_shape_swap", "cross_column_type_swap")]
+
+
+def test_phone_zip_place_and_date_columns_in_mixed_formats_are_not_swaps(tmp_path):
+    suggestions = _suggestions_for(tmp_path, "formats.csv", {
+        "home_phone": ["555-123-4567", "(555) 123-4567", "555.123.4567", "+1 555 123 4567", "5551234567", "123-4567"],
+        "mobile_phone": ["(212) 555-0199", "212-555-0199", "+44 20 7946 0958", "2125550199", "212 555 0199"],
+        "zip": ["84101", "10001-1234", "M5V 3L9", "SW1A 1AA", "90210", "60601"],
+        "city": ["Salt Lake City", "Toronto", "London", "Beverly Hills", "Chicago", "São Paulo", "Zürich", "St. Louis"],
+        "birth_place": ["Mumbai", "Lagos", "Osaka", "Texas", "Canada", "Orlando, FL", "Nairobi"],
+        "start_date": ["2024-08-26", "Apr 17", "03/04/2024", "5 May 2023", "2023", "March 2022"],
+        "end_date": ["2025-01-02", "12/31/2024", "Jan 3, 2025", "2025", "June 2025"],
+    })
+    assert not _swap_sources(suggestions)
+
+
+def test_temperature_weather_binary_and_company_columns_are_not_swaps(tmp_path):
+    suggestions = _suggestions_for(tmp_path, "weather.csv", {
+        "temp_f": ["72°F", "68 F", "75.5°F", "90", "55 °F", "-4°F"],
+        "temp_c": ["22°C", "20 C", "24.5°C", "32", "13 °C", "-20°C"],
+        "conditions": ["sunny", "Partly cloudy", "RAIN", "snow", "Overcast", "thunderstorm"],
+        "is_active": ["yes", "no", "Y", "N", "TRUE", "false", "1", "0"],
+        "has_garage": ["1", "0", "yes", "no", "true", "false"],
+        "company": ["Acme Inc", "Valley Stone Homes", "Globex LLC", "NASA", "Summit House Builders", "Initech Ltd."],
+        "agency": ["University of Utah", "Red Cross Society", "City Housing Authority", "NASA", "Salt Lake Hospital"],
+        "year_built": ["1999", "2005", "2012", "1987", "2020"],
+        "bedrooms": ["2", "3", "4", "5"],
+    })
+    assert not _swap_sources(suggestions)
+
+
+def test_real_swap_between_zip_text_and_world_city_is_still_found(tmp_path):
+    cities = ["Toronto", "London", "Zürich", "Mumbai", "Nairobi", "Osaka"]
+    crossed = [(cities[i % 6], f"{20000 + i:05d}") for i in range(8)]
+    home = [(f"{10000 + i:05d}", cities[i % 6]) for i in range(40)]
+    path = _write_pairs(tmp_path, "zip_world_city.csv", "zipcode,city", crossed, home)
+    _, entry, _ = _shape_swap_step(path)
+    assert set(entry["columns"]) == {"zipcode", "city"}
+
+
+def test_place_gazetteer_recognizes_world_places_and_rejects_words():
+    from fbroom.semantics import is_place, value_kinds
+
+    for name in ("Orlando", "SALT LAKE CITY", "St. Louis", "Zürich", "Tokyo", "Texas", "TX", "Canada", "Orlando, FL"):
+        assert is_place(name), name
+    for word in ("Cedar Ridge Homes", "single-family", "builder", "12345", ""):
+        assert not is_place(word), word
+    assert "temperature" in value_kinds("72°F")
+    assert "weather" in value_kinds("Partly cloudy")
+    assert "company" in value_kinds("Acme Inc")
+    assert "binary" in value_kinds("Yes")
+
+
+def test_swap_apply_step_is_unchanged_by_value_meaning_checks(tmp_path):
+    from fbroom.engine import _read_table, _swap_by_types
+
+    cities = ["Flint", "Dallas", "Houston", "Austin", "Denver", "Reno"]
+    crossed = [(cities[i % 6], f"{20000 + i:05d}") for i in range(8)]
+    home = [(f"{10000 + i:05d}", cities[i % 6]) for i in range(40)]
+    path = _write_pairs(tmp_path, "unchanged.csv", "zipcode,city", crossed, home)
+    _, _, step = _shape_swap_step(path)
+    result, info = _swap_by_types(_read_table(str(path)), step["params"]["moves"], "")
+    assert info["rows_changed"] == 8
+    assert result["zipcode"].to_list()[:8] == [b for _, b in crossed]
+    assert result["city"].to_list()[:8] == [a for a, _ in crossed]
+
+
 def test_swap_pair_only_fills_blank_cells_for_unmatched_rows():
     from fbroom.engine import _swap_by_types
 

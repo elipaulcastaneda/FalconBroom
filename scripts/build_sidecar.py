@@ -39,9 +39,15 @@ def main() -> int:
         "--collect-submodules", "celery",
         "--collect-all", "polars",
         "--collect-all", "duckdb",
+        "--add-data", f"{ROOT / 'fbroom' / 'data'}{os.pathsep}fbroom/data",
         "--hidden-import", "multipart",
         "--exclude-module", "tkinter",
         "--exclude-module", "pytest",
+        # Present in some dev environments but never imported by FalconBroom; they bloat the sidecar by 100+ MB.
+        *[arg for module in ("numba", "llvmlite", "IPython", "ipywidgets", "ipykernel", "jedi", "matplotlib",
+                             "boto3", "botocore", "s3transfer", "notebook", "jupyter_client", "jupyter_core", "sympy",
+                             "tensorflow", "torch", "bokeh", "plotly", "dask", "distributed", "pytest")
+          for arg in ("--exclude-module", module)],
         str(ROOT / "fbroom" / "sidecar.py"),
     ]
     print(" ".join(cmd))
