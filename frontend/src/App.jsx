@@ -697,15 +697,15 @@ export default function App() {
             : `${item.state?.leftPath || "No left source"} + ${item.state?.rightPath || "No right source"}`
           return (
             <div key={item.id} className="history-item">
-              <div style={{flex: "1 1 0"}}>
-                <strong>{label}</strong>{idx === 0 ? <span style={{marginLeft: 8, padding: "1px 8px", borderRadius: 10, fontSize: 11, background: "rgba(16,185,129,0.15)", color: "#047857"}}>Most recent</span> : null}
+              <div style={{flex: "1 1 0", minWidth: 0, overflowWrap: "anywhere"}}>
+                <strong title={label}>{label}</strong>{idx === 0 ? <span style={{marginLeft: 8, padding: "1px 8px", borderRadius: 10, fontSize: 11, background: "rgba(16,185,129,0.15)", color: "#047857"}}>Most recent</span> : null}
                 <div><small style={{color:"var(--muted)"}}>Saved {item.updated_at ? new Date(item.updated_at).toLocaleString() : ""}</small></div>
                 {(item.timeline || []).slice(-4).reverse().map((entry) => (
                   <div key={entry.id}><small style={{color:"var(--muted)"}}>{new Date(entry.at).toLocaleTimeString()} · {entry.label}</small></div>
                 ))}
               </div>
-              <div className="history-actions">
-                <button className="primary" onClick={() => resumeWorkflowCheckpoint(item)}>Continue</button>
+              <div className="history-actions" style={{flex: "0 0 auto", display: "flex", gap: 6, whiteSpace: "nowrap"}}>
+                <button className="primary" onClick={() => resumeWorkflowCheckpoint(item)}>Continue where I left off</button>
                 <button onClick={() => deleteWorkflowCheckpoint(item.id)} aria-label="Delete workflow checkpoint">Delete</button>
               </div>
             </div>
