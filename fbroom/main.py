@@ -600,6 +600,23 @@ class SourceSpec(BaseModel):
     path: str
 
 
+class ReviewOptionsSpec(BaseModel):
+    path: str
+    text: str
+    column: Optional[str] = None
+
+
+@app.post("/review-options")
+def review_options_endpoint(spec: ReviewOptionsSpec):
+    from .review_options import review_options
+    try:
+        return {"options": review_options(spec.path, spec.text, spec.column)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 class SourceInspectSpec(BaseModel):
     path: str
     offset: int = 0

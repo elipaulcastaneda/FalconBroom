@@ -32,19 +32,24 @@ function isAdded(s, selectedKeys) {
   return isReady(s) && s.json_steps.every((step) => selectedKeys.has(JSON.stringify(step)))
 }
 
-function markNote(setter, text, on) {
-  setter((prev) => {
-    const next = new Set(prev)
-    if (on) next.add(text); else next.delete(text)
-    return next
-  })
-}
-
-export default function SuggestionList({ suggestions, selectedSteps, onUse, onUndo }) {
+export default function SuggestionList({ suggestions, selectedSteps, onUse, onUndo, onReview }) {
   const [filter, setFilter] = useState('all')
   const [query, setQuery] = useState('')
-  const [reviewed, setReviewed] = useState(() => new Set())
-  const [usedNotes, setUsedNotes] = useState(() => new Set())
+  const [reviews, setReviews] = useState({})
+
+  async function reviewNote(s) {
+    if (!onReview) return
+    setReviews((prev) => ({ ...prev, [s.text]: { status: 'loading', options: [] } }))
+    let options = []
+    try {
+      const result = await onReview(s)
+      options = Array.isArray(result) ? result.filter((o) => isReady(o)) : []
+    } catch (e) {
+      setReviews((prev) => ({ ...prev, [s.text]: { status: 'error', options: [] } }))
+      return
+    }
+    setReviews((prev) => ({ ...prev, [s.text]: { status: 'done', options } }))
+  }
 
   const selectedKeys = useMemo(() => new Set((selectedSteps || []).map((step) => JSON.stringify(step))), [selectedSteps])
 
@@ -144,52 +149,61 @@ export default function SuggestionList({ suggestions, selectedSteps, onUse, onUn
             <ul className="sg-items">
               {group.entries.map((s, i) => {
                 const meta = META[s.__category]
-                const added = isAdded(s, selectedKeys)
-                return (
-                  <li key={`${group.column}-${i}`} className={`sg-item sg-${s.__category}${added ? ' is-added' : ''}`}>
-                    <span className={`sg-badge sg-badge-${s.__category}`} title={meta.hint}>{meta.badge}</span>
-                    <span className="sg-text">{s.text}</span>
-                    {isReady(s) ? (
-                      added ? (
+                const review = reviews[s.text]
+                const renderReady = (item, key, nested) => {
+                  const itemCategory = META[item.category] ? item.category : 'fix'
+                  const itemAdded = isAdded(item, selectedKeys)
+                  return (
+                    <li key={key} className={`sg-item sg-${itemCategory}${itemAdded ? ' is-added' : ''}${nested ? ' sg-nested' : ''}`} style={nested ? { marginLeft: 18 } : undefined}>
+                      <span className={`sg-badge sg-badge-${itemCategory}`} title={META[itemCategory].hint}>{META[itemCategory].badge}</span>
+                      <span className="sg-text">{item.text}</span>
+                      {itemAdded ? (
                         <>
                           <span className="sg-note">Added</span>
                           <button
                             type="button"
                             className="secondary"
                             title="Remove this suggestion from the instruction box and the selected steps"
-                            onClick={() => onUndo && onUndo(s)}
+                            onClick={() => onUndo && onUndo(item)}
                           >
                             Undo
                           </button>
                         </>
                       ) : (
-                        <button type="button" onClick={() => onUse(s)}>Use</button>
-                      )
-                    ) : usedNotes.has(s.text) ? (
-                      <>
-                        <span className="sg-note">Added</span>
+                        <button type="button" onClick={() => onUse(item)}>Use</button>
+                      )}
+                    </li>
+                  )
+                }
+                if (isReady(s)) return renderReady({ ...s, category: s.__category }, `${group.column}-${i}`, false)
+                return (
+                  <React.Fragment key={`${group.column}-${i}`}>
+                    <li className={`sg-item sg-${s.__category}`}>
+                      <span className={`sg-badge sg-badge-${s.__category}`} title={meta.hint}>{meta.badge}</span>
+                      <span className="sg-text">{s.text}</span>
+                      {!review && (
                         <button
                           type="button"
                           className="secondary"
-                          title="Remove this note from the instruction box"
-                          onClick={() => { onUndo && onUndo(s); markNote(setUsedNotes, s.text, false); markNote(setReviewed, s.text, false) }}
+                          title="Generate concrete suggestions for this note"
+                          onClick={() => reviewNote(s)}
                         >
-                          Undo
+                          Review
                         </button>
-                      </>
-                    ) : reviewed.has(s.text) ? (
-                      <button type="button" onClick={() => { onUse(s); markNote(setUsedNotes, s.text, true) }}>Use</button>
-                    ) : (
-                      <button
-                        type="button"
-                        className="secondary"
-                        title="Look this over first; Use becomes available afterwards"
-                        onClick={() => markNote(setReviewed, s.text, true)}
-                      >
-                        Review
-                      </button>
-                    )}
-                  </li>
+                      )}
+                      {review?.status === 'loading' && <span className="sg-note">Reviewing…</span>}
+                      {review?.status === 'done' && (
+                        <span className="sg-note">{review.options.length ? `Reviewed: ${review.options.length} option${review.options.length === 1 ? '' : 's'}` : 'Reviewed: no automatic option fits this'}</span>
+                      )}
+                      {review?.status === 'error' && (
+                        <>
+                          <span className="sg-note">Review failed</span>
+                          <button type="button" className="secondary" onClick={() => reviewNote(s)}>Retry</button>
+                        </>
+                      )}
+                    </li>
+                    {review?.status === 'done' && review.options.map((o, j) => renderReady(o, `${group.column}-${i}-opt-${j}`, true))}
+                  </React.Fragment>
                 )
               })}
             </ul>

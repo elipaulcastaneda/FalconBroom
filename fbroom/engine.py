@@ -3178,7 +3178,7 @@ def _impute_missing(df, col, params=None):
             if strategy in ("mode", "most_common"):
                 try:
                     try:
-                        mode_val = df.select(pl.col(source if source in df.columns else col).mode()).to_series()[0]
+                        mode_val = df.select(pl.col(source if source in df.columns else col).drop_nulls().mode()).to_series()[0]
                     except Exception:
                         # fallback to pandas
                         pd = df.to_pandas()

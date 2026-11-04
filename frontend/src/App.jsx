@@ -266,10 +266,7 @@ export default function App() {
   function addSuggestionToRecipe(s) {
     const text = (s && s.text) || ''
     if (!Array.isArray(s?.json_steps) || !s.json_steps.length) {
-      // Reviewed note: goes into the instruction box so the user can edit it into a concrete instruction.
-      setInstruction((prev) => (prev && prev.trim() ? `${prev}\n${text}` : text))
-      recordWorkflowAction("source", "Suggestion reviewed and used")
-      addToast('Added to the instruction box. Edit it into a concrete instruction, then generate the recipe.', 'info')
+      addToast('This suggestion is review-only and has no automatic recipe step.', 'info')
       return
     }
     setSelectedSuggestionSteps((prev) => {
@@ -283,6 +280,18 @@ export default function App() {
     })
     setInstruction((prev) => (prev && prev.trim() ? `${prev}\n${text}` : text))
     recordWorkflowAction("source", "Suggestion used")
+  }
+  async function reviewSuggestion(s) {
+    const sourcePath = path || (uploadsList[0] && uploadsList[0].path)
+    const res = await fetch(`${BACKEND}/review-options`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: sourcePath, text: s.text, column: s.column || null }),
+    })
+    if (!res.ok) throw new Error(`review failed: ${res.status}`)
+    const payload = await res.json()
+    recordWorkflowAction("source", "Suggestion reviewed")
+    return payload.options || []
   }
   function removeSuggestionFromRecipe(s) {
     const text = ((s && s.text) || '').trim()
@@ -5029,6 +5038,7 @@ export default function App() {
                           selectedSteps={selectedSuggestionSteps}
                           onUse={addSuggestionToRecipe}
                           onUndo={removeSuggestionFromRecipe}
+                          onReview={reviewSuggestion}
                         />
                       </div>
                     )}
