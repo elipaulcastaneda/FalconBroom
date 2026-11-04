@@ -31,7 +31,7 @@ from .engine import (
     _suggest_buckets,
     _write_parquet,
     _write_csv,
-    _map_values,
+    _copy_text_columns,
     _string_transform_column,
     _fill_null_column,
     _unicode_normalize_column,
@@ -3516,6 +3516,7 @@ def apply_patch(spec: PatchSpec):
             cleaner.apply_recipe_from_spec(recipe_obj)
             upload_path = UPLOAD_DIR / out_name
             shutil.copyfile(out_path, upload_path)
+            _copy_text_columns(out_path, upload_path)
             stat = upload_path.stat()
             return {"patched_path": str(out_path.resolve()), "upload_path": str(upload_path.resolve()), "applied": len(recipe_obj.cleaning_steps), "size": stat.st_size, "modified_at": datetime.utcfromtimestamp(stat.st_mtime).isoformat() + "Z", "mode": "recipe"}
         # read source table as list of dicts

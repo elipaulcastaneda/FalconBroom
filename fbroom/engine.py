@@ -1490,12 +1490,63 @@ def _rename_column(df, old, new):
 
 def _write_csv(df, out_path):
     if _is_polars_df(df):
+        try:
+            nan_cols = [c for c, t in df.schema.items() if t in (pl.Float32, pl.Float64)]
+            if nan_cols:
+                df = df.with_columns([pl.col(c).fill_nan(None) for c in nan_cols])
+        except Exception:
+            pass
         return df.write_csv(out_path)
     else:
         try:
             return df.to_csv(out_path, index=False)
         except Exception:
             return None
+
+
+_TEXT_COLUMN_REGISTRY: dict = {}
+_CSV_NULL_VALUES = ["", "NA", "N/A", "null", "None"]
+
+
+def _file_key(path):
+    try:
+        p = Path(path).resolve()
+        st = p.stat()
+        return str(p), (st.st_size, st.st_mtime_ns)
+    except Exception:
+        return None, None
+
+
+def _register_text_columns(path, cols):
+    key, stamp = _file_key(path)
+    if key is None:
+        return
+    if cols:
+        _TEXT_COLUMN_REGISTRY[key] = (stamp, list(cols))
+    else:
+        _TEXT_COLUMN_REGISTRY.pop(key, None)
+
+
+def _copy_text_columns(src, dst):
+    """Carry the text-column record over when a result file is copied (e.g. into uploads)."""
+    key, stamp = _file_key(src)
+    entry = _TEXT_COLUMN_REGISTRY.get(key) if key else None
+    _register_text_columns(dst, entry[1] if entry and entry[0] == stamp else [])
+
+
+def _retyped_text_columns(df, written_path):
+    """Text columns that a plain re-read would retype (dates, numbers); reading them back as text keeps the chosen format."""
+    try:
+        if not _is_polars_df(df):
+            return []
+        text_cols = [c for c, t in df.schema.items() if t == pl.Utf8]
+        if not text_cols:
+            return []
+        back = pl.read_csv(written_path, columns=text_cols, infer_schema_length=1000, ignore_errors=True,
+                           truncate_ragged_lines=True, null_values=_CSV_NULL_VALUES, try_parse_dates=True)
+        return [c for c, t in back.schema.items() if t != pl.Utf8]
+    except Exception:
+        return []
 
 
 def _resolve_conflict_name(existing_names, desired_name):
@@ -2871,14 +2922,20 @@ def _percentile_bucketize(df, col, buckets):
 
 
 def _restore_leading_zero_columns(df, path, separator, read_kwargs):
-    """Numeric inference turns ZIP codes like 01234 into 1234; keep any numeric column whose raw text has leading zeros as text."""
+    """Numeric inference turns ZIP codes like 01234 into 1234; keep any numeric column whose raw text has leading zeros as text.
+
+    Columns that FalconBroom wrote as text (chosen date layouts, fixed decimal places) also stay text on re-read."""
     try:
-        numeric = [c for c, t in df.schema.items() if t.is_numeric()]
-        if not numeric:
+        key, stamp = _file_key(path)
+        entry = _TEXT_COLUMN_REGISTRY.get(key) if key else None
+        forced = [c for c in (entry[1] if entry and entry[0] == stamp else []) if c in df.columns and df.schema[c] != pl.Utf8]
+        numeric = [c for c, t in df.schema.items() if t.is_numeric() and c not in forced]
+        if not numeric and not forced:
             return df
-        raw = pl.read_csv(path, separator=separator, columns=numeric, infer_schema=False,
+        wanted = numeric + forced
+        raw = pl.read_csv(path, separator=separator, columns=wanted, infer_schema=False,
                           truncate_ragged_lines=True, null_values=read_kwargs.get("null_values"))
-        keep = [c for c in numeric if raw.get_column(c).str.contains(r"^\s*[+-]?0\d").any()]
+        keep = forced + [c for c in numeric if raw.get_column(c).str.contains(r"^\s*[+-]?0\d").any()]
         if not keep:
             return df
         return df.with_columns([raw.get_column(c).alias(c) for c in keep])
@@ -4469,6 +4526,7 @@ class Cleaner:
                 tmp = Path(tmp_f.name)
                 tmp_f.close()
                 _write_csv(df, str(tmp))
+                text_cols = _retyped_text_columns(df, str(tmp))
                 # atomic replace
                 try:
                     os.replace(str(tmp), str(out_p))
@@ -4479,6 +4537,7 @@ class Cleaner:
                         tmp.unlink()
                     except Exception:
                         pass
+                _register_text_columns(str(out_p), text_cols)
             except Exception:
                 # ensure we don't leave a dangling tmp
                 if tmp and tmp.exists():
