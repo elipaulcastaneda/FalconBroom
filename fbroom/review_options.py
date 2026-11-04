@@ -6,7 +6,10 @@ ordinary suggestion with `json_steps` that the normal Use -> Generate -> Apply f
 """
 from __future__ import annotations
 
+import csv
+import os
 import re
+import tempfile
 from collections import Counter
 from typing import Any
 
@@ -199,6 +202,119 @@ def _date_options(df, col: str, text: str) -> list[dict[str, Any]]:
             options.append(_entry(f"Standardize '{col}' to {label}{suffix}", [step], "fix", col, 0.6 if order == "month" else 0.5))
     return options
 
+
+
+# ---------------------------------------------------------------- reuse of the normal suggestion generators
+
+_SAMPLE = 5000
+_SIMULATE_ROWS = 100_000
+_cleaner = None
+
+
+def _effect(col: str, values: list, steps: list[dict[str, Any]]) -> tuple[int, int, int]:
+    """Run the steps on the whole column; returns (values changed, non-blank values emptied, rows dropped)."""
+    global _cleaner
+    from .engine import Cleaner
+    if _cleaner is None:
+        _cleaner = Cleaner()
+    values = values[:_SIMULATE_ROWS]
+    with tempfile.TemporaryDirectory() as folder:
+        path = os.path.join(folder, "column.csv")
+        with open(path, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow([col])
+            for v in values:
+                writer.writerow(["" if _blank(v) else str(v)])
+        preview = _cleaner.preview_recipe({"sources": [{"path": path}], "cleaning_steps": steps}, n=0)
+    before, after = preview.get("before") or [], preview.get("after") or []
+    if len(before) != len(after):
+        return 0, 0, len(before) - len(after)
+    changed = emptied = 0
+    for b, a in zip(before, after):
+        old, new = b.get(col), a.get(col)
+        if str(old if old is not None else "") != str(new if new is not None else ""):
+            changed += 1
+            if not _blank(old) and _blank(new):
+                emptied += 1
+    return changed, emptied, 0
+
+
+def _subsets(vals: list[str]) -> dict[str, list[str]]:
+    """Groups of values that fit one pattern, so the normal generators see a clean column."""
+    from .ingest import _classify_cell, _value_shape, _DATE_FORMATS, _parses_with
+    kinds = [_classify_cell(s) for s in vals]
+    groups: dict[str, list[str]] = {}
+    groups["numbers"] = [s for s, (k, _, _) in zip(vals, kinds) if k in ("numeric", "formatted", "affix")]
+    for unit in {x for k, _, x in kinds if k == "affix"}:
+        groups[f"unit:{unit}"] = [s for s, (k, _, x) in zip(vals, kinds) if k in ("numeric", "formatted") or (k == "affix" and x == unit)]
+    groups["dates"] = [s for s in vals if any(p.fullmatch(s) and _parses_with(s, f) for f, p in _DATE_FORMATS)]
+    for shape, count in Counter(_value_shape(s) for s in vals).most_common(3):
+        if count >= 3:
+            groups[f"shape:{shape}"] = [s for s in vals if _value_shape(s) == shape]
+    return {k: v for k, v in groups.items() if 2 <= len(v) < len(vals)}
+
+
+def _extra_options(col: str, vals: list[str]) -> list[dict[str, Any]]:
+    from .ingest import _classify_cell
+    n = len(vals)
+    kinds = [_classify_cell(s)[0] for s in vals]
+    options: list[dict[str, Any]] = []
+    numberish = sum(1 for k in kinds if k in ("numeric", "formatted", "affix"))
+    if numberish and numberish / n >= 0.5 and numberish < n:
+        options.append(_entry(
+            f"Drop the rows where '{col}' is not a number",
+            [{"action": "drop_rows", "column": col, "params": {"issue": "not_numeric"}}], "drop_rows", col, 0.4))
+    stray = [s for s, k in zip(vals, kinds) if k == "text" and re.search(r"\d", s) and re.fullmatch(r"[A-Za-z]{1,3}\d[\d.,]*|\d[\d.,]*[A-Za-z]{1,3}", s)]
+    if stray and (numberish + len(stray)) / n >= 0.5:
+        shown = ", ".join(repr(s) for s in list(dict.fromkeys(stray))[:3])
+        letters = {"action": "regex_replace", "column": col, "params": {"pattern": r"[A-Za-z]+", "replace": ""}}
+        options.append(_entry(f"Remove stray letters from the numbers in '{col}' ({len(stray)} values like {shown})", [letters], "fix", col, 0.5))
+        options.append(_entry(f"Remove stray letters from '{col}' ({len(stray)} values like {shown}), then convert it to a number",
+                              [letters, {"action": "cast", "column": col, "params": {"to": "float"}}], "fix", col, 0.45))
+    day_month = [s for s in vals if re.fullmatch(r"\d{1,2}[- ][A-Za-z]{3,9}", s)]
+    if len(day_month) >= max(2, n // 2):
+        options.append(_entry(
+            f"Rewrite the day-month values in '{col}' (e.g. {day_month[0]}) as month then day (Sep 30); the values have no year, so they stay text",
+            [{"action": "regex_replace", "column": col, "params": {"pattern": r"^(\d{1,2})[- ]([A-Za-z]{3})[A-Za-z]*$", "replace": r"\2 \1"}}],
+            "fix", col, 0.5))
+    return options
+
+
+def _relaxed_options(df, col: str) -> list[dict[str, Any]]:
+    """Fix suggestions the generators would make if the column were cleaner, built from the values that fit."""
+    from .ingest import _analyze_column
+    values = df[col].to_list()
+    vals = [str(v).strip() for v in values if not _blank(v)][:_SAMPLE]
+    if len(vals) < 2:
+        return []
+    candidates: list[dict[str, Any]] = []
+    for subset in _subsets(vals).values():
+        try:
+            result = _analyze_column(col, subset)
+        except Exception:
+            continue
+        for entry in (result or {}).get("entries", []):
+            steps = entry.get("json_steps") or []
+            if steps and not any(s.get("action") == "drop_rows" for s in steps):
+                candidates.append(_entry(entry["text"], steps, "fix", col, min(float(entry.get("confidence") or 0.5), 0.7)))
+    candidates.extend(_extra_options(col, vals))
+    kept: list[dict[str, Any]] = []
+    for option in candidates:
+        try:
+            changed, emptied, dropped = _effect(col, values, option["json_steps"])
+        except Exception:
+            continue
+        if not (changed or dropped):
+            continue
+        if dropped:
+            option["text"] += f" (removes {dropped} row(s))"
+        else:
+            tail = f"changes {changed} value(s)" + (f" and empties {emptied} that do not fit" if emptied else "")
+            option["text"] += f" [on the whole column this {tail}]"
+        kept.append(option)
+    return kept
+
+
 def review_options(path: str, text: str, column: str | None = None) -> list[dict[str, Any]]:
     """Concrete suggestions for one review-only note (empty list when none can be offered safely)."""
     df = _read_table(path)
@@ -228,4 +344,9 @@ def review_options(path: str, text: str, column: str | None = None) -> list[dict
         found = _column_options(df, column, text)
     else:
         found = []
-    return found
+    if not df[column].dtype.is_temporal():
+        found = found + _relaxed_options(df, column)
+    unique: dict[str, dict[str, Any]] = {}
+    for option in found:
+        unique.setdefault(repr(option["json_steps"]), option)
+    return list(unique.values())
