@@ -2870,6 +2870,22 @@ def _percentile_bucketize(df, col, buckets):
         return df
 
 
+def _restore_leading_zero_columns(df, path, separator, read_kwargs):
+    """Numeric inference turns ZIP codes like 01234 into 1234; keep any numeric column whose raw text has leading zeros as text."""
+    try:
+        numeric = [c for c, t in df.schema.items() if t.is_numeric()]
+        if not numeric:
+            return df
+        raw = pl.read_csv(path, separator=separator, columns=numeric, infer_schema=False,
+                          truncate_ragged_lines=True, null_values=read_kwargs.get("null_values"))
+        keep = [c for c in numeric if raw.get_column(c).str.contains(r"^\s*[+-]?0\d").any()]
+        if not keep:
+            return df
+        return df.with_columns([raw.get_column(c).alias(c) for c in keep])
+    except Exception:
+        return df
+
+
 def _read_table(path: str):
     if pl is None:
         raise RuntimeError("Polars not installed. See requirements.txt to install dependencies.")
@@ -2901,6 +2917,7 @@ def _read_table(path: str):
             try:
                 logger.info("_read_table trying separator '%s' for %s", separator, materialized_path)
                 df = pl.read_csv(materialized_path, separator=separator, **read_kwargs)
+                df = _restore_leading_zero_columns(df, materialized_path, separator, read_kwargs)
                 logger.info("_read_table csv read ok with separator '%s', columns=%s", separator, list(df.columns if _is_polars_df(df) else list(df.columns)))
                 break
             except Exception as e:
