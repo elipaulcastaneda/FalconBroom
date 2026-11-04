@@ -266,7 +266,10 @@ export default function App() {
   function addSuggestionToRecipe(s) {
     const text = (s && s.text) || ''
     if (!Array.isArray(s?.json_steps) || !s.json_steps.length) {
-      addToast('This suggestion is review-only and has no automatic recipe step.', 'info')
+      // Reviewed note: goes into the instruction box so the user can edit it into a concrete instruction.
+      setInstruction((prev) => (prev && prev.trim() ? `${prev}\n${text}` : text))
+      recordWorkflowAction("source", "Suggestion reviewed and used")
+      addToast('Added to the instruction box. Edit it into a concrete instruction, then generate the recipe.', 'info')
       return
     }
     setSelectedSuggestionSteps((prev) => {

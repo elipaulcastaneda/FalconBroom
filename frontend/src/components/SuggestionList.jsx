@@ -32,15 +32,19 @@ function isAdded(s, selectedKeys) {
   return isReady(s) && s.json_steps.every((step) => selectedKeys.has(JSON.stringify(step)))
 }
 
-function suggestionKey(s) {
-  return JSON.stringify(s.json_steps || s.text)
+function markNote(setter, text, on) {
+  setter((prev) => {
+    const next = new Set(prev)
+    if (on) next.add(text); else next.delete(text)
+    return next
+  })
 }
 
 export default function SuggestionList({ suggestions, selectedSteps, onUse, onUndo }) {
   const [filter, setFilter] = useState('all')
   const [query, setQuery] = useState('')
-  const [reviewedKeys, setReviewedKeys] = useState(() => new Set())
-  const markReviewed = (s) => setReviewedKeys((prev) => new Set(prev).add(suggestionKey(s)))
+  const [reviewed, setReviewed] = useState(() => new Set())
+  const [usedNotes, setUsedNotes] = useState(() => new Set())
 
   const selectedKeys = useMemo(() => new Set((selectedSteps || []).map((step) => JSON.stringify(step))), [selectedSteps])
 
@@ -158,30 +162,32 @@ export default function SuggestionList({ suggestions, selectedSteps, onUse, onUn
                             Undo
                           </button>
                         </>
-                      ) : reviewedKeys.has(suggestionKey(s)) ? (
-                        <button type="button" onClick={() => onUse(s)}>Use</button>
                       ) : (
+                        <button type="button" onClick={() => onUse(s)}>Use</button>
+                      )
+                    ) : usedNotes.has(s.text) ? (
+                      <>
+                        <span className="sg-note">Added</span>
                         <button
                           type="button"
                           className="secondary"
-                          title="Look at exactly what this suggestion will do before you can use it"
-                          onClick={() => markReviewed(s)}
+                          title="Remove this note from the instruction box"
+                          onClick={() => { onUndo && onUndo(s); markNote(setUsedNotes, s.text, false); markNote(setReviewed, s.text, false) }}
                         >
-                          Review
+                          Undo
                         </button>
-                      )
+                      </>
+                    ) : reviewed.has(s.text) ? (
+                      <button type="button" onClick={() => { onUse(s); markNote(setUsedNotes, s.text, true) }}>Use</button>
                     ) : (
-                      <span className="sg-note">Needs your judgement</span>
-                    )}
-                    {isReady(s) && !added && reviewedKeys.has(suggestionKey(s)) && (
-                      <div className="sg-review" style={{ gridColumn: '1 / -1', fontSize: '0.85rem', color: 'var(--muted)' }}>
-                        Will run: {s.json_steps.map((step, n) => (
-                          <code key={n} style={{ marginRight: 8 }}>
-                            {step.action}{step.column ? ` on ${step.column}` : ''}
-                            {step.params && Object.keys(step.params).length ? ` ${JSON.stringify(step.params)}` : ''}
-                          </code>
-                        ))}
-                      </div>
+                      <button
+                        type="button"
+                        className="secondary"
+                        title="Look this over first; Use becomes available afterwards"
+                        onClick={() => markNote(setReviewed, s.text, true)}
+                      >
+                        Review
+                      </button>
                     )}
                   </li>
                 )
