@@ -1222,7 +1222,7 @@ def _unicode_normalize_column(df, col, form: str = "NFKC", remove_diacritics: bo
 
 def _unique_df(df, subset=None):
     if _is_polars_df(df):
-        return df.unique(subset=subset, keep="first")
+        return df.unique(subset=subset, keep="first", maintain_order=True)
     else:
         try:
             return df.drop_duplicates(subset=subset, keep="first")

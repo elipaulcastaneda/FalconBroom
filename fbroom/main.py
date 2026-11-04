@@ -644,7 +644,8 @@ class SourceResolveSpec(BaseModel):
 
 class PatchSpec(BaseModel):
     path: str
-    patches: list
+    patches: list = []
+    recipe: Optional[dict] = None
 
 
 class SnapshotCleanupSpec(BaseModel):
@@ -3501,6 +3502,22 @@ def apply_recipe(recipe: Recipe):
 @app.post("/apply-patch")
 def apply_patch(spec: PatchSpec):
     try:
+        if spec.recipe:
+            # run every recipe step on the whole file so row-changing steps (drops, dedupe) are honored
+            out_name = f"patched_{Path(spec.path).stem}_{uuid4().hex[:8]}.csv"
+            out_path = OUTPUTS_DIR / out_name
+            recipe_dict = dict(spec.recipe)
+            recipe_dict["sources"] = [{"path": spec.path}]
+            recipe_dict["outputs"] = [{"path": str(out_path)}]
+            try:
+                recipe_obj = Recipe.model_validate(recipe_dict)
+            except Exception:
+                recipe_obj = Recipe.parse_obj(recipe_dict)
+            cleaner.apply_recipe_from_spec(recipe_obj)
+            upload_path = UPLOAD_DIR / out_name
+            shutil.copyfile(out_path, upload_path)
+            stat = upload_path.stat()
+            return {"patched_path": str(out_path.resolve()), "upload_path": str(upload_path.resolve()), "applied": len(recipe_obj.cleaning_steps), "size": stat.st_size, "modified_at": datetime.utcfromtimestamp(stat.st_mtime).isoformat() + "Z", "mode": "recipe"}
         # read source table as list of dicts
         df = _read_table(spec.path)
         rows = df.to_dicts()

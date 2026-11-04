@@ -2085,6 +2085,52 @@ export default function App() {
     }
     const before = (usePreview && usePreview.before) || []
     const after = (usePreview && usePreview.after) || []
+    let recipeForApply = null
+    try {
+      if (recipeText && recipeText.trim()) recipeForApply = JSON.parse(recipeText)
+    } catch { recipeForApply = null }
+    if (!recipeForApply) recipeForApply = recipeFromText || null
+    const rowsAligned = before.length === after.length
+    let totalChanged = 0
+    if (rowsAligned) {
+      for (let i = 0; i < before.length; i++) {
+        const b = before[i] || {}
+        const a = after[i] || {}
+        for (const col of new Set([...Object.keys(b), ...Object.keys(a)])) {
+          if (String(b[col] ?? '') !== String(a[col] ?? '')) totalChanged++
+        }
+      }
+    }
+    const selectedCount = Object.keys(selectedCells || {}).length
+    // Cell patches pair rows by position, so they only work while no step dropped rows and every change is selected-or-partial.
+    const runWholeRecipe = !!recipeForApply && selectedCount > 0 && (!rowsAligned || selectedCount >= totalChanged)
+    if (runWholeRecipe) {
+      try {
+        persistWorkflowCheckpoint("source")
+        const res = await fetch(`${BACKEND}/apply-patch`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path, patches: [], recipe: recipeForApply })
+        })
+        if (!res.ok) {
+          addToast('Apply selected failed: ' + (await res.text()), 'error')
+          return
+        }
+        const j = await res.json()
+        addToast(`Applied all ${j.applied || 0} recipe steps to the whole file`, 'success')
+        recordWorkflowAction("source", "Applied the full recipe from Apply Selected")
+        if (j && (j.upload_path || j.patched_path)) {
+          const usePath = j.upload_path || j.patched_path
+          const parts = String(usePath).split(/\\|\//)
+          const newItem = { name: parts[parts.length - 1], path: usePath, size: j.size || 0, modified_at: j.modified_at || new Date().toISOString() }
+          setUploadsList((u) => [newItem, ...(u || []).filter(x => x.path !== newItem.path)])
+          try { await openUploadItem(newItem, { preserveRecipe: true }) } catch (err) { console.warn('Failed opening patched item', err) }
+        }
+        setSelectedCells({})
+      } catch (e) {
+        addToast('Apply selected failed: ' + (e.message || e), 'error')
+      }
+      return
+    }
     Object.keys(selectedCells || {}).forEach((k) => {
       const [r, col] = k.split('|')
       const ri = Number(r)
