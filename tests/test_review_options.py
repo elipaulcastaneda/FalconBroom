@@ -55,3 +55,23 @@ def test_unrecognized_note_has_no_options(tmp_path):
     client = TestClient(app)
     res = client.post("/review-options", json={"path": str(src), "text": "Something else about 'state'", "column": "state"})
     assert res.json()["options"] == []
+
+
+def test_column_removal_options_remove_only_that_column(tmp_path):
+    src = tmp_path / "people.csv"
+    with open(src, "w", newline="", encoding="utf-8") as h:
+        w = csv.writer(h)
+        w.writerow(["id", "contact_email", "city"])
+        w.writerows([[i, f"user{i}@example.com", "Paris" if i % 2 else ""] for i in range(1, 61)])
+    client = TestClient(app)
+    note = "Column 'contact_email' contains email addresses."
+    options = client.post("/review-options", json={"path": str(src), "text": note, "column": "city"}).json()["options"]
+    options += client.post("/review-options", json={"path": str(src), "text": "Review column 'city' (30 nulls); no automatic change is suggested.", "column": "city"}).json()["options"]
+    removals = [o for o in options if any(s["action"] == "drop_column" for s in o["json_steps"])]
+    assert removals
+    for i, option in enumerate(removals):
+        assert "row" not in option["text"].lower()
+        rows = _apply(client, src, option["json_steps"], tmp_path / f"rm{i}.csv")
+        dropped = {s["column"] for s in option["json_steps"] if s["action"] == "drop_column"}
+        assert len(dropped) == 1 and len(rows) == 60
+        assert set(rows[0]) == {"id", "contact_email", "city"} - dropped
