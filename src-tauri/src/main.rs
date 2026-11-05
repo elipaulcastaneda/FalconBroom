@@ -292,7 +292,15 @@ fn main() {
             // Add the webview as a child to the window at position 0,0 and
             // the window's current inner size.
             let size = window.inner_size()?;
-            let _webview = window.add_child(webview_builder, tauri::LogicalPosition::new(0.0, 0.0), size)?;
+            let webview = window.add_child(webview_builder, tauri::LogicalPosition::new(0.0, 0.0), size)?;
+
+            // A child webview does not follow the window, so keep it filling the window on resize/maximize.
+            let follower = webview.clone();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::Resized(new_size) = event {
+                    let _ = follower.set_size(*new_size);
+                }
+            });
 
             Ok(())
         });
