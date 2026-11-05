@@ -533,18 +533,6 @@ export default function App() {
   const workflowActiveTab = useRef(activeTab)
   const workflowAutosaveTimer = useRef(null)
 
-  const profileCount = profile ? Object.keys(profile).length : 0
-  const suggestedCount = suggest ? suggest.length : 0
-  const previewCount = preview ? preview.before?.length || 0 : 0
-  const recipeSteps = useMemo(() => {
-    try {
-      const parsed = recipeText ? JSON.parse(recipeText) : null
-      return parsed?.cleaning_steps?.length || 0
-    } catch {
-      return 0
-    }
-  }, [recipeText])
-
   // Large selections are transient (they point at preview rows that aren't restored on resume),
   // and serializing them into localStorage on every save freezes the UI.
   const MAX_PERSISTED_SELECTED_CELLS = 200
@@ -2351,26 +2339,6 @@ export default function App() {
     uploadInputRef.current?.click()
   }
 
-  async function doSuggest() {
-    const res = await fetch(`${BACKEND}/suggest`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path }),
-    })
-    const j = await res.json()
-    setSuggest(j.suggestions)
-    const rec = {
-      sources: [{ path }],
-      cleaning_steps: j.suggestions.map((s) => ({
-        action: s.action,
-        column: s.column,
-        params: { strategy: s.strategy },
-      })),
-      outputs: [{ path: "output_preview.csv" }],
-    }
-    setRecipeText(JSON.stringify(rec, null, 2))
-  }
-
   async function doCleaningSuggestions() {
     const res = await fetch(`${BACKEND}/cleaning-suggestions`, {
       method: "POST",
@@ -3463,61 +3431,6 @@ export default function App() {
   }, [])
 
   function renderTab() {
-    if (activeTab === "overview") {
-      return (
-        <div className="tab-stack tab-panel">
-          <Card
-            eyebrow="Workspace"
-            title="Analyst-friendly workflow"
-            subtitle="Profile data, author a recipe, inspect join hints, then preview the result before writing anything out."
-          >
-            <div className="overview-grid">
-              <Stat label="Columns profiled" value={formatCount(profileCount)} tone="blue" />
-              <Stat label="Suggested steps" value={formatCount(suggestedCount)} tone="violet" />
-              <Stat label="Preview rows" value={formatCount(previewCount)} tone="teal" />
-              <Stat label="Recipe steps" value={formatCount(recipeSteps)} tone="amber" />
-            </div>
-            <div className="button-row button-row-tight">
-              <button className="primary" onClick={openUploadPicker}>Upload file</button>
-              <button onClick={doProfile}>Profile data</button>
-              <button onClick={doSuggest}>Suggest recipe</button>
-              <button onClick={doPreview}>Preview</button>
-            </div>
-          </Card>
-
-          <div className="two-up">
-            <Card eyebrow="Quick start" title="Open a dataset" subtitle="Load a CSV, then let the engine suggest the next move.">
-              <label>Local CSV path</label>
-              <input value={path} onChange={(e) => setPath(e.target.value)} placeholder="C:/data/customers.csv" />
-              <label>Plain-English instruction</label>
-              <textarea
-                value={instruction}
-                onChange={(e) => setInstruction(e.target.value)}
-                rows={4}
-                placeholder="e.g. fill missing age values, lowercase email, and remove duplicate customers"
-              />
-            </Card>
-
-            <Card eyebrow="Theme" title="Appearance" subtitle="Toggle between dark and light modes for different work sessions.">
-              <div className="theme-toggle-panel">
-                <div>
-                  <strong>{theme === "light" ? "Light theme" : "Dark theme"}</strong>
-                  <p>Switch the interface to match your environment and reading preference.</p>
-                </div>
-                <button
-                  className="theme-toggle"
-                  onClick={() => persistTheme(theme === "dark" ? "light" : "dark")}
-                  aria-pressed={theme === "light"}
-                >
-                  {theme === "light" ? "Switch to dark" : "Switch to light"}
-                </button>
-              </div>
-            </Card>
-          </div>
-        </div>
-      )
-    }
-
     if (activeTab === "source") {
       return (
         <div className="tab-stack tab-panel">
@@ -4311,6 +4224,20 @@ export default function App() {
     if (activeTab === "settings") {
       return (
         <div className="tab-stack tab-panel">
+          <Card eyebrow="Appearance" title="Theme" subtitle="Switch between dark and light modes.">
+            <div className="theme-toggle-panel">
+              <div>
+                <strong>{theme === "light" ? "Light theme" : "Dark theme"}</strong>
+              </div>
+              <button
+                className="theme-toggle"
+                onClick={() => persistTheme(theme === "dark" ? "light" : "dark")}
+                aria-pressed={theme === "light"}
+              >
+                {theme === "light" ? "Switch to dark" : "Switch to light"}
+              </button>
+            </div>
+          </Card>
           <Card eyebrow="Account" title="Settings" subtitle="Manage your account and privacy preferences">
             <div style={{display:'grid',gridTemplateColumns:'1fr',gap:12}}>
               <div>
@@ -4703,6 +4630,15 @@ export default function App() {
               </div>
             </div>
           </Card>
+
+          <Card eyebrow="About" title="Data credits" subtitle="Reference data used by the cleaning suggestions.">
+            <p style={{ margin: 0 }}>
+              Place names used to recognise cities, regions and countries come from{' '}
+              <a href="https://www.geonames.org" target="_blank" rel="noreferrer">GeoNames</a>, licensed under{' '}
+              <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noreferrer">CC BY 4.0</a>.
+              The data was reduced to a name list.
+            </p>
+          </Card>
         </div>
       )
     }
@@ -4895,31 +4831,6 @@ export default function App() {
           })}
         </nav>
 
-        <div className="rail-footer">
-          <div className="rail-metric">
-            <span>Theme</span>
-            <strong>{theme === "light" ? "Light" : "Dark"}</strong>
-          </div>
-          <button className="theme-toggle" onClick={() => persistTheme(theme === "dark" ? "light" : "dark")}>
-            {theme === "light" ? "Switch to dark" : "Switch to light"}
-          </button>
-          <div className="rail-actions">
-            <button onClick={openUploadPicker}>Upload file</button>
-            <button onClick={doProfile}>Profile data</button>
-            <button className="primary" onClick={doSuggest}>Suggest recipe</button>
-          </div>
-          {!railCollapsed && (
-            <details className="data-credits" style={{ fontSize: '0.75rem', color: 'var(--muted)', marginTop: 8 }}>
-              <summary style={{ cursor: 'pointer' }}>Data credits</summary>
-              <p style={{ margin: '6px 0 0' }}>
-                Place names used to recognise cities, regions and countries come from{' '}
-                <a href="https://www.geonames.org" target="_blank" rel="noreferrer">GeoNames</a>, licensed under{' '}
-                <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noreferrer">CC BY 4.0</a>.
-                The data was reduced to a name list.
-              </p>
-            </details>
-          )}
-        </div>
       </aside>
 
       <main className="main-pane">

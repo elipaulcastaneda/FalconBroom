@@ -450,48 +450,6 @@ p {
   justify-content: center;
 }
 
-.rail-footer {
-  margin-top: auto;
-  padding-top: 0.5rem;
-  border-top: var(--border-width, 1px) solid var(--border);
-}
-
-.rail-actions {
-  display: grid;
-  gap: 0.6rem;
-  margin-top: 0.9rem;
-}
-
-.rail-actions button {
-  width: 100%;
-}
-
-.side-rail.side-rail-collapsed .rail-actions {
-  gap: 0.45rem;
-}
-
-.side-rail.side-rail-collapsed .rail-actions button {
-  padding-inline: 0.65rem;
-}
-
-.rail-metric {
-  margin-bottom: 0.75rem;
-}
-
-.rail-metric span {
-  display: block;
-  font-size: 0.76rem;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--muted);
-}
-
-.rail-metric strong {
-  display: block;
-  margin-top: 0.3rem;
-  font-size: 1.08rem;
-}
-
 .main-pane {
   min-width: 0;
   display: grid;
