@@ -5310,18 +5310,20 @@ export default function App() {
                   <select defaultValue="csv" ref={runFormatRef}>
                     <option value="csv">CSV</option>
                     <option value="xlsx">XLSX</option>
+                    <option value="pkl">PKL</option>
+                    <option value="sqlite">SQLITE</option>
                   </select>
                 </label>
                 <button onClick={() => runSavedRecipe(runFormatRef.current?.value || 'csv')} disabled={!recipeId || recipeStatus !== 'approved'}>Run</button>
-                <button onClick={() => runAndDownloadSavedRecipe(runFormatRef.current?.value || 'csv')} disabled={!recipeId || recipeStatus !== 'approved'}>{runDownloadLoading ? 'Running…' : 'Run & Download'}</button>
-                <button title="Debug: show logs and attempt run+download" onClick={() => debugRunDownload(runFormatRef.current?.value || 'csv')}>Debug Run & Download</button>
+                <button onClick={() => runAndDownloadSavedRecipe('csv')} disabled={!recipeId || recipeStatus !== 'approved' || runDownloadLoading}>{runDownloadLoading ? 'Running…' : 'Run & Download CSV'}</button>
+                <button onClick={() => runAndDownloadSavedRecipe('xlsx')} disabled={!recipeId || recipeStatus !== 'approved' || runDownloadLoading}>Run &amp; Download XLSX</button>
+                <button onClick={() => runAndDownloadSavedRecipe('pkl')} disabled={!recipeId || recipeStatus !== 'approved' || runDownloadLoading}>Run &amp; Download PKL</button>
+                <button onClick={() => runAndDownloadSavedRecipe('sqlite')} disabled={!recipeId || recipeStatus !== 'approved' || runDownloadLoading}>Run &amp; Download SQLITE</button>
+                {/* Google Sheets export is not connected yet.
                 <button onClick={exportToSheets} disabled={!recipeId}>Export to Google Sheets</button>
                 <input placeholder="target user id or email" value={exportTargetUser} onChange={(e)=>setExportTargetUser(e.target.value)} style={{marginLeft:8,width:220}} />
-                <label style={{display:'inline-flex',alignItems:'center',gap:8,marginLeft:8}}>
-                  <input type="checkbox" checked={previewAddRowIndex} onChange={(e)=>setPreviewAddRowIndex(e.target.checked)} />
-                  <small style={{color:'var(--muted)'}}>Include row index (#)</small>
-                </label>
-                <button onClick={() => downloadPreviewCsv()} disabled={!displayPreview}>Download CSV</button>
+                */}
+                <button disabled title="Google Sheets export is coming soon">Export to Google Sheets (coming soon)</button>
               </div>
             </div>
           </div>

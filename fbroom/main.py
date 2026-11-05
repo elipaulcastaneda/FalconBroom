@@ -2012,7 +2012,6 @@ def run_recipe(rid: str, request: Request, export_format: str = "csv"):
                 except Exception:
                     recipe_obj = recipe
         result = cleaner.apply_recipe_from_spec(recipe_obj)
-        result = cleaner.apply_recipe_from_spec(recipe_obj)
         out_path = result.get("written") if isinstance(result, dict) else None
         diagnostics = result.get("diagnostics") if isinstance(result, dict) else None
         # Ensure output is copied into the canonical outputs directory so the
@@ -2065,6 +2064,34 @@ def run_recipe(rid: str, request: Request, export_format: str = "csv"):
             except Exception as exc:
                 # conversion failed; keep CSV but note warning
                 run_record.setdefault("warnings", []).append(f"xlsx conversion failed: {exc}")
+        elif export_format.lower() in ("pkl", "pandas", "sqlite", "sql"):
+            try:
+                tabular = _read_table(out_path)
+                if export_format.lower() in ("pkl", "pandas"):
+                    pkl_path = str(Path(out_path).with_suffix('.pkl'))
+                    tabular.to_pandas().to_pickle(pkl_path)
+                    exported = pkl_path
+                else:
+                    import sqlite3
+                    db_path = str(Path(out_path).with_suffix('.sqlite'))
+                    if os.path.exists(db_path):
+                        os.remove(db_path)
+                    names = list(tabular.columns)
+                    con = sqlite3.connect(db_path)
+                    try:
+                        quoted = ", ".join('"' + n.replace('"', '""') + '"' for n in names)
+                        con.execute(f"CREATE TABLE data ({quoted})")
+                        con.executemany(
+                            f"INSERT INTO data VALUES ({','.join('?' for _ in names)})",
+                            tabular.iter_rows(),
+                        )
+                        con.commit()
+                    finally:
+                        con.close()
+                    exported = db_path
+            except Exception as exc:
+                run_record.setdefault("warnings", []).append(f"{export_format} export failed: {exc}")
+                raise
 
         # finalize run record
         run_record["status"] = "completed"
