@@ -62,6 +62,16 @@ jobs:
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
 
+      - name: Verify Supabase settings were baked into the frontend
+        shell: pwsh
+        run: |
+          $url = "${{ secrets.VITE_SUPABASE_URL }}".Trim().Trim('"',"'")
+          if (-not $url) { throw "VITE_SUPABASE_URL secret is empty or not visible to this workflow" }
+          $hostName = ([Uri]$url).Host
+          $hit = Get-ChildItem frontend/dist -Recurse -Filter *.js | Select-String -SimpleMatch $hostName -List
+          if (-not $hit) { throw "Built frontend does not contain $hostName; sign-in would fail" }
+          "Supabase host $hostName found in the built frontend"
+
       - name: Write checksums
         shell: pwsh
         run: |
