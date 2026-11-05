@@ -52,7 +52,35 @@ html, body, #root {
   --teal: #0f9f8f;
   --blue: #2563eb;
   --amber: #b45309;
-  --violet: #7c3aed;
+}
+
+/* Light theme: the page around the panels turns light; the panels keep the dark look. */
+.app-shell[data-theme="light"],
+.auth-page[data-theme="light"] {
+  background: linear-gradient(180deg, #eef3fb 0%, #f7faff 100%);
+}
+
+[data-theme="light"] .card,
+[data-theme="light"] .side-rail,
+[data-theme="light"] .main-pane {
+  color-scheme: dark;
+  --panel: rgba(12, 19, 34, 0.72);
+  --panel-strong: rgba(14, 23, 40, 0.92);
+  --border: rgba(148, 163, 184, 0.16);
+  --border-strong: rgba(148, 163, 184, 0.24);
+  --text: #e5eefc;
+  --muted: #96a4bd;
+  --muted-strong: #b9c4d8;
+  --shadow: 0 24px 60px rgba(15, 23, 42, 0.28);
+  --primary: #7c3aed;
+  --primary-strong: #8b5cf6;
+  --primary-hover: #e6ddff;
+  --primary-strong-hover: #f3efff;
+  --teal: #14b8a6;
+  --blue: #3b82f6;
+  --amber: #f59e0b;
+  --violet: #8b5cf6;
+  color: var(--text);
 }
 
 * {
@@ -119,11 +147,6 @@ textarea {
   padding: 0.9rem 1rem;
   outline: none;
   transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
-}
-
-[data-theme="light"] input,
-[data-theme="light"] textarea {
-  background: rgba(255, 255, 255, 0.88);
 }
 
 input:focus,
@@ -273,10 +296,6 @@ p {
   backdrop-filter: blur(22px);
   position: relative;
   overflow: hidden;
-}
-
-[data-theme="light"] .card {
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.88), rgba(247, 250, 255, 0.9));
 }
 
 .card::before {
@@ -568,10 +587,6 @@ p {
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.015));
 }
 
-[data-theme="light"] .stat {
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.82), rgba(255, 255, 255, 0.6));
-}
-
 .stat span {
   display: block;
   font-size: 0.76rem;
@@ -615,11 +630,6 @@ p {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   font-size: 0.84rem;
   line-height: 1.55;
-}
-
-[data-theme="light"] .json-block {
-  background: rgba(248, 250, 255, 0.92);
-  color: #0f172a;
 }
 
 .json-block-soft {
