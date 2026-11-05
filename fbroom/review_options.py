@@ -300,6 +300,10 @@ def _relaxed_options(df, col: str) -> list[dict[str, Any]]:
     candidates.extend(_extra_options(col, vals))
     kept: list[dict[str, Any]] = []
     for option in candidates:
+        if any(s.get("action") == "drop_column" for s in option["json_steps"]):
+            # Removing a column leaves no column to compare, and it never removes rows.
+            kept.append(option)
+            continue
         try:
             changed, emptied, dropped = _effect(col, values, option["json_steps"])
         except Exception:
