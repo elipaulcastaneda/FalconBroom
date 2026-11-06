@@ -55,6 +55,19 @@ jobs:
       - name: Install Tauri CLI
         run: cargo install tauri-cli --version "^2.10" --locked
 
+      - name: Optional override from Actions variables
+        shell: pwsh
+        run: |
+          $u = "${{ vars.VITE_SUPABASE_URL }}".Trim()
+          $k = "${{ vars.VITE_SUPABASE_ANON_KEY }}".Trim()
+          if ($u -and $k) {
+            "VITE_SUPABASE_URL=$u" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+            "VITE_SUPABASE_ANON_KEY=$k" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+            "Using Supabase settings from Actions variables"
+          } else {
+            "No Actions variables set; using frontend/.env.production"
+          }
+
       - name: Build installer
         run: cargo tauri build --bundles nsis
         working-directory: src-tauri
@@ -64,6 +77,7 @@ jobs:
         run: |
           $line = Get-Content frontend/.env.production | Where-Object { $_ -like 'VITE_SUPABASE_URL=*' } | Select-Object -First 1
           $url = ($line -replace '^VITE_SUPABASE_URL=', '').Trim()
+          if ($env:VITE_SUPABASE_URL) { $url = $env:VITE_SUPABASE_URL.Trim() }
           if (-not $url) { throw "VITE_SUPABASE_URL missing from frontend/.env.production" }
           $hostName = ([Uri]$url).Host
           $hit = Get-ChildItem frontend/dist -Recurse -Filter *.js | Select-String -SimpleMatch $hostName -List
