@@ -26,6 +26,8 @@ __pycache__/
 # Frontend env (keep local secrets out of git)
 frontend/.env
 frontend/.env.*
+# Public Supabase URL + anon key (shipped in every build by design)
+!frontend/.env.production
 
 # Editor/IDE
 .vscode/
