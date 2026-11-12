@@ -10,6 +10,7 @@ use keyring::Entry;
 struct BackendChild(Arc<Mutex<Option<Child>>>);
 
 struct BackendPort(u16);
+struct BackendSecret(String);
 
 impl BackendChild {
     fn empty() -> Self {
@@ -94,7 +95,7 @@ fn find_bundled_backend() -> Option<PathBuf> {
     if p.exists() { Some(p) } else { None }
 }
 
-fn spawn_backend(port: u16, data_dir: &std::path::Path) -> Result<Child, String> {
+fn spawn_backend(port: u16, data_dir: &std::path::Path, secret: &str) -> Result<Child, String> {
     let parent_pid = std::process::id().to_string();
     let port_s = port.to_string();
 
@@ -116,6 +117,7 @@ fn spawn_backend(port: u16, data_dir: &std::path::Path) -> Result<Child, String>
         c
     };
 
+    cmd.env("FALCONBROOM_DESKTOP_SECRET", secret);
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)]
     {
@@ -127,7 +129,7 @@ fn spawn_backend(port: u16, data_dir: &std::path::Path) -> Result<Child, String>
 
 // Command exposed to frontend: opens native file dialog and posts the selected path to the backend /profile endpoint.
 #[tauri::command]
-fn pick_file_and_profile(port: tauri::State<'_, BackendPort>) -> Result<Value, String> {
+fn pick_file_and_profile(port: tauri::State<'_, BackendPort>, secret: tauri::State<'_, BackendSecret>) -> Result<Value, String> {
     let path = rfd::FileDialog::new()
         .add_filter("CSV", &["csv"])
         .pick_file();
@@ -167,6 +169,7 @@ fn pick_file_and_profile(port: tauri::State<'_, BackendPort>) -> Result<Value, S
         let body = serde_json::json!({"path": path});
         client
             .post(url)
+            .header("X-FalconBroom-Desktop-Token", &secret.0)
             .json(&body)
             .send()
             .map_err(|e| format!("Failed to call backend: {}", e))?
@@ -186,15 +189,8 @@ fn secure_store_get(key: String) -> Result<Option<String>, String> {
     let kr = Entry::new(service, &key);
     match kr.get_password() {
         Ok(pw) => Ok(Some(pw)),
-        Err(e) => {
-            // If no entry found, return Ok(None). For other errors, return Err with message.
-            let s = format!("{}", e);
-            if s.contains("No entry") || s.contains("no entry") {
-                Ok(None)
-            } else {
-                Err(format!("secure_store_get error: {}", s))
-            }
-        }
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("secure_store_get error: {}", e)),
     }
 }
 
@@ -214,15 +210,8 @@ fn secure_store_delete(key: String) -> Result<bool, String> {
     let kr = Entry::new(service, &key);
     match kr.delete_password() {
         Ok(()) => Ok(true),
-        Err(e) => {
-            let s = format!("{}", e);
-            if s.contains("No entry") || s.contains("no entry") {
-                // already not present
-                Ok(true)
-            } else {
-                Err(format!("secure_store_delete error: {}", s))
-            }
-        }
+        Err(keyring::Error::NoEntry) => Ok(true),
+        Err(e) => Err(format!("secure_store_delete error: {}", e)),
     }
 }
 
@@ -247,10 +236,29 @@ fn main() {
     let env_base = std::env::var("FALCONBROOM_BACKEND_URL").ok();
     let port = if env_base.is_some() { 0 } else { free_port().unwrap_or(3009) };
     let base = env_base.clone().unwrap_or_else(|| format!("http://127.0.0.1:{}", port));
+    let mut random = [0u8; 32];
+    getrandom::getrandom(&mut random).expect("Could not generate desktop session secret");
+    let secret: String = random.iter().map(|b| format!("{:02x}", b)).collect();
 
     // Set the backend URL before any page script runs.
     let base_escaped = base.replace("'", "\\'");
-    let init_js = format!("(function(){{try{{window.__FALCONBROOM_BACKEND_URL = '{}' ;}}catch(e){{}}}})();", base_escaped);
+    let init_js = if env_base.is_none() {
+        format!(r#"(function(){{
+            const base = new URL({base});
+            const secret = {secret};
+            window.__FALCONBROOM_BACKEND_URL = base.href.replace(/\/$/, '');
+            const original = window.fetch.bind(window);
+            window.fetch = function(input, init) {{
+                const request = new Request(input, init);
+                if (new URL(request.url).origin !== base.origin) return original(input, init);
+                const headers = new Headers(request.headers);
+                headers.set('X-FalconBroom-Desktop-Token', secret);
+                return original(new Request(request, {{headers, redirect: 'error'}}));
+            }};
+        }})();"#, base = serde_json::to_string(&base).unwrap(), secret = serde_json::to_string(&secret).unwrap())
+    } else {
+        format!("window.__FALCONBROOM_BACKEND_URL = '{}';", base_escaped)
+    };
     let start_page = if env_base.is_some() { "index.html" } else { "loading.html" };
 
     let backend_child = BackendChild::empty();
@@ -259,12 +267,13 @@ fn main() {
     let builder = tauri::Builder::default()
         .manage(backend_child)
         .manage(BackendPort(port))
+        .manage(BackendSecret(secret.clone()))
         .invoke_handler(tauri::generate_handler![pick_file_and_profile, secure_store_get, secure_store_set, secure_store_delete])
         .setup(move |app| {
             if env_base.is_none() {
                 // Data lives in the OS app-data directory, not next to the executable.
                 let data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir().join("FalconBroom"));
-                match spawn_backend(port, &data_dir) {
+                match spawn_backend(port, &data_dir, &secret) {
                     Ok(c) => app.state::<BackendChild>().set(c),
                     Err(e) => eprintln!("Warning: could not start backend: {}", e),
                 }

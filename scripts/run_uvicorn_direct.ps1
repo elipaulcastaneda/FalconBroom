@@ -1,5 +1,6 @@
 param(
-    [string]$Host = '127.0.0.1',
+    [Alias('Host')]
+    [string]$BackendHost = '127.0.0.1',
     [int]$Port = 3009,
     [switch]$LifespanOff
 )
@@ -14,5 +15,13 @@ if (Test-Path $venvPython) {
 
 $lifespanArg = if ($LifespanOff.IsPresent -or $env:LIFESPAN_OFF -eq '1' -or $env:LIFESPAN_OFF -eq 'true') { '--lifespan off' } else { '' }
 
-Write-Host "Starting uvicorn on $Host:$Port (lifespan: $(if ($lifespanArg) { 'off' } else { 'on' }))"
-& $python -m uvicorn fbroom.main:app --host $Host --port $Port --log-level debug $lifespanArg
+if ($BackendHost -in @('127.0.0.1', '::1', 'localhost')) {
+    $env:ENV = 'development'
+    $env:FALCONBROOM_LOCAL_MODE = '1'
+} else {
+    $env:ENV = 'production'
+    $env:FALCONBROOM_LOCAL_MODE = '0'
+}
+
+Write-Host "Starting uvicorn on ${BackendHost}:$Port (lifespan: $(if ($lifespanArg) { 'off' } else { 'on' }))"
+& $python -m uvicorn fbroom.main:app --host $BackendHost --port $Port --log-level debug $lifespanArg

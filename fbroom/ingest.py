@@ -118,11 +118,15 @@ _CSV_FIELDNAMES = [
 
 
 class _CsvRowSink:
-    def __init__(self, writer: csv.DictWriter):
+    def __init__(self, writer: csv.DictWriter, source_path: str | None = None, logical_source_path: str | None = None):
         self.writer = writer
         self.count = 0
+        self.source_path = source_path
+        self.logical_source_path = logical_source_path
 
     def append(self, row: dict[str, Any]) -> None:
+        if self.logical_source_path and row.get("source_path") == self.source_path:
+            row["source_path"] = self.logical_source_path
         self.writer.writerow(row)
         self.count += 1
 
@@ -2087,7 +2091,12 @@ def generate_plain_language_suggestions(metadata: dict[str, Any], df=None) -> li
     return uniq
 
 
-def convert_uploaded_file(source_path: str | Path, output_dir: str | Path) -> dict[str, Any]:
+def convert_uploaded_file(
+    source_path: str | Path,
+    output_dir: str | Path,
+    wait_for_extended_diags: bool = False,
+    logical_source_path: str | Path | None = None,
+) -> dict[str, Any]:
     source_path = Path(source_path)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2100,7 +2109,11 @@ def convert_uploaded_file(source_path: str | Path, output_dir: str | Path) -> di
         with temporary_target.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=_CSV_FIELDNAMES, quoting=csv.QUOTE_MINIMAL)
             writer.writeheader()
-            rows = _CsvRowSink(writer)
+            rows = _CsvRowSink(
+                writer,
+                str(source_path),
+                str(logical_source_path) if logical_source_path is not None else None,
+            )
 
             if suffix in TEXT_EXTENSIONS:
                 _extract_text_rows(source_path, suffix.lstrip("."), rows)
@@ -2211,6 +2224,8 @@ def convert_uploaded_file(source_path: str | Path, output_dir: str | Path) -> di
         try:
             t = threading.Thread(target=compute_extended_diags, args=(metadata['normalized_path'], metadata_path), daemon=True)
             t.start()
+            if wait_for_extended_diags:
+                t.join()
         except Exception:
             pass
     except Exception:

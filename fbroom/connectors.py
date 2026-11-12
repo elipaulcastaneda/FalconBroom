@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import desktop_vault
+
 
 @dataclass
 class ResolvedSource:
@@ -17,7 +19,9 @@ class ResolvedSource:
             "exists": self.exists,
             "kind": self.kind,
             "name": self.name,
-            "materialized_path": self.materialized_path,
+            "materialized_path": (
+                None if desktop_vault.is_initialized() else self.materialized_path
+            ),
         }
 
 
@@ -29,11 +33,9 @@ def resolve_source(path: str) -> ResolvedSource:
     heavier dependencies.
     """
     p = Path(path)
-    exists = p.exists()
+    materialized = desktop_vault.materialize(p) if desktop_vault.is_initialized() else p
+    exists = materialized.exists()
     suffix = p.suffix.lower()
     kind = suffix.lstrip('.') if suffix else 'file'
-    # materialized_path is used by the engine to locate a readable CSV/Parquet.
-    # If the provided path exists, use it; otherwise leave None so callers
-    # can handle resolution/fallback externally.
-    mat = str(p.resolve()) if exists else None
+    mat = str(materialized.resolve()) if exists else None
     return ResolvedSource(str(p), exists, kind, p.name, materialized_path=mat)

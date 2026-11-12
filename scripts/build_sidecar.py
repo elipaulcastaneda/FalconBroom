@@ -39,6 +39,7 @@ def main() -> int:
         "--collect-submodules", "celery",
         "--collect-all", "polars",
         "--collect-all", "duckdb",
+        "--collect-all", "cryptography",
         "--add-data", f"{ROOT / 'fbroom' / 'data'}{os.pathsep}fbroom/data",
         "--hidden-import", "multipart",
         "--exclude-module", "tkinter",

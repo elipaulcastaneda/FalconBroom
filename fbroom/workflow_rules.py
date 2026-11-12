@@ -91,7 +91,6 @@ def infer_action(text: str) -> Optional[str]:
         if len(parts) > 1:
             all_steps: List[CleaningStep] = []
             for p in parts:
-                print('DEBUG: parsing clause ->', repr(p))
                 parsed = False
                 # 1) typed move with optional 'non-' prefix: e.g. "move all non-numerical values from postal_code to city"
                 # allow optional 'all' and optional 'values/entries' so phrasing like
@@ -202,7 +201,6 @@ def infer_action(text: str) -> Optional[str]:
                         except Exception:
                             # fallback: minimal representation
                             serial_steps.append({ 'action': getattr(s, 'action', None), 'column': getattr(s, 'column', None), 'params': getattr(s, 'params', {}) })
-                print('DEBUG: serial_steps ->', serial_steps)
                 # Return the serializable step list to the caller for recipe construction
                 return serial_steps
     except Exception:

@@ -3,10 +3,12 @@
 Usage: falconbroom-backend --port 51234 --data-dir "<app data dir>" --parent-pid 1234
 """
 import argparse
+import ipaddress
 import os
 import sys
 import threading
 import time
+from pathlib import Path
 
 
 def _pid_alive(pid: int) -> bool:
@@ -45,6 +47,18 @@ def main(argv=None):
     parser.add_argument("--parent-pid", type=int, default=None)
     args = parser.parse_args(argv)
 
+    secret = os.environ.get("FALCONBROOM_DESKTOP_SECRET", "")
+    if len(secret) != 64 or any(c not in "0123456789abcdef" for c in secret):
+        parser.error("A desktop session secret must be supplied by the launcher")
+    os.environ.pop("SUPABASE_SERVICE_ROLE_KEY", None)
+
+    try:
+        local_backend = ipaddress.ip_address(args.host.strip("[]")).is_loopback
+    except ValueError:
+        local_backend = args.host.lower() == "localhost"
+    os.environ["FALCONBROOM_LOCAL_MODE"] = "1" if local_backend else "0"
+    os.environ["ENV"] = "development" if local_backend else "production"
+
     if args.data_dir:
         # The backend stores everything under ./data, so run from the app data dir.
         os.makedirs(args.data_dir, exist_ok=True)
@@ -54,9 +68,24 @@ def main(argv=None):
         threading.Thread(target=_exit_when_parent_dies, args=(args.parent_pid,), daemon=True).start()
 
     import uvicorn
-    from fbroom.main import app
+    from fbroom import desktop_vault
+    from fbroom.desktop_request_gate import desktop_startup_gate
+    from fbroom import main as fb
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning", lifespan="off")
+    if local_backend:
+        with desktop_startup_gate():
+            desktop_vault.initialize(os.path.join(os.getcwd(), "data"))
+            desktop_vault.cleanup_abandoned_scratch()
+            desktop_vault.migrate_plaintext_files(
+                (fb.UPLOAD_DIR, fb.OUTPUTS_DIR, fb.RECIPES_DIR, fb.HISTORY_DIR)
+            )
+            legacy_output = Path.cwd() / "output_from_text.csv"
+            if legacy_output.is_file() or legacy_output.is_symlink():
+                desktop_vault.migrate_plaintext_file(
+                    legacy_output, fb.OUTPUTS_DIR / "output_from_text_legacy.csv"
+                )
+
+    uvicorn.run(fb.app, host=args.host, port=args.port, log_level="warning", lifespan="off")
 
 
 if __name__ == "__main__":

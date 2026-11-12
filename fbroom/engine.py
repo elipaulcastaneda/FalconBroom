@@ -11,6 +11,7 @@ from pathlib import Path
 import time
 
 from .connectors import resolve_source
+from . import desktop_vault
 
 try:
     import polars as pl
@@ -4086,7 +4087,7 @@ class Cleaner:
             try:
                 if not p.is_file():
                     continue
-                mtime = datetime.utcfromtimestamp(p.stat().st_mtime)
+                mtime = datetime.fromtimestamp(p.stat().st_mtime, timezone.utc)
                 age_days = (now - mtime).total_seconds() / 86400.0
                 if age_days > float(retention_days):
                     try:
@@ -4501,22 +4502,29 @@ class Cleaner:
         try:
             # Create a snapshot of the source for audit/rollback purposes
             try:
+                source = resolve_source(src)
                 src_p = Path(src).resolve()
-                if src_p.exists():
+                if source.exists:
+                    readable_source = Path(source.materialized_path or source.path)
                     snaps_dir = Path("data") / "history" / "snapshots"
                     snaps_dir.mkdir(parents=True, exist_ok=True)
                     # compute a short hash of the source for uniqueness
                     h = hashlib.sha256()
-                    with src_p.open("rb") as fh:
+                    with readable_source.open("rb") as fh:
                         for chunk in iter(lambda: fh.read(8192), b""):
                             h.update(chunk)
                     short = h.hexdigest()[:10]
                     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                     snap_name = f"{src_p.stem}_snapshot_{ts}_{short}{src_p.suffix}"
                     snap_path = snaps_dir / snap_name
-                    shutil.copyfile(str(src_p), str(snap_path))
+                    if desktop_vault.is_initialized():
+                        desktop_vault.seal_file(readable_source, snap_path, remove_source=False)
+                    else:
+                        shutil.copyfile(str(readable_source), str(snap_path))
                     snapshot_info = {"path": str(snap_path), "created_at": ts, "hash": short}
             except Exception:
+                if desktop_vault.is_initialized():
+                    raise
                 snapshot_info = None
 
             # Write to a temp file in the destination directory then atomically replace

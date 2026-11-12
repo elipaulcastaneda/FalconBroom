@@ -4,9 +4,16 @@ Purpose
 - Explain how consent/PII in `data/` is handled for partner testing.
 - Provide a retention policy and safe deletion steps.
 - Offer minimal partner-facing instructions and disclaimers.
+- This is a test-data policy, not the customer privacy notice. The desktop app's
+  draft notice is in `docs/customer-privacy-notice-draft.md`.
 
 Consent & PII
 - The `data/` folder may contain consent records, user profiles, uploads and other production-like artifacts.
+- On the updated Windows desktop app, managed uploads and their metadata,
+  recipes, history, snapshots and supported outputs are encrypted using a key
+  protected by the current Windows user profile. New inspections are protected;
+  older inspections require the separately confirmed Settings action. Other
+  data and temporary files may remain plaintext. See the draft notice for limits.
 - Workflow drafts for uploaded files are stored in that upload's `.meta.json` sidecar. Drafts can include the user's instruction, recipe JSON, and editor settings; they do not duplicate the uploaded file contents.
 - Deleting an upload through the app also deletes its metadata sidecar and saved workflow draft.
 - Before sharing the repository or a snapshot with partners, ensure consent records and PII are either:
@@ -25,13 +32,16 @@ Retention policy (test environment)
   - automatic deletion using `scripts/clear_test_data.ps1` (or equivalent) after confirmation.
 
 How to delete test data
-- To remove runtime data locally (non-recoverable):
+- To remove repository test runtime data locally, after checking the target:
 
   PowerShell:
 
     .\scripts\clear_test_data.ps1
 
-  The script will prompt for confirmation before deleting files under `data/`.
+  The script operates on `data/` under the current working directory, not
+  necessarily the installed desktop app's data directory. It prompts for
+  confirmation and suppresses some deletion errors; verify the result. It
+  does not guarantee secure erasure or remove backups and other copies.
 
 Partner terms & disclaimers (minimal)
 - This repository snapshot is provided for limited testing only.

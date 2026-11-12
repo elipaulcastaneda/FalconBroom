@@ -1,8 +1,10 @@
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
+from urllib.parse import quote
 import json
 from datetime import datetime, timezone, timedelta
 import shutil
+import tempfile
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, Request, Response, WebSocket, WebSocketDisconnect
 import logging
@@ -11,6 +13,7 @@ from celery import Celery
 import threading
 import time
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 if __name__ == '__main__' and __package__ is None:
@@ -23,6 +26,9 @@ if __name__ == '__main__' and __package__ is None:
     __package__ = 'fbroom'
 
 from .connectors import resolve_source
+from . import desktop_vault
+from .desktop_request_gate import DesktopRequestGate
+from .desktop_inspection_store import migrate_inspections, read_inspection, write_inspection
 from .engine import (
     Cleaner,
     _is_polars_df,
@@ -329,6 +335,7 @@ def load_sensitive_json(path: Path):
 # Application-wide JWT settings (cache a secret so tokens remain verifiable across calls)
 JWT_SECRET = os.environ.get("JWT_SECRET") or uuid4().hex
 JWT_ALGO = os.environ.get("JWT_ALGO") or "HS256"
+TEAM_FEATURES_ENABLED = False
 
 # Allow the Vite dev server and Tauri webview during local development.
 # Configure CORS: in production use explicit origins via `CORS_ALLOW_ORIGINS` env (comma-separated).
@@ -355,8 +362,17 @@ else:
     )
 
 
+app.add_middleware(DesktopRequestGate)
+
+
 @app.middleware("http")
 async def _secure_headers_middleware(request: Request, call_next):
+    desktop_secret = os.environ.get("FALCONBROOM_DESKTOP_SECRET")
+    if desktop_secret and request.method != "OPTIONS":
+        import hmac
+        supplied = request.headers.get("X-FalconBroom-Desktop-Token", "")
+        if not hmac.compare_digest(supplied.encode("utf-8"), desktop_secret.encode("utf-8")):
+            return Response(status_code=401, content="Desktop session required")
     # Enforce TLS in production
     if os.environ.get('ENV') == 'production':
         try:
@@ -364,7 +380,11 @@ async def _secure_headers_middleware(request: Request, call_next):
                 return Response(status_code=400, content="HTTPS required")
         except Exception:
             pass
-    resp = await call_next(request)
+    if desktop_vault.is_initialized():
+        with desktop_vault.request_workspace():
+            resp = await call_next(request)
+    else:
+        resp = await call_next(request)
     # Standard security headers
     try:
         resp.headers['Strict-Transport-Security'] = 'max-age=63072000; includeSubDomains; preload'
@@ -406,6 +426,50 @@ PRIVACY_DIR = Path("data") / "privacy"
 PRIVACY_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _record_files(root: Path, pattern: str = "*.json"):
+    if desktop_vault.is_initialized():
+        return [path for path in desktop_vault.logical_files(root) if path.match(pattern)]
+    return list(root.glob(pattern))
+
+
+def _read_record(path: Path):
+    return json.loads(desktop_vault.read_text(path))
+
+
+def _write_record(path: Path, record):
+    data = json.dumps(record, indent=2, ensure_ascii=False).encode("utf-8")
+    if desktop_vault.is_initialized():
+        desktop_vault.write_encrypted_bytes(path, data)
+    else:
+        path.write_bytes(data)
+
+
+def _delete_record(path: Path):
+    if desktop_vault.is_initialized():
+        desktop_vault.delete(path)
+    else:
+        path.unlink()
+
+
+def _record_mtime(path: Path):
+    encrypted = desktop_vault.encrypted_path(path)
+    return (encrypted if desktop_vault.is_initialized() and encrypted.is_file() else path).stat().st_mtime
+
+
+def _desktop_default_output(path: str) -> str:
+    if desktop_vault.is_initialized() and Path(path).resolve() == (Path.cwd() / "output_from_text.csv"):
+        return str(OUTPUTS_DIR / "output_from_text.csv")
+    return path
+
+
+def _desktop_legacy_output(path: str) -> str:
+    if desktop_vault.is_initialized() and Path(path).resolve() == (Path.cwd() / "output_from_text.csv"):
+        migrated = OUTPUTS_DIR / "output_from_text_legacy.csv"
+        if desktop_vault.exists(migrated):
+            return str(migrated)
+    return path
+
+
 def _create_join_history_for_file(out_path: Path):
     """Create a minimal join history record for an existing output file if none exists.
     This is used by the background watcher to automatically ingest externally-created join files.
@@ -417,9 +481,9 @@ def _create_join_history_for_file(out_path: Path):
             return False
         # avoid duplicate history for same output_path
         resolved = str(out_path.resolve())
-        for p in HISTORY_DIR.glob('join_*.json'):
+        for p in _record_files(HISTORY_DIR, 'join_*.json'):
             try:
-                j = json.loads(p.read_text(encoding='utf-8'))
+                j = _read_record(p)
                 if j.get('output_path') and str(Path(j.get('output_path')).resolve()) == resolved:
                     return False
             except Exception:
@@ -443,7 +507,7 @@ def _create_join_history_for_file(out_path: Path):
             'join_type': None,
         }
         dest = HISTORY_DIR / f"{rec['id']}.json"
-        dest.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding='utf-8')
+        _write_record(dest, rec)
         logger.info('Created join history record for %s as %s', out_path, dest)
         return True
     except Exception:
@@ -458,17 +522,17 @@ def _outputs_watcher(poll_interval: float = 5.0):
     try:
         seen = set()
         # initialize seen set from existing outputs
-        for p in OUTPUTS_DIR.iterdir():
+        for p in desktop_vault.logical_files(OUTPUTS_DIR):
             try:
-                if p.is_file():
+                if desktop_vault.exists(p) and not p.name.endswith(".meta.json"):
                     seen.add(str(p.resolve()))
             except Exception:
                 continue
         while True:
             try:
-                for p in OUTPUTS_DIR.iterdir():
+                for p in desktop_vault.logical_files(OUTPUTS_DIR):
                     try:
-                        if not p.is_file():
+                        if not desktop_vault.exists(p) or p.name.endswith(".meta.json"):
                             continue
                         rp = str(p.resolve())
                         if rp in seen:
@@ -607,9 +671,10 @@ class ReviewOptionsSpec(BaseModel):
 
 
 @app.post("/review-options")
-def review_options_endpoint(spec: ReviewOptionsSpec):
+def review_options_endpoint(spec: ReviewOptionsSpec, request: Request):
     from .review_options import review_options
     try:
+        _require_owned_file(spec.path, _file_access_user(request))
         return {"options": review_options(spec.path, spec.text, spec.column)}
     except HTTPException:
         raise
@@ -652,7 +717,6 @@ class JoinPreviewSpec(BaseModel):
 class JoinExportSpec(JoinPreviewSpec):
     export_format: Optional[str] = "csv"  # csv,xlsx,pandas,sql
     filename: Optional[str] = None
-    target_user: Optional[str] = None
 
 
 class SourceResolveSpec(BaseModel):
@@ -726,15 +790,18 @@ def monitor_page():
 
 
 @app.get('/lineage')
-def lineage_page():
+def lineage_page(request: Request):
     """Simple lineage/ history viewer that lists recent run history files."""
+    user = _file_access_user(request)
     try:
         files = []
-        for p in sorted(HISTORY_DIR.glob('run_*.json'), reverse=True)[:50]:
+        for p in sorted(_record_files(HISTORY_DIR, 'run_*.json'), reverse=True)[:50]:
             try:
-                data = json.loads(p.read_text(encoding='utf-8'))
+                data = _read_record(p)
             except Exception:
                 data = {"id": p.name}
+            if not _record_is_owned(data, user):
+                continue
             files.append((p.name, data))
         rows = ''
         for name, data in files:
@@ -783,12 +850,19 @@ def admin_metrics_tab(request: Request):
 @app.post("/upload")
 async def upload_file(request: Request, file: UploadFile = File(...)):
     try:
+        user = _file_access_user(request)
         filename = file.filename or "upload"
         source_path = Path(filename)
         suffix = source_path.suffix.lower() or ".bin"
         stem = source_path.stem.strip() or "upload"
         safe_stem = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in stem)
-        target = UPLOAD_DIR / f"{safe_stem}_{uuid4().hex[:8]}{suffix}"
+        encrypted_desktop = desktop_vault.is_initialized()
+        if encrypted_desktop:
+            target = desktop_vault.current_workspace() / f"{safe_stem}_{uuid4().hex[:8]}{suffix}"
+            conversion_dir = desktop_vault.current_workspace()
+        else:
+            target = UPLOAD_DIR / f"{safe_stem}_{uuid4().hex[:8]}{suffix}"
+            conversion_dir = UPLOAD_DIR
 
         first_chunk = await file.read(1024 * 1024)
         if not first_chunk:
@@ -802,28 +876,92 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
                 uploaded_size += len(chunk)
                 chunk = await file.read(1024 * 1024)
 
-        conversion = convert_uploaded_file(target, UPLOAD_DIR)
-        # persist simple metadata (owner if authenticated)
-        try:
-            owner = None
+        if encrypted_desktop:
+            conversion = convert_uploaded_file(
+                target,
+                conversion_dir,
+                wait_for_extended_diags=True,
+                logical_source_path=UPLOAD_DIR / target.name,
+            )
+        else:
+            conversion = convert_uploaded_file(target, conversion_dir)
+        if encrypted_desktop:
+            source_logical = UPLOAD_DIR / target.name
+            normalized_logical = UPLOAD_DIR / Path(conversion["normalized_path"]).name
+            metadata_logical = normalized_logical.with_suffix(".json")
+            source_temp = Path(conversion["source_path"])
+            normalized_temp = Path(conversion["normalized_path"])
+            metadata_temp = Path(conversion["metadata_path"])
+            conversion["source_path"] = str(source_logical)
+            conversion["normalized_path"] = str(normalized_logical)
+            conversion["metadata_path"] = str(metadata_logical)
+            conversion["path"] = str(normalized_logical)
+
             try:
-                user = _require_auth(request)
-                owner = {"user_id": user.get("id"), "username": user.get("username"), "email": user.get("email")}
-            except Exception:
-                user = None
-            meta = Path(conversion["path"]).parent / (Path(conversion["path"]).name + ".meta.json")
-            existing = {}
-            if meta.exists():
+                conversion_metadata = json.loads(metadata_temp.read_text(encoding="utf-8"))
+                conversion_metadata["source_path"] = str(source_logical)
+                conversion_metadata["normalized_path"] = str(normalized_logical)
+                conversion_metadata["path"] = str(normalized_logical)
+                metadata_temp.write_text(
+                    json.dumps(conversion_metadata, indent=2, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+            except (OSError, ValueError, TypeError) as error:
+                raise HTTPException(status_code=500, detail="Could not secure upload metadata") from error
+
+            metadata_user = user
+            if metadata_user is None:
                 try:
-                    existing = json.loads(meta.read_text(encoding="utf-8"))
-                except Exception:
-                    existing = {}
-            if owner:
-                existing["owner"] = owner
+                    metadata_user = _require_auth(request)
+                except HTTPException as error:
+                    if error.status_code != 401:
+                        raise
+            owner_metadata = {
+                "uploaded_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+            }
+            if metadata_user:
+                owner_metadata["owner"] = {
+                    "user_id": metadata_user.get("id"),
+                    "username": metadata_user.get("username"),
+                    "email": metadata_user.get("email"),
+                }
+
+            desktop_vault.seal_file(
+                source_temp, desktop_vault.encrypted_path(source_logical)
+            )
+            desktop_vault.seal_file(
+                normalized_temp, desktop_vault.encrypted_path(normalized_logical)
+            )
+            desktop_vault.seal_file(
+                metadata_temp, desktop_vault.encrypted_path(metadata_logical)
+            )
+            for created in {source_logical, normalized_logical, metadata_logical}:
+                desktop_vault.write_encrypted_bytes(
+                    created.with_name(created.name + ".meta.json"),
+                    json.dumps(owner_metadata, indent=2, ensure_ascii=False).encode("utf-8"),
+                )
+        if not encrypted_desktop and user:
+            for created in {str(target), conversion.get("path"), conversion.get("normalized_path"), conversion.get("source_path"), conversion.get("metadata_path")}:
+                if created:
+                    created_path = Path(created).resolve()
+                    if not created_path.is_relative_to(UPLOAD_DIR.resolve()) or not created_path.is_file():
+                        raise HTTPException(status_code=500, detail="Invalid upload conversion path")
+                    _write_file_owner(created_path, user)
+        if not encrypted_desktop:
+            # Preserve optional owner metadata for authenticated desktop uploads.
+            metadata_user = user
+            if metadata_user is None:
+                try:
+                    metadata_user = _require_auth(request)
+                except HTTPException as error:
+                    if error.status_code != 401:
+                        raise
+            meta = Path(conversion["path"]).parent / (Path(conversion["path"]).name + ".meta.json")
+            existing = json.loads(meta.read_text(encoding="utf-8")) if meta.exists() else {}
+            if metadata_user:
+                existing["owner"] = {"user_id": metadata_user.get("id"), "username": metadata_user.get("username"), "email": metadata_user.get("email")}
             existing.setdefault("uploaded_at", datetime.now(timezone.utc).isoformat().replace('+00:00','Z'))
             meta.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
-        except Exception:
-            pass
         # notify websocket clients of updated uploads list
         try:
             import asyncio
@@ -868,69 +1006,85 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 
 
 @app.post("/profile")
-def profile(spec: SourceSpec):
+def profile(spec: SourceSpec, request: Request):
     try:
+        user = _file_access_user(request)
+        _require_owned_file(spec.path, user)
         profile = cleaner.profile(spec.path)
         return {"profile": profile}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/inspect")
-def inspect(spec: SourceInspectSpec):
+def inspect(spec: SourceInspectSpec, request: Request):
     try:
+        user = _file_access_user(request)
+        _require_owned_file(spec.path, user)
         inspection = cleaner.inspect_source(spec.path, offset=spec.offset, limit=spec.limit)
         # persist full inspection JSON for auditing and later retrieval
         insp_id = f"inspection_{uuid4().hex[:8]}"
         dest = INSPECTIONS_DIR / f"{insp_id}.json"
         payload = {"id": insp_id, "created_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), "path": spec.path, "inspection": inspection}
-        dest.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+        if user:
+            payload["owner"] = {"user_id": str(user["id"])}
+        write_inspection(dest, payload)
         return {"inspection": inspection, "dump_id": insp_id, "dump_path": str(dest)}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/resolve-source")
-def resolve_source_endpoint(spec: SourceResolveSpec):
+def resolve_source_endpoint(spec: SourceResolveSpec, request: Request):
     try:
+        user = _file_access_user(request)
+        _require_owned_file(spec.path, user)
         resolved = resolve_source(spec.path)
         return {"source": resolved.to_dict()}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/suggest")
-def suggest(spec: SourceSpec):
+def suggest(spec: SourceSpec, request: Request):
     try:
+        user = _file_access_user(request)
+        _require_owned_file(spec.path, user)
         profile = cleaner.profile(spec.path)
         # get a sample of rows to allow cross-column type inference (move/swap suggestions)
         inspection = cleaner.inspect_source(spec.path, offset=0, limit=500)
         sample_rows = inspection.get('rows') if isinstance(inspection, dict) else None
         suggestions = cleaner.suggest_fixes(profile, sample_rows=sample_rows, path=spec.path)
         return {"suggestions": suggestions}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/metadata")
-def metadata(spec: SourceSpec):
+def metadata(spec: SourceSpec, request: Request):
     """Return persisted metadata for a normalized upload and regenerate suggestions if missing.
 
     This endpoint is useful for the frontend to fetch the upload's diagnostics and
     editable plain-English suggestions after upload or on-demand.
     """
     try:
+        user = _file_access_user(request)
+        _require_owned_file(spec.path, user)
         path = spec.path
         metadata = {}
-        try:
-            md_path = Path(path).with_suffix('.json')
-            if md_path.exists():
-                try:
-                    metadata = json.loads(md_path.read_text(encoding='utf-8'))
-                except Exception:
-                    metadata = {}
-        except Exception:
-            metadata = {}
+        md_path = Path(path).with_suffix('.json')
+        if desktop_vault.exists(md_path):
+            if user:
+                _require_owned_file(str(md_path), user)
+            metadata = json.loads(desktop_vault.read_text(md_path))
 
         # ensure basic fields
         metadata.setdefault('normalized_path', path)
@@ -969,6 +1123,8 @@ def metadata(spec: SourceSpec):
             metadata.setdefault('plain_language_suggestions', [])
 
         return {"metadata": metadata}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1010,6 +1166,9 @@ async def debug_recipe_from_text(request: Request):
 
         source_path = payload.get('source_path') or payload.get('sourcePath') or payload.get('source')
         output_path = payload.get('output_path') or payload.get('outputPath') or payload.get('output') or 'output.csv'
+        user = _file_access_user(request)
+        if source_path:
+            _require_owned_file(source_path, user)
 
         recipe = None
         recipe_json = None
@@ -1112,6 +1271,7 @@ async def debug_recipe_from_text(request: Request):
             pass
 
         # Compute preview
+        _require_recipe_sources_owned(recipe if recipe is not None else recipe_json, user)
         preview = cleaner.preview_recipe(
             recipe if recipe is not None else recipe_json,
             n=5,
@@ -1359,7 +1519,7 @@ else:
 
 
 @app.get("/suggest-buckets", response_model=SuggestBucketsResponse)
-def suggest_buckets(path: str, col: str, strategy: str = "quantile", n_buckets: int = 5):
+def suggest_buckets(request: Request, path: str, col: str, strategy: str = "quantile", n_buckets: int = 5):
     """Suggest numeric buckets for a column.
 
     Query params:
@@ -1386,15 +1546,18 @@ def suggest_buckets(path: str, col: str, strategy: str = "quantile", n_buckets: 
     ```
     """
     try:
+        _require_owned_file(path, _file_access_user(request))
         df = _read_table(path)
         buckets = _suggest_buckets(df, col, strategy=strategy, n_buckets=int(n_buckets))
         return {"buckets": buckets}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/write-parquet", response_model=WriteParquetResponse)
-def write_parquet(spec: WriteParquetSpec):
+def write_parquet(spec: WriteParquetSpec, request: Request):
     """Write a materialized source to Parquet.
 
     Body JSON fields (`WriteParquetSpec`):
@@ -1417,6 +1580,10 @@ def write_parquet(spec: WriteParquetSpec):
     ```
     """
     try:
+        user = _file_access_user(request)
+        _require_owned_file(spec.path, user)
+        if user and spec.out_path:
+            raise HTTPException(status_code=400, detail="Custom output paths are not supported")
         df = _read_table(spec.path)
         if not spec.out_path:
             out = OUTPUTS_DIR / f"{Path(spec.path).stem}_{uuid4().hex[:8]}.parquet"
@@ -1428,6 +1595,8 @@ def write_parquet(spec: WriteParquetSpec):
         res = _write_parquet(df, str(out), compression=spec.compression, atomic=bool(spec.atomic))
         if not res:
             raise HTTPException(status_code=500, detail="Failed to write parquet file")
+        _write_file_owner(out, user)
+        _seal_desktop_artifact(out)
         return {"path": str(out)}
     except HTTPException:
         raise
@@ -1436,8 +1605,11 @@ def write_parquet(spec: WriteParquetSpec):
 
 
 @app.post("/recipe-from-text")
-def recipe_from_text(spec: TextRecipeSpec):
+def recipe_from_text(spec: TextRecipeSpec, request: Request):
     try:
+        user = _file_access_user(request)
+        _require_owned_file(spec.source_path, user)
+        spec.output_path = _desktop_default_output(spec.output_path)
         # Build a profile from the materialized source. If the ingestion
         # produced long-form rows (unit_kind/text), prefer a reconstructed
         # table profile so the parser sees the wide table columns rather than
@@ -1610,6 +1782,7 @@ def recipe_from_text(spec: TextRecipeSpec):
         except Exception:
             column_candidates = infer_columns_from_text(spec.instruction, profile)
 
+        _require_recipe_sources_owned(recipe_dict, user)
         # cache the generated recipe so preview calls can fallback when UI omits steps
         try:
             if spec.source_path:
@@ -1700,9 +1873,181 @@ class SaveRecipeSpec(BaseModel):
     recipe: Recipe
 
 
-@app.post("/recipes")
-def save_recipe(spec: SaveRecipeSpec):
+def _recipe_path(rid: str) -> Path:
+    recipe_root = RECIPES_DIR.resolve()
+    path = (RECIPES_DIR / f"{rid}.json").resolve()
+    if path.parent != recipe_root:
+        raise HTTPException(status_code=404, detail="Recipe not found")
+    return path
+
+
+def _require_owned_recipe_source(source_path: str, user: dict):
+    if not user or not user.get("id"):
+        raise HTTPException(status_code=401, detail="Authentication required")
+    upload_root = UPLOAD_DIR.resolve()
     try:
+        resolved = Path(source_path).resolve(strict=True)
+        resolved.relative_to(upload_root)
+    except (OSError, ValueError):
+        raise HTTPException(status_code=404, detail="Recipe source not found")
+    if not resolved.is_file():
+        raise HTTPException(status_code=404, detail="Recipe source not found")
+
+    metadata_path = resolved.with_name(f"{resolved.name}.meta.json")
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise HTTPException(status_code=404, detail="Recipe source not found")
+    owner = metadata.get("owner") or {}
+    if str(owner.get("user_id") or "") != str(user["id"]):
+        raise HTTPException(status_code=404, detail="Recipe source not found")
+
+
+def _file_access_user(request: Request):
+    if _is_local_desktop_mode() and os.environ.get("ENV", "").strip().lower() != "production":
+        return None
+    user = _require_auth(request)
+    if not user.get("id"):
+        raise HTTPException(status_code=401, detail="Authenticated user has no identifier")
+    return user
+
+
+def _require_owned_file(path: str, user: Optional[dict], roots=None):
+    if user is None:
+        return Path(path)
+    roots = roots or (UPLOAD_DIR,)
+    try:
+        resolved = Path(path).resolve()
+        stored_path = desktop_vault.encrypted_path(resolved) if desktop_vault.is_initialized() else resolved
+        if not desktop_vault.exists(resolved) or stored_path.is_symlink() or not any(
+            resolved.is_relative_to(root.resolve()) for root in roots
+        ):
+            raise ValueError("Invalid file path")
+        metadata_path = resolved.with_name(f"{resolved.name}.meta.json")
+        metadata = json.loads(desktop_vault.read_text(metadata_path))
+        if not isinstance(metadata, dict) or not isinstance(metadata.get("owner"), dict):
+            raise ValueError("Invalid metadata")
+        if str(metadata["owner"].get("user_id") or "") != str(user["id"]):
+            raise ValueError("Not owned")
+    except (OSError, ValueError, TypeError):
+        raise HTTPException(status_code=404, detail="File not found")
+    return resolved
+
+
+def _write_file_owner(path: Path, user: Optional[dict]):
+    if user is None:
+        return
+    metadata_path = path.with_name(f"{path.name}.meta.json")
+    metadata = {}
+    if desktop_vault.is_initialized():
+        if desktop_vault.exists(metadata_path):
+            metadata = json.loads(desktop_vault.read_text(metadata_path))
+    elif metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["owner"] = {"user_id": str(user["id"])}
+    serialized = json.dumps(metadata, indent=2, ensure_ascii=False).encode("utf-8")
+    if desktop_vault.is_initialized():
+        desktop_vault.write_encrypted_bytes(metadata_path, serialized)
+    else:
+        metadata_path.write_bytes(serialized)
+
+
+def _seal_desktop_artifact(path: Path) -> Path:
+    path = Path(path)
+    if (
+        desktop_vault.is_initialized()
+        and path.is_file()
+        and any(path.resolve().is_relative_to(root.resolve()) for root in (UPLOAD_DIR, OUTPUTS_DIR))
+    ):
+        desktop_vault.seal_file(path)
+    return path
+
+
+def _write_snapshot_owner(result, user: Optional[dict]):
+    if not user or not isinstance(result, dict):
+        return
+    snapshot = result.get("snapshot")
+    if not isinstance(snapshot, dict) or not snapshot.get("path"):
+        return
+    path = Path(snapshot["path"]).resolve()
+    if not path.is_relative_to((HISTORY_DIR / "snapshots").resolve()):
+        raise HTTPException(status_code=500, detail="Invalid snapshot path")
+    if not desktop_vault.exists(path):
+        raise HTTPException(status_code=500, detail="Snapshot not found")
+    _write_file_owner(path, user)
+
+
+def _record_is_owned(record: dict, user: Optional[dict]) -> bool:
+    if user is None:
+        return True
+    owner = record.get("owner") if isinstance(record, dict) else None
+    return isinstance(owner, dict) and str(owner.get("user_id") or "") == str(user["id"])
+
+
+def _owned_record(root: Path, record_id: str, user: Optional[dict]):
+    path = (root / f"{record_id}.json").resolve()
+    if path.parent != root.resolve() or not desktop_vault.exists(path):
+        raise HTTPException(status_code=404, detail="Record not found")
+    try:
+        record = read_inspection(path) if root == INSPECTIONS_DIR else _read_record(path)
+    except (OSError, json.JSONDecodeError):
+        raise HTTPException(status_code=404, detail="Record not found")
+    if not isinstance(record, dict) or not _record_is_owned(record, user):
+        raise HTTPException(status_code=404, detail="Record not found")
+    return path, record
+
+
+def _require_recipe_sources_owned(recipe, user: Optional[dict]):
+    if not user:
+        return
+    sources = recipe.get("sources") if isinstance(recipe, dict) else getattr(recipe, "sources", None)
+    for source in sources or []:
+        source_path = source.get("path") if isinstance(source, dict) else getattr(source, "path", None)
+        if not source_path:
+            raise HTTPException(status_code=400, detail="Recipe source path is required")
+        _require_owned_recipe_source(str(source_path), user)
+    steps = recipe.get("cleaning_steps") if isinstance(recipe, dict) else getattr(recipe, "cleaning_steps", None)
+    for step in steps or []:
+        params = step.get("params") if isinstance(step, dict) else getattr(step, "params", None)
+        if not isinstance(params, dict):
+            continue
+        for key in ("right", "right_path"):
+            if params.get(key):
+                _require_owned_file(str(params[key]), user)
+        for rule in params.get("rules") or []:
+            if isinstance(rule, dict) and rule.get("map_path"):
+                _require_owned_file(str(rule["map_path"]), user)
+
+
+def _recipe_auth_user(request: Request):
+    return _file_access_user(request)
+
+
+def _load_recipe_for_request(rid: str, request: Request):
+    user = _recipe_auth_user(request)
+    path = _recipe_path(rid)
+    if not desktop_vault.exists(path):
+        raise HTTPException(status_code=404, detail="Recipe not found")
+    try:
+        data = _read_record(path)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500, detail="Could not read recipe") from exc
+
+    if user:
+        owner = data.get("owner") or {}
+        if str(owner.get("user_id") or "") != str(user.get("id") or ""):
+            raise HTTPException(status_code=404, detail="Recipe not found")
+    return path, data, user
+
+
+@app.post("/recipes")
+def save_recipe(spec: SaveRecipeSpec, request: Request):
+    try:
+        user = _recipe_auth_user(request)
+        _require_recipe_sources_owned(
+            spec.recipe.model_dump() if hasattr(spec.recipe, "model_dump") else spec.recipe.dict(),
+            user,
+        )
         # capture a snapshot of source columns for schema-drift detection
         src = spec.recipe.sources[0]["path"] if spec.recipe.sources else None
         expected_columns = []
@@ -1710,8 +2055,9 @@ def save_recipe(spec: SaveRecipeSpec):
             profile = cleaner.profile(src)
             expected_columns = list(profile.keys())
 
-        rid = f"{spec.name}_{uuid4().hex[:8]}".replace(" ", "_")
-        dest = RECIPES_DIR / f"{rid}.json"
+        safe_name = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in spec.name).strip("_") or "recipe"
+        rid = f"{safe_name}_{uuid4().hex[:8]}"
+        dest = _recipe_path(rid)
         payload = {
             "id": rid,
             "name": spec.name,
@@ -1720,30 +2066,43 @@ def save_recipe(spec: SaveRecipeSpec):
             "expected_columns": expected_columns,
             "recipe": spec.recipe.model_dump() if hasattr(spec.recipe, "model_dump") else spec.recipe.dict(),
         }
-        dest.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        if user:
+            payload["owner"] = {
+                "user_id": str(user["id"]),
+                "username": user.get("username"),
+                "email": user.get("email"),
+            }
+        _write_record(dest, payload)
         return {"id": rid, "path": str(dest)}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/recipes")
-def list_recipes():
+def list_recipes(request: Request):
+    user = _recipe_auth_user(request)
     out = []
-    for p in RECIPES_DIR.glob("*.json"):
+    for p in _record_files(RECIPES_DIR):
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
+            data = _read_record(p)
+            if user:
+                owner = data.get("owner") or {}
+                if str(owner.get("user_id") or "") != str(user.get("id") or ""):
+                    continue
             out.append(data)
+        except desktop_vault.DesktopVaultError:
+            logger.exception("Could not decrypt recipe record %s", p.name)
+            raise HTTPException(status_code=500, detail="Could not decrypt a recipe record")
         except Exception:
             continue
     return {"recipes": out}
 
 
 @app.get("/recipes/{rid}")
-def get_recipe(rid: str):
-    p = RECIPES_DIR / f"{rid}.json"
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="Recipe not found")
-    data = json.loads(p.read_text(encoding="utf-8"))
+def get_recipe(rid: str, request: Request):
+    p, data, _ = _load_recipe_for_request(rid, request)
     # sanitize loaded recipe: remove any cleaning steps that target metadata columns
     try:
         recipe = data.get("recipe") or {}
@@ -1884,14 +2243,12 @@ def _apply_step_preview(df, step, n=5):
 
 
 @app.get("/recipes/{rid}/explain", response_model=ExplainResponse)
-def explain_recipe_endpoint(rid: str, sample_rows: int = 5):
+def explain_recipe_endpoint(rid: str, request: Request, sample_rows: int = 5):
     """Return step-level explanations and small before/after samples for a saved recipe."""
-    p = RECIPES_DIR / f"{rid}.json"
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="Recipe not found")
+    p, data, user = _load_recipe_for_request(rid, request)
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
         recipe_dict = data.get("recipe") or {}
+        _require_recipe_sources_owned(recipe_dict, user)
         # coerce into Recipe model via recipe_schema if available
         from .recipe_schema import Recipe as RecipeModel
         recipe = RecipeModel(**recipe_dict) if isinstance(recipe_dict, dict) else RecipeModel(**recipe_dict)
@@ -1915,29 +2272,26 @@ def explain_recipe_endpoint(rid: str, sample_rows: int = 5):
             })
 
         return {"id": rid, "explanations": previews}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/recipes/{rid}/approve")
-def approve_recipe(rid: str):
-    p = RECIPES_DIR / f"{rid}.json"
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="Recipe not found")
-    data = json.loads(p.read_text(encoding="utf-8"))
+def approve_recipe(rid: str, request: Request):
+    p, data, _ = _load_recipe_for_request(rid, request)
     data["status"] = "approved"
     data["approved_at"] = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
-    p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_record(p, data)
     return {"id": rid, "status": "approved"}
 
 
 @app.post("/recipes/{rid}/run")
 def run_recipe(rid: str, request: Request, export_format: str = "csv"):
-    p = RECIPES_DIR / f"{rid}.json"
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="Recipe not found")
-    data = json.loads(p.read_text(encoding="utf-8"))
+    p, data, user = _load_recipe_for_request(rid, request)
     recipe = data.get("recipe")
+    _require_recipe_sources_owned(recipe, user)
     # ensure recipe is approved before allowing a run
     status = data.get("status")
     if status != "approved":
@@ -1986,18 +2340,10 @@ def run_recipe(rid: str, request: Request, export_format: str = "csv"):
         "status": "running",
         "export_format": export_format,
     }
-    # attach owner if request is authenticated
-    try:
-        if request is not None:
-            try:
-                user = _require_auth(request)
-                run_record["owner"] = {"user_id": user.get("id"), "username": user.get("username"), "email": user.get("email")}
-            except Exception:
-                pass
-    except Exception:
-        pass
+    if user:
+        run_record["owner"] = {"user_id": user.get("id"), "username": user.get("username"), "email": user.get("email")}
     history_path = HISTORY_DIR / f"{run_id}.json"
-    history_path.write_text(json.dumps(run_record, indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_record(history_path, run_record)
 
     # run (apply)
     try:
@@ -2011,7 +2357,12 @@ def run_recipe(rid: str, request: Request, export_format: str = "csv"):
                     recipe_obj = Recipe(**recipe)
                 except Exception:
                     recipe_obj = recipe
+        if user:
+            recipe_obj.outputs = [{"path": str(OUTPUTS_DIR / f"run_{uuid4().hex}.csv")}]
+        elif desktop_vault.is_initialized() and recipe_obj.outputs:
+            recipe_obj.outputs[0]["path"] = _desktop_default_output(recipe_obj.outputs[0]["path"])
         result = cleaner.apply_recipe_from_spec(recipe_obj)
+        _write_snapshot_owner(result, user)
         out_path = result.get("written") if isinstance(result, dict) else None
         diagnostics = result.get("diagnostics") if isinstance(result, dict) else None
         # Ensure output is copied into the canonical outputs directory so the
@@ -2094,12 +2445,19 @@ def run_recipe(rid: str, request: Request, export_format: str = "csv"):
                 raise
 
         # finalize run record
+        if user:
+            _write_file_owner(Path(out_path), user)
+            if exported != out_path:
+                _write_file_owner(Path(exported), user)
+        _seal_desktop_artifact(Path(out_path))
+        if exported != out_path:
+            _seal_desktop_artifact(Path(exported))
         run_record["status"] = "completed"
         run_record["finished_at"] = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
         run_record["output_path"] = exported
         if diagnostics:
             run_record["diagnostics"] = diagnostics
-        history_path.write_text(json.dumps(run_record, indent=2, ensure_ascii=False), encoding="utf-8")
+        _write_record(history_path, run_record)
         # metrics: per-recipe run completed
         try:
             if RECIPE_RUNS is not None:
@@ -2111,7 +2469,7 @@ def run_recipe(rid: str, request: Request, export_format: str = "csv"):
         run_record["status"] = "failed"
         run_record["error"] = str(e)
         run_record["finished_at"] = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
-        history_path.write_text(json.dumps(run_record, indent=2, ensure_ascii=False), encoding="utf-8")
+        _write_record(history_path, run_record)
         # metrics: per-recipe run failed
         try:
             if RECIPE_RUNS is not None:
@@ -2122,35 +2480,43 @@ def run_recipe(rid: str, request: Request, export_format: str = "csv"):
 
 
 @app.post("/history/snapshots/cleanup")
-def cleanup_snapshots(spec: SnapshotCleanupSpec):
+def cleanup_snapshots(spec: SnapshotCleanupSpec, request: Request):
     try:
+        if _file_access_user(request):
+            raise HTTPException(status_code=403, detail="Remote snapshot cleanup is not supported")
         res = cleaner.cleanup_snapshots(spec.days)
         return {"cleanup": res}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/history/snapshots/rollback")
-def rollback_snapshot(spec: SnapshotRollbackSpec):
+def rollback_snapshot(spec: SnapshotRollbackSpec, request: Request):
     try:
+        if _file_access_user(request):
+            raise HTTPException(status_code=403, detail="Remote snapshot rollback is not supported")
         snap = Path(spec.snapshot_path)
         # allow both absolute and snapshots dir-relative paths
         snaps_dir = Path("data") / "history" / "snapshots"
-        if not snap.exists():
+        if not desktop_vault.exists(snap):
             candidate = snaps_dir / spec.snapshot_path
-            if candidate.exists():
+            if desktop_vault.exists(candidate):
                 snap = candidate
-        if not snap.exists():
+        if not desktop_vault.exists(snap):
             raise HTTPException(status_code=404, detail=f"Snapshot not found: {spec.snapshot_path}")
 
         # copy into outputs as a rollback artifact
         dest_name = spec.dest_name or f"rollback_snapshot_{uuid4().hex[:8]}_{snap.name}"
         dest_path = OUTPUTS_DIR / dest_name
-        shutil.copyfile(str(snap), str(dest_path))
+        readable = desktop_vault.materialize(snap) if desktop_vault.is_initialized() else snap
+        shutil.copyfile(str(readable), str(dest_path))
+        _seal_desktop_artifact(dest_path)
 
         record = {"rollback_snapshot": str(snap), "performed_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), "rollback_path": str(dest_path)}
         out = HISTORY_DIR / f"rollback_snapshot_{uuid4().hex[:8]}.json"
-        out.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+        _write_record(out, record)
         return {"rollback": record}
     except HTTPException:
         raise
@@ -2159,14 +2525,12 @@ def rollback_snapshot(spec: SnapshotRollbackSpec):
 
 
 @app.post("/recipes/{rid}/validate")
-def validate_recipe_schema(rid: str):
-    p = RECIPES_DIR / f"{rid}.json"
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="Recipe not found")
+def validate_recipe_schema(rid: str, request: Request):
+    p, data, user = _load_recipe_for_request(rid, request)
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
         expected = data.get("expected_columns") or []
         recipe = data.get("recipe") or {}
+        _require_recipe_sources_owned(recipe, user)
         src = None
         try:
             src = recipe.get("sources", [])[0].get("path")
@@ -2183,10 +2547,41 @@ def validate_recipe_schema(rid: str):
 
 
 @app.get("/download")
-def download(path: str):
+def download(path: str, request: Request):
     try:
+        user = _file_access_user(request)
         if not path:
             raise HTTPException(status_code=400, detail="Missing path")
+        path = _desktop_legacy_output(path)
+        if desktop_vault.is_initialized():
+            resolved = Path(path).resolve()
+            if user:
+                _require_owned_file(str(resolved), user, (OUTPUTS_DIR, UPLOAD_DIR))
+            if not any(
+                resolved.is_relative_to(root.resolve())
+                for root in (OUTPUTS_DIR, UPLOAD_DIR)
+            ):
+                raise HTTPException(status_code=403, detail="Download restricted to outputs or uploads directory")
+            if not desktop_vault.exists(resolved):
+                raise HTTPException(status_code=404, detail="File not found")
+            encrypted = desktop_vault.encrypted_path(resolved)
+            if encrypted.is_file():
+                temp_dir, temp_lock = desktop_vault.create_scratch()
+                plaintext = temp_dir / resolved.name
+                try:
+                    desktop_vault.materialize_to(resolved, plaintext)
+                except Exception:
+                    desktop_vault.release_scratch(temp_dir, temp_lock)
+                    raise
+                return FileResponse(
+                    plaintext,
+                    filename=resolved.name,
+                    background=BackgroundTask(desktop_vault.release_scratch, temp_dir, temp_lock),
+                )
+            return FileResponse(resolved, filename=resolved.name)
+        if user:
+            resolved = _require_owned_file(path, user, (OUTPUTS_DIR, UPLOAD_DIR))
+            return FileResponse(resolved, filename=resolved.name)
         p = Path(path)
         resolved = p.resolve() if p.exists() else (Path(path).resolve())
         outputs_root = OUTPUTS_DIR.resolve()
@@ -2195,7 +2590,7 @@ def download(path: str):
         ok = False
         try:
             r = str(resolved)
-            if r.startswith(str(outputs_root)) or r.startswith(str(uploads_root)):
+            if resolved.is_relative_to(outputs_root) or resolved.is_relative_to(uploads_root):
                 ok = True
         except Exception:
             ok = False
@@ -2211,12 +2606,18 @@ def download(path: str):
 
 
 @app.get("/history")
-def list_history():
+def list_history(request: Request):
+    user = _file_access_user(request)
     out = []
-    for p in HISTORY_DIR.glob("*.json"):
+    for p in _record_files(HISTORY_DIR):
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
+            data = _read_record(p)
+            if not _record_is_owned(data, user):
+                continue
             out.append(data)
+        except desktop_vault.DesktopVaultError:
+            logger.exception("Could not decrypt history record %s", p.name)
+            raise HTTPException(status_code=500, detail="Could not decrypt a history record")
         except Exception:
             continue
     return {"history": sorted(out, key=lambda r: r.get("started_at", ""), reverse=True)}
@@ -2226,44 +2627,73 @@ def list_history():
 @app.get("/history/download_all_zip")
 @app.get("/history/download-all")
 def download_all_history(request: Request):
+    zip_path = None
+    scratch = None
     try:
         user = _require_auth(request)
         # create temporary zip of history, inspections, and outputs metadata
-        tmp_dir = Path("data") / "tmp"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
+        if desktop_vault.is_initialized():
+            scratch = desktop_vault.create_scratch()
+            tmp_dir = scratch[0]
+        else:
+            tmp_dir = Path("data") / "tmp"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
         zip_name = f"history_lineage_{uuid4().hex}.zip"
         zip_path = tmp_dir / zip_name
         import zipfile
         with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
             # add history files
             try:
-                for p in HISTORY_DIR.glob("*.json"):
+                for p in _record_files(HISTORY_DIR):
                     try:
-                        zf.write(p, arcname=str(Path('history')/p.name))
+                        record = _read_record(p)
+                        if not _record_is_owned(record, user):
+                            continue
+                        zf.writestr(str(Path('history')/p.name), json.dumps(record, ensure_ascii=False))
+                    except desktop_vault.DesktopVaultError:
+                        raise
                     except Exception:
                         continue
+            except desktop_vault.DesktopVaultError:
+                raise
             except Exception:
                 pass
             # add inspections
-            try:
-                for p in INSPECTIONS_DIR.glob("*.json"):
-                    try:
-                        zf.write(p, arcname=str(Path('inspections')/p.name))
-                    except Exception:
-                        continue
-            except Exception:
-                pass
+            for p in INSPECTIONS_DIR.glob("*.json"):
+                inspection = read_inspection(p)
+                if not _record_is_owned(inspection, user):
+                    continue
+                zf.writestr(str(Path('inspections')/p.name), json.dumps(inspection, ensure_ascii=False))
             # add outputs (file names only, include file if small — we'll include the file entry path)
-            try:
-                for p in OUTPUTS_DIR.rglob("*"):
-                    if p.is_file():
-                        try:
-                            # include relative path under outputs/
-                            zf.write(p, arcname=str(Path('outputs')/p.relative_to(OUTPUTS_DIR)))
-                        except Exception:
+            if desktop_vault.is_initialized():
+                seen = set()
+                for stored_path in OUTPUTS_DIR.rglob("*"):
+                    if not stored_path.is_file():
+                        continue
+                    p = desktop_vault.logical_path(stored_path)
+                    if p in seen or p.name.endswith(".meta.json"):
+                        continue
+                    seen.add(p)
+                    try:
+                        _require_owned_file(str(p), user, (OUTPUTS_DIR,))
+                    except HTTPException as error:
+                        if error.status_code == 404:
                             continue
-            except Exception:
-                pass
+                        raise
+                    zf.write(desktop_vault.materialize(p), arcname=str(Path("outputs") / p.relative_to(OUTPUTS_DIR)))
+            else:
+                try:
+                    for p in OUTPUTS_DIR.rglob("*"):
+                        if p.is_file():
+                            try:
+                                if p.name.endswith(".meta.json"):
+                                    continue
+                                _require_owned_file(str(p), user, (OUTPUTS_DIR,))
+                                zf.write(p, arcname=str(Path('outputs')/p.relative_to(OUTPUTS_DIR)))
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
 
         # issue a temporary delete token tied to this user
         token = uuid4().hex
@@ -2271,20 +2701,40 @@ def download_all_history(request: Request):
         with _delete_tokens_lock:
             _delete_tokens[token] = {"user_id": user.get('id'), "expires": expires}
         try:
-            logger.info(f"Issued delete token for user={user.get('id')} token={token} expires={int(expires)}")
+            logger.info(f"Issued delete token for user={user.get('id')} expires={int(expires)}")
         except Exception:
             pass
         try:
-            _append_audit_event(Path('data') / 'delete_audit', 'delete_token_issued', {"token": token, "user_id": user.get('id'), "expires": int(expires)})
+            _append_audit_event(Path('data') / 'delete_audit', 'delete_token_issued', {"user_id": user.get('id'), "expires": int(expires)})
         except Exception:
             pass
 
         headers = {"X-Delete-Token": token}
-        return FileResponse(str(zip_path), filename=zip_name, media_type='application/zip', headers=headers)
+        cleanup = (
+            BackgroundTask(desktop_vault.release_scratch, *scratch)
+            if scratch else BackgroundTask(_remove_history_export, zip_path)
+        )
+        return FileResponse(str(zip_path), filename=zip_name, media_type='application/zip', headers=headers,
+                            background=cleanup)
     except HTTPException:
+        if scratch:
+            desktop_vault.release_scratch(*scratch)
+        elif zip_path is not None:
+            _remove_history_export(zip_path)
         raise
     except Exception as e:
+        if scratch:
+            desktop_vault.release_scratch(*scratch)
+        elif zip_path is not None:
+            _remove_history_export(zip_path)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _remove_history_export(path: Path):
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.exception("Could not remove temporary history export %s", path)
 
 
 # Admin-scoped alias to avoid conflicts with parameterized /history/{run_id} routes
@@ -2312,42 +2762,42 @@ def delete_all_history(request: Request):
             info = _delete_tokens.get(token)
             if not info:
                 try:
-                    logger.warning(f"Invalid or unknown delete token attempted by user={user.get('id')} token={token}")
+                    logger.warning(f"Invalid or unknown delete token attempted by user={user.get('id')}")
                 except Exception:
                     pass
                 try:
-                    _append_audit_event(Path('data') / 'delete_audit', 'delete_attempt_invalid_token', {"token": token, "attempted_by": user.get('id')})
+                    _append_audit_event(Path('data') / 'delete_audit', 'delete_attempt_invalid_token', {"attempted_by": user.get('id')})
                 except Exception:
                     pass
                 raise HTTPException(status_code=403, detail="Invalid or expired delete token")
             if info.get('user_id') != user.get('id'):
                 try:
-                    logger.warning(f"Delete token user mismatch: token={token} issued_to={info.get('user_id')} attempted_by={user.get('id')}")
+                    logger.warning(f"Delete token user mismatch: issued_to={info.get('user_id')} attempted_by={user.get('id')}")
                 except Exception:
                     pass
                 try:
-                    _append_audit_event(Path('data') / 'delete_audit', 'delete_attempt_user_mismatch', {"token": token, "issued_to": info.get('user_id'), "attempted_by": user.get('id')})
+                    _append_audit_event(Path('data') / 'delete_audit', 'delete_attempt_user_mismatch', {"issued_to": info.get('user_id'), "attempted_by": user.get('id')})
                 except Exception:
                     pass
                 raise HTTPException(status_code=403, detail="Delete token not issued to this user")
             if time.time() > info.get('expires', 0):
                 try:
-                    logger.info(f"Delete token expired for token={token} user={info.get('user_id')}")
+                    logger.info(f"Delete token expired for user={info.get('user_id')}")
                 except Exception:
                     pass
                 try:
-                    _append_audit_event(Path('data') / 'delete_audit', 'delete_attempt_expired', {"token": token, "issued_to": info.get('user_id'), "expires": int(info.get('expires', 0))})
+                    _append_audit_event(Path('data') / 'delete_audit', 'delete_attempt_expired', {"issued_to": info.get('user_id'), "expires": int(info.get('expires', 0))})
                 except Exception:
                     pass
                 del _delete_tokens[token]
                 raise HTTPException(status_code=403, detail="Delete token expired")
             # consume token
             try:
-                logger.info(f"Consuming delete token={token} for user={user.get('id')}")
+                logger.info(f"Consuming delete token for user={user.get('id')}")
             except Exception:
                 pass
             try:
-                _append_audit_event(Path('data') / 'delete_audit', 'delete_token_consumed', {"token": token, "user_id": user.get('id'), "expires": int(info.get('expires', 0))})
+                _append_audit_event(Path('data') / 'delete_audit', 'delete_token_consumed', {"user_id": user.get('id'), "expires": int(info.get('expires', 0))})
             except Exception:
                 pass
             del _delete_tokens[token]
@@ -2355,23 +2805,25 @@ def delete_all_history(request: Request):
         # perform deletion: remove history and inspections JSON files
         deleted = {"history": 0, "inspections": 0}
         try:
-            for p in HISTORY_DIR.glob("*.json"):
+            for p in _record_files(HISTORY_DIR):
                 try:
-                    p.unlink()
+                    if not _record_is_owned(_read_record(p), user):
+                        continue
+                    _delete_record(p)
                     deleted['history'] += 1
+                except desktop_vault.DesktopVaultError:
+                    raise
                 except Exception:
                     continue
+        except desktop_vault.DesktopVaultError:
+            raise
         except Exception:
             pass
-        try:
-            for p in INSPECTIONS_DIR.glob("*.json"):
-                try:
-                    p.unlink()
-                    deleted['inspections'] += 1
-                except Exception:
-                    continue
-        except Exception:
-            pass
+        for p in INSPECTIONS_DIR.glob("*.json"):
+            if not _record_is_owned(read_inspection(p), user):
+                continue
+            p.unlink()
+            deleted['inspections'] += 1
         _consent_audit('delete_all_history', {'user_id': user.get('id'), 'deleted': deleted})
         return {'ok': True, 'deleted': deleted}
     except HTTPException:
@@ -2396,13 +2848,13 @@ def request_delete_token(request: Request):
         with _delete_tokens_lock:
             _delete_tokens[token] = {"user_id": user.get('id'), "expires": expires}
         try:
-            logger.info(f"Issued delete token user={user.get('id')} token={token} expires={int(expires)} (env={os.environ.get('ENV')})")
+            logger.info(f"Issued delete token user={user.get('id')} expires={int(expires)} (env={os.environ.get('ENV')})")
         except Exception:
             pass
         try:
             # record whether this was admin-issued or dev-issued
             evt = 'admin_delete_token_issued' if os.environ.get('ENV') == 'production' else 'dev_delete_token_issued'
-            _append_audit_event(Path('data') / 'delete_audit', evt, {"token": token, "user_id": user.get('id'), "expires": int(expires)})
+            _append_audit_event(Path('data') / 'delete_audit', evt, {"user_id": user.get('id'), "expires": int(expires)})
         except Exception:
             pass
         return {"delete_token": token, "expires": int(expires)}
@@ -2413,32 +2865,57 @@ def request_delete_token(request: Request):
 
 
 @app.get("/inspections")
-def list_inspections():
+def list_inspections(request: Request):
+    user = _file_access_user(request)
     out = []
     for p in INSPECTIONS_DIR.glob("*.json"):
         try:
-            data = json.loads(p.read_text(encoding="utf-8"))
+            data = read_inspection(p)
+            if not _record_is_owned(data, user):
+                continue
             out.append({"id": data.get("id"), "path": data.get("path"), "created_at": data.get("created_at"), "file": str(p)})
-        except Exception:
-            continue
+        except (OSError, ValueError, RuntimeError) as error:
+            logger.exception("Could not read inspection record %s", p.name)
+            raise HTTPException(status_code=500, detail="Could not read an inspection record") from error
     return {"inspections": sorted(out, key=lambda r: r.get("created_at", ""), reverse=True)}
 
 
 @app.get("/inspections/{insp_id}")
-def get_inspection(insp_id: str):
-    p = INSPECTIONS_DIR / f"{insp_id}.json"
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="Inspection not found")
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+def get_inspection(insp_id: str, request: Request):
+    user = _file_access_user(request)
+    _, record = _owned_record(INSPECTIONS_DIR, insp_id, user)
+    return record
 
 
 @app.get("/uploads")
-def list_uploads():
+def list_uploads(request: Request):
+    user = _file_access_user(request)
+    files = (
+        desktop_vault.logical_files(UPLOAD_DIR)
+        if desktop_vault.is_initialized()
+        else [p for p in UPLOAD_DIR.iterdir() if p.is_file()]
+    )
+    if user:
+        owned = []
+        for path in files:
+            if path.name.endswith(".meta.json") or path.suffix == ".json":
+                continue
+            try:
+                _require_owned_file(str(path), user)
+            except HTTPException as error:
+                if error.status_code == 404:
+                    continue
+                raise
+            disk_path = desktop_vault.encrypted_path(path) if desktop_vault.is_initialized() else path
+            stat = disk_path.stat()
+            owned.append({
+                "name": path.name,
+                "path": str(path.resolve()),
+                "size": stat.st_size,
+                "modified_at": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
+            })
+        return {"uploads": sorted(owned, key=lambda item: item["modified_at"], reverse=True)}
     out = []
-    files = [p for p in UPLOAD_DIR.iterdir() if p.is_file()]
 
     # parse conversion metadata files into entries keyed by source base name
     entries = {}
@@ -2449,7 +2926,7 @@ def list_uploads():
             if p.suffix != '.json':
                 continue
             try:
-                meta = json.loads(p.read_text(encoding='utf-8'))
+                meta = json.loads(desktop_vault.read_text(p))
             except Exception:
                 continue
             source_name = meta.get('source_name') or (Path(meta.get('source_path') or '').name) or p.stem
@@ -2461,10 +2938,10 @@ def list_uploads():
             if norm:
                 try:
                     cand = Path(norm)
-                    if cand.exists():
+                    if desktop_vault.exists(cand):
                         norm_path = cand
                     else:
-                        matches = list(UPLOAD_DIR.glob(Path(norm).name + '*'))
+                        matches = [f for f in files if f.name.startswith(Path(norm).name)]
                         if matches:
                             norm_path = matches[0]
                 except Exception:
@@ -2532,8 +3009,8 @@ def list_uploads():
                     try:
                         rp = Path(rf)
                         extra = rp.parent / (rp.name + '.meta.json')
-                        if extra.exists():
-                            em = json.loads(extra.read_text(encoding='utf-8'))
+                        if desktop_vault.exists(extra):
+                            em = json.loads(desktop_vault.read_text(extra))
                             if em.get('owner'):
                                 item['owner'] = em.get('owner')
                             if em.get('uploaded_at'):
@@ -2548,16 +3025,18 @@ def list_uploads():
             try:
                 if item.get('path'):
                     pth = Path(item['path'])
-                    if pth.exists():
-                        st = pth.stat()
+                    if desktop_vault.exists(pth):
+                        disk_path = desktop_vault.encrypted_path(pth) if desktop_vault.is_initialized() else pth
+                        st = disk_path.stat()
                         item['size'] = st.st_size
                         item['modified_at'] = datetime.utcfromtimestamp(st.st_mtime).isoformat() + 'Z'
                 else:
                     # fallback to first related file
                     if item.get('related_files') and len(item['related_files'])>0:
                         pth = Path(item['related_files'][0])
-                        if pth.exists():
-                            st = pth.stat()
+                        if desktop_vault.exists(pth):
+                            disk_path = desktop_vault.encrypted_path(pth) if desktop_vault.is_initialized() else pth
+                            st = disk_path.stat()
                             item['size'] = st.st_size
                             item['modified_at'] = datetime.utcfromtimestamp(st.st_mtime).isoformat() + 'Z'
             except Exception:
@@ -2569,13 +3048,14 @@ def list_uploads():
     # include unmatched raw files as separate entries
     for p in unmatched:
         try:
-            st = p.stat()
+            disk_path = desktop_vault.encrypted_path(p) if desktop_vault.is_initialized() else p
+            st = disk_path.stat()
             item = {'name': p.name, 'path': str(p.resolve()), 'size': st.st_size, 'modified_at': datetime.utcfromtimestamp(st.st_mtime).isoformat() + 'Z'}
             # attach .meta.json if present
             try:
                 meta = p.parent / (p.name + '.meta.json')
-                if meta.exists():
-                    mj = json.loads(meta.read_text(encoding='utf-8'))
+                if desktop_vault.exists(meta):
+                    mj = json.loads(desktop_vault.read_text(meta))
                     if mj.get('explanations_history'):
                         item['explanations_history'] = mj.get('explanations_history')
                     if mj.get('owner'):
@@ -2592,51 +3072,61 @@ def list_uploads():
 
 
 @app.post("/history/{run_id}/rollback")
-def rollback_run(run_id: str):
-    p = HISTORY_DIR / f"{run_id}.json"
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="Run not found")
-    record = json.loads(p.read_text(encoding="utf-8"))
+def rollback_run(run_id: str, request: Request):
+    user = _file_access_user(request)
+    p, record = _owned_record(HISTORY_DIR, run_id, user)
     output = record.get("output_path")
-    if not output or not Path(output).exists():
+    if output:
+        output = _desktop_legacy_output(output)
+    if not output or not desktop_vault.exists(Path(output)):
         raise HTTPException(status_code=404, detail="Output not available for rollback")
+    _require_owned_file(output, user, (OUTPUTS_DIR,))
     dest = OUTPUTS_DIR / f"rollback_{run_id}_{Path(output).name}"
-    shutil.copyfile(output, dest)
+    source = desktop_vault.materialize(Path(output)) if desktop_vault.is_initialized() else Path(output)
+    shutil.copyfile(source, dest)
+    _write_file_owner(dest, user)
+    _seal_desktop_artifact(dest)
     rollback_record = {
         "rollback_of": run_id,
         "performed_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),
         "rollback_path": str(dest.resolve()),
     }
+    if user:
+        rollback_record["owner"] = {"user_id": str(user["id"])}
     rbpath = HISTORY_DIR / f"rollback_{run_id}.json"
-    rbpath.write_text(json.dumps(rollback_record, indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_record(rbpath, rollback_record)
     return {"rollback": rollback_record}
 
 
 @app.delete("/history/{run_id}")
-def delete_history_entry(run_id: str):
-    p = HISTORY_DIR / f"{run_id}.json"
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="Run not found")
+def delete_history_entry(run_id: str, request: Request):
+    user = _file_access_user(request)
+    p, _ = _owned_record(HISTORY_DIR, run_id, user)
     try:
-        p.unlink()
+        _delete_record(p)
         return {"deleted": run_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/history/dedupe")
-def dedupe_history(by: str = "output_path"):
+def dedupe_history(request: Request, by: str = "output_path"):
     """Remove duplicate history records. By default de-duplicates by `output_path`.
 
     Returns list of removed run ids.
     """
     try:
+        user = _file_access_user(request)
         seen = set()
         removed = []
-        for p in sorted(HISTORY_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+        for p in sorted(_record_files(HISTORY_DIR), key=_record_mtime, reverse=True):
             try:
-                data = json.loads(p.read_text(encoding="utf-8"))
+                data = _read_record(p)
+            except desktop_vault.DesktopVaultError:
+                raise
             except Exception:
+                continue
+            if not _record_is_owned(data, user):
                 continue
             key = data.get(by)
             # fallback to full record hash when key is missing
@@ -2645,29 +3135,32 @@ def dedupe_history(by: str = "output_path"):
             if key in seen:
                 try:
                     removed.append(data.get("id") or p.stem)
-                    p.unlink()
+                    _delete_record(p)
                 except Exception:
                     continue
             else:
                 seen.add(key)
         return {"removed": removed}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/recipes/{rid}/export_sheets")
-def export_recipe_to_sheets(rid: str, sheet_name: str = "Sheet1", target_user: Optional[str] = None):
-    p = RECIPES_DIR / f"{rid}.json"
-    if not p.exists():
-        raise HTTPException(status_code=404, detail="Recipe not found")
+def export_recipe_to_sheets(rid: str, request: Request, sheet_name: str = "Sheet1"):
+    _, _, user = _load_recipe_for_request(rid, request)
 
     # find latest completed run for this recipe
     completed = []
-    for h in HISTORY_DIR.glob("run_*.json"):
+    for h in _record_files(HISTORY_DIR, "run_*.json"):
         try:
-            data = json.loads(h.read_text(encoding="utf-8"))
+            data = _read_record(h)
             if data.get("recipe_id") == rid and data.get("status") == "completed":
                 completed.append(data)
+        except desktop_vault.DesktopVaultError:
+            logger.exception("Could not decrypt history record %s", h.name)
+            raise HTTPException(status_code=500, detail="Could not decrypt a history record")
         except Exception:
             continue
 
@@ -2675,6 +3168,10 @@ def export_recipe_to_sheets(rid: str, sheet_name: str = "Sheet1", target_user: O
         raise HTTPException(status_code=400, detail="No completed run found for this recipe. Run the recipe first.")
 
     latest = sorted(completed, key=lambda r: r.get("finished_at", ""), reverse=True)[0]
+    if user:
+        run_owner = latest.get("owner") or {}
+        if str(run_owner.get("user_id") or "") != str(user.get("id") or ""):
+            raise HTTPException(status_code=404, detail="Recipe run not found")
     output_path = latest.get("output_path")
 
     def _owner_opt_out_from_run(record):
@@ -2687,11 +3184,6 @@ def export_recipe_to_sheets(rid: str, sheet_name: str = "Sheet1", target_user: O
         return False
 
     export_id = f"export_{uuid4().hex[:8]}"
-    # if explicit target_user provided, block if they opted out
-    if target_user and _is_opted_out(user_id=target_user):
-        _privacy_audit("blocked_recipe_export_target_opt_out", {"recipe_id": rid, "target_user": target_user})
-        raise HTTPException(status_code=403, detail="Target user has opted out of exports")
-
     token = _google_drive_access_token()
     record = {
         "id": export_id,
@@ -2714,19 +3206,21 @@ def export_recipe_to_sheets(rid: str, sheet_name: str = "Sheet1", target_user: O
     if not token:
         record["status"] = "pending_auth"
         out = HISTORY_DIR / f"{export_id}.json"
-        out.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+        _write_record(out, record)
         raise HTTPException(status_code=501, detail="Google Drive token not configured. Set the env var to enable exports.")
 
     # Token present: record queued export (scaffold)
     record["status"] = "queued"
     out = HISTORY_DIR / f"{export_id}.json"
-    out.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_record(out, record)
     return {"export_id": export_id, "status": "queued", "output_path": output_path}
 
 
 @app.post("/cleaning-suggestions")
-def cleaning_suggestions(spec: SourceSpec):
+def cleaning_suggestions(spec: SourceSpec, request: Request):
     try:
+        user = _file_access_user(request)
+        _require_owned_file(spec.path, user)
         profile = cleaner.profile(spec.path)
         return {
             "suggestions": [
@@ -2734,13 +3228,18 @@ def cleaning_suggestions(spec: SourceSpec):
                 for col, score, reason in suggest_columns_to_clean(profile)
             ]
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/join-suggestions")
-def join_suggestions(spec: JoinSuggestionSpec):
+def join_suggestions(spec: JoinSuggestionSpec, request: Request):
     try:
+        user = _file_access_user(request)
+        _require_owned_file(spec.left_path, user)
+        _require_owned_file(spec.right_path, user)
         # Resolve provided paths first so we can give a clear 404 when files
         # are missing instead of bubbling up a FileNotFoundError as a 500.
         left_res = resolve_source(spec.left_path)
@@ -2761,22 +3260,18 @@ def join_suggestions(spec: JoinSuggestionSpec):
         return {
             "joins": [join.model_dump() if hasattr(join, "model_dump") else join.dict() for join in joins]
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/join-preview")
-def join_preview(spec: JoinPreviewSpec):
+def join_preview(spec: JoinPreviewSpec, request: Request = None):
     try:
-        # DEBUG: log incoming spec for diagnosis of join key issues
-        try:
-            logger.info("/join-preview incoming spec: %s", json.dumps(spec.dict() if hasattr(spec, 'dict') else spec))
-        except Exception:
-            try:
-                logger.info("/join-preview incoming spec raw: %s", str(spec))
-            except Exception:
-                pass
-
+        user = _file_access_user(request)
+        _require_owned_file(spec.left_path, user)
+        _require_owned_file(spec.right_path, user)
         left_res = resolve_source(spec.left_path)
         right_res = resolve_source(spec.right_path)
         if not left_res.exists:
@@ -2786,39 +3281,6 @@ def join_preview(spec: JoinPreviewSpec):
 
         left_mat = getattr(left_res, 'materialized_path', None) or getattr(left_res, 'path', None)
         right_mat = getattr(right_res, 'materialized_path', None) or getattr(right_res, 'path', None)
-        try:
-            logger.info('/join-preview reading left materialized path: %s', left_mat)
-            logger.info('/join-preview reading right materialized path: %s', right_mat)
-            # quick local file sniff to verify content and delimiter
-            import csv as _csv
-            try:
-                with open(left_mat, 'rb') as _f:
-                    _sample = _f.read(2048)
-                _s = _sample.decode('utf-8', errors='replace')
-                logger.info('/join-preview left file head: %s', _s[:800].replace('\n', '\\n'))
-                try:
-                    _d = _csv.Sniffer().sniff(_s)
-                    _has_header = _csv.Sniffer().has_header(_s)
-                    logger.info('/join-preview left sniff delimiter=%s has_header=%s', _d.delimiter, _has_header)
-                except Exception as _e:
-                    logger.info('/join-preview left sniffer failed: %s', _e)
-            except Exception as _e:
-                logger.info('/join-preview unable to read left_mat %s: %s', left_mat, _e)
-            try:
-                with open(right_mat, 'rb') as _f:
-                    _sample = _f.read(2048)
-                _s = _sample.decode('utf-8', errors='replace')
-                logger.info('/join-preview right file head: %s', _s[:800].replace('\n', '\\n'))
-                try:
-                    _d = _csv.Sniffer().sniff(_s)
-                    _has_header = _csv.Sniffer().has_header(_s)
-                    logger.info('/join-preview right sniff delimiter=%s has_header=%s', _d.delimiter, _has_header)
-                except Exception as _e:
-                    logger.info('/join-preview right sniffer failed: %s', _e)
-            except Exception as _e:
-                logger.info('/join-preview unable to read right_mat %s: %s', right_mat, _e)
-        except Exception:
-            pass
         left_df = _read_table(left_mat)
         right_df = _read_table(right_mat)
 
@@ -3172,8 +3634,11 @@ def join_preview(spec: JoinPreviewSpec):
 
 
 @app.post("/join-export")
-def join_export(spec: JoinExportSpec):
+def join_export(spec: JoinExportSpec, request: Request):
     try:
+        user = _file_access_user(request)
+        _require_owned_file(spec.left_path, user)
+        _require_owned_file(spec.right_path, user)
         # DEBUG: log incoming spec for diagnosis of join key issues
         try:
             logger.info("/join-export incoming spec: %s", json.dumps(spec.dict() if hasattr(spec, 'dict') else spec))
@@ -3182,11 +3647,6 @@ def join_export(spec: JoinExportSpec):
                 logger.info("/join-export incoming spec raw: %s", str(spec))
             except Exception:
                 pass
-
-        # If explicit target_user provided, block if they opted out
-        if spec.target_user and _is_opted_out(user_id=spec.target_user):
-            _privacy_audit("blocked_join_export_target_opt_out", {"target_user": spec.target_user})
-            raise HTTPException(status_code=403, detail="Target user has opted out of exports")
 
         left_res = resolve_source(spec.left_path)
         right_res = resolve_source(spec.right_path)
@@ -3203,16 +3663,17 @@ def join_export(spec: JoinExportSpec):
             for src in [left_res, right_res]:
                 try:
                     meta = Path(src.path).parent / (Path(src.path).name + ".meta.json")
-                    if meta.exists():
-                        mj = json.loads(meta.read_text(encoding="utf-8"))
+                    if desktop_vault.exists(meta):
+                        mj = json.loads(desktop_vault.read_text(meta))
                         owner = mj.get("owner")
                         if owner and owner.get("user_id") and _is_opted_out(user_id=owner.get("user_id")):
                             _privacy_audit("blocked_join_export_owner_opt_out", {"owner": owner, "source": src.path})
                             raise HTTPException(status_code=403, detail="One of the source owners has opted out of exports")
                 except HTTPException:
                     raise
-                except Exception:
-                    pass
+                except (OSError, ValueError, desktop_vault.DesktopVaultError) as error:
+                    logger.exception("Could not read join source privacy metadata")
+                    raise HTTPException(status_code=500, detail="Could not read source privacy metadata") from error
         except HTTPException:
             raise
 
@@ -3368,6 +3829,10 @@ def join_export(spec: JoinExportSpec):
 
         # prepare output filename
         fname = spec.filename or f"join_{uuid4().hex[:8]}"
+        if user:
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", fname):
+                raise HTTPException(status_code=400, detail="Invalid output filename")
+            fname = f"{fname}_{uuid4().hex}"
         fmt = (spec.export_format or "csv").lower()
         out_path = OUTPUTS_DIR / f"{fname}.{ 'csv' if fmt!='pandas' and fmt!='sql' else ('pkl' if fmt=='pandas' else 'sqlite') }"
 
@@ -3375,6 +3840,7 @@ def join_export(spec: JoinExportSpec):
         if fmt == "csv":
             try:
                 _write_csv(joined, str(out_path))
+                _write_file_owner(out_path, user)
                 # record history entry for this join export
                 try:
                     now = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
@@ -3393,10 +3859,16 @@ def join_export(spec: JoinExportSpec):
                         "output_path": str(out_path),
                         "filename": fname,
                     }
+                    if user:
+                        rec["owner"] = {"user_id": str(user["id"])}
                     outp = HISTORY_DIR / f"{rec['id']}.json"
-                    outp.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding='utf-8')
+                    _write_record(outp, rec)
                 except Exception:
                     logger.exception('Failed to write join history record')
+                    if desktop_vault.is_initialized():
+                        _seal_desktop_artifact(out_path)
+                        raise
+                _seal_desktop_artifact(out_path)
                 return {"export_path": str(out_path)}
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
@@ -3417,13 +3889,22 @@ def join_export(spec: JoinExportSpec):
                         ws.append(r)
                 xlsx_path = str(OUTPUTS_DIR / f"{fname}.xlsx")
                 wb.save(xlsx_path)
+                _write_file_owner(Path(xlsx_path), user)
+                if user or desktop_vault.is_initialized():
+                    Path(tmp_csv).unlink()
                 try:
                     now = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
                     rec = {"id": f"join_{uuid4().hex}", "type": "join", "status": "success", "started_at": now, "finished_at": now, "left_path": spec.left_path, "right_path": spec.right_path, "left_on": left_on, "right_on": right_on, "join_type": how, "export_format": 'xlsx', "output_path": xlsx_path, "filename": fname}
+                    if user:
+                        rec["owner"] = {"user_id": str(user["id"])}
                     outp = HISTORY_DIR / f"{rec['id']}.json"
-                    outp.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding='utf-8')
+                    _write_record(outp, rec)
                 except Exception:
                     logger.exception('Failed to write join history record')
+                    if desktop_vault.is_initialized():
+                        _seal_desktop_artifact(Path(xlsx_path))
+                        raise
+                _seal_desktop_artifact(Path(xlsx_path))
                 return {"export_path": xlsx_path}
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
@@ -3434,13 +3915,20 @@ def join_export(spec: JoinExportSpec):
                 pd_df = joined.to_pandas() if hasattr(joined, 'to_pandas') else joined
                 pkl_path = str(OUTPUTS_DIR / f"{fname}.pkl")
                 pd_df.to_pickle(pkl_path)
+                _write_file_owner(Path(pkl_path), user)
                 try:
                     now = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
                     rec = {"id": f"join_{uuid4().hex}", "type": "join", "status": "success", "started_at": now, "finished_at": now, "left_path": spec.left_path, "right_path": spec.right_path, "left_on": left_on, "right_on": right_on, "join_type": how, "export_format": 'pandas', "output_path": pkl_path, "filename": fname}
+                    if user:
+                        rec["owner"] = {"user_id": str(user["id"])}
                     outp = HISTORY_DIR / f"{rec['id']}.json"
-                    outp.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding='utf-8')
+                    _write_record(outp, rec)
                 except Exception:
                     logger.exception('Failed to write join history record')
+                    if desktop_vault.is_initialized():
+                        _seal_desktop_artifact(Path(pkl_path))
+                        raise
+                _seal_desktop_artifact(Path(pkl_path))
                 return {"export_path": pkl_path}
             except Exception:
                 # fallback to parquet using polars
@@ -3451,6 +3939,8 @@ def join_export(spec: JoinExportSpec):
                     except Exception:
                         # if joined is pandas
                         pd_df.to_parquet(pq_path)
+                    _write_file_owner(Path(pq_path), user)
+                    _seal_desktop_artifact(Path(pq_path))
                     return {"export_path": pq_path}
                 except Exception as e:
                     raise HTTPException(status_code=500, detail=str(e))
@@ -3484,13 +3974,20 @@ def join_export(spec: JoinExportSpec):
                     cur.executemany(f'INSERT INTO joined VALUES ({placeholders})', to_insert)
                     con.commit()
                 con.close()
+                _write_file_owner(Path(db_path), user)
                 try:
                     now = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
                     rec = {"id": f"join_{uuid4().hex}", "type": "join", "status": "success", "started_at": now, "finished_at": now, "left_path": spec.left_path, "right_path": spec.right_path, "left_on": left_on, "right_on": right_on, "join_type": how, "export_format": 'sql', "output_path": db_path, "filename": fname}
+                    if user:
+                        rec["owner"] = {"user_id": str(user["id"])}
                     outp = HISTORY_DIR / f"{rec['id']}.json"
-                    outp.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding='utf-8')
+                    _write_record(outp, rec)
                 except Exception:
                     logger.exception('Failed to write join history record')
+                    if desktop_vault.is_initialized():
+                        _seal_desktop_artifact(Path(db_path))
+                        raise
+                _seal_desktop_artifact(Path(db_path))
                 return {"export_path": db_path}
             except Exception as e:
                 raise HTTPException(status_code=500, detail=str(e))
@@ -3498,13 +3995,20 @@ def join_export(spec: JoinExportSpec):
         # default: fallback to csv
         try:
             _write_csv(joined, str(out_path))
+            _write_file_owner(out_path, user)
             try:
                 now = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
                 rec = {"id": f"join_{uuid4().hex}", "type": "join", "status": "success", "started_at": now, "finished_at": now, "left_path": spec.left_path, "right_path": spec.right_path, "left_on": left_on, "right_on": right_on, "join_type": how, "export_format": fmt, "output_path": str(out_path), "filename": fname}
+                if user:
+                    rec["owner"] = {"user_id": str(user["id"])}
                 outp = HISTORY_DIR / f"{rec['id']}.json"
-                outp.write_text(json.dumps(rec, indent=2, ensure_ascii=False), encoding='utf-8')
+                _write_record(outp, rec)
             except Exception:
                 logger.exception('Failed to write join history record')
+                if desktop_vault.is_initialized():
+                    _seal_desktop_artifact(out_path)
+                    raise
+            _seal_desktop_artifact(out_path)
             return {"export_path": str(out_path)}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
@@ -3515,8 +4019,14 @@ def join_export(spec: JoinExportSpec):
 
 
 @app.post("/apply")
-def apply_recipe(recipe: Recipe):
+def apply_recipe(recipe: Recipe, request: Request):
     try:
+        user = _file_access_user(request)
+        _require_recipe_sources_owned(recipe, user)
+        if user:
+            recipe.outputs = [{"path": str(OUTPUTS_DIR / f"apply_{uuid4().hex}.csv")}]
+        elif desktop_vault.is_initialized() and recipe.outputs:
+            recipe.outputs[0]["path"] = _desktop_default_output(recipe.outputs[0]["path"])
         # Debug: log incoming recipe payload (truncated) to help diagnose 500s
         try:
             raw = recipe.json() if hasattr(recipe, 'json') else str(recipe)
@@ -3529,9 +4039,14 @@ def apply_recipe(recipe: Recipe):
         src = recipe.sources[0]["path"] if recipe.sources else None
         if not src:
             raise HTTPException(status_code=400, detail="Recipe missing source path")
-        if not Path(src).exists():
+        if not desktop_vault.exists(Path(src)):
             raise HTTPException(status_code=400, detail=f"Source path not found: {src}")
         out = cleaner.apply_recipe_from_spec(recipe)
+        _write_snapshot_owner(out, user)
+        if user:
+            _write_file_owner(Path(out["written"]), user)
+        if out.get("written"):
+            _seal_desktop_artifact(Path(out["written"]))
         return {"result": out}
     except Exception as e:
         traceback.print_exc()
@@ -3544,8 +4059,10 @@ def apply_recipe(recipe: Recipe):
 
 
 @app.post("/apply-patch")
-def apply_patch(spec: PatchSpec):
+def apply_patch(spec: PatchSpec, request: Request):
     try:
+        user = _file_access_user(request)
+        _require_owned_file(spec.path, user)
         if spec.recipe:
             # run every recipe step on the whole file so row-changing steps (drops, dedupe) are honored
             out_name = f"patched_{Path(spec.path).stem}_{uuid4().hex[:8]}.csv"
@@ -3553,15 +4070,22 @@ def apply_patch(spec: PatchSpec):
             recipe_dict = dict(spec.recipe)
             recipe_dict["sources"] = [{"path": spec.path}]
             recipe_dict["outputs"] = [{"path": str(out_path)}]
+            _require_recipe_sources_owned(recipe_dict, user)
             try:
                 recipe_obj = Recipe.model_validate(recipe_dict)
             except Exception:
                 recipe_obj = Recipe.parse_obj(recipe_dict)
-            cleaner.apply_recipe_from_spec(recipe_obj)
+            result = cleaner.apply_recipe_from_spec(recipe_obj)
+            _write_snapshot_owner(result, user)
             upload_path = UPLOAD_DIR / out_name
             shutil.copyfile(out_path, upload_path)
+            _write_file_owner(out_path, user)
+            _write_file_owner(upload_path, user)
             _copy_text_columns(out_path, upload_path)
-            stat = upload_path.stat()
+            _seal_desktop_artifact(out_path)
+            _seal_desktop_artifact(upload_path)
+            stat_path = desktop_vault.encrypted_path(upload_path) if desktop_vault.is_initialized() else upload_path
+            stat = stat_path.stat()
             return {"patched_path": str(out_path.resolve()), "upload_path": str(upload_path.resolve()), "applied": len(recipe_obj.cleaning_steps), "size": stat.st_size, "modified_at": datetime.utcfromtimestamp(stat.st_mtime).isoformat() + "Z", "mode": "recipe"}
         # read source table as list of dicts
         df = _read_table(spec.path)
@@ -3604,9 +4128,14 @@ def apply_patch(spec: PatchSpec):
         upload_name = out_name
         upload_path = UPLOAD_DIR / upload_name
         shutil.copyfile(out_path, upload_path)
+        _write_file_owner(out_path, user)
+        _write_file_owner(upload_path, user)
 
         # gather metadata
-        stat = upload_path.stat()
+        _seal_desktop_artifact(out_path)
+        _seal_desktop_artifact(upload_path)
+        stat_path = desktop_vault.encrypted_path(upload_path) if desktop_vault.is_initialized() else upload_path
+        stat = stat_path.stat()
         size = stat.st_size
         modified_at = datetime.utcfromtimestamp(stat.st_mtime).isoformat() + "Z"
 
@@ -3618,26 +4147,34 @@ def apply_patch(spec: PatchSpec):
 
 
 @app.post("/uploads/delete")
-def delete_upload(payload: dict):
+def delete_upload(payload: dict, request: Request):
     try:
+        user = _file_access_user(request)
         path = payload.get("path")
         if not path:
             raise HTTPException(status_code=400, detail="Missing path")
-        p = Path(path)
-        resolved = p.resolve()
-        if not str(resolved).startswith(str(UPLOAD_DIR.resolve())):
+        resolved = _require_owned_file(path, user).resolve()
+        if not resolved.is_relative_to(UPLOAD_DIR.resolve()):
             raise HTTPException(status_code=403, detail="Delete restricted to uploads directory")
-        if not resolved.exists():
+        if not desktop_vault.exists(resolved):
             raise HTTPException(status_code=404, detail="File not found")
-        # delete the main file
-        resolved.unlink()
-        # also attempt to delete any associated meta file named <filename>.meta.json
-        try:
-            meta = resolved.parent / (resolved.name + '.meta.json')
-            if meta.exists():
-                meta.unlink()
-        except Exception:
-            pass
+        associated = {resolved}
+        conversion_metadata = resolved.with_suffix(".json")
+        if desktop_vault.exists(conversion_metadata):
+            try:
+                details = json.loads(desktop_vault.read_text(conversion_metadata))
+                for key in ("source_path", "normalized_path"):
+                    candidate = Path(details.get(key, "")).resolve()
+                    if candidate.is_relative_to(UPLOAD_DIR.resolve()):
+                        associated.add(candidate)
+            except (OSError, ValueError, TypeError):
+                logger.exception("Could not read upload metadata while deleting %s", resolved.name)
+                raise HTTPException(status_code=500, detail="Could not securely delete upload")
+        associated.add(conversion_metadata)
+        associated.update(item.with_name(item.name + ".meta.json") for item in tuple(associated))
+        for item in associated:
+            if item.is_relative_to(UPLOAD_DIR.resolve()):
+                desktop_vault.delete(item)
         # attempt to log/audit this deletion
         try:
             logger.info(f"Upload deleted: {resolved}")
@@ -3665,14 +4202,26 @@ def delete_upload(payload: dict):
 
 
 @app.get("/uploads/duplicates")
-def find_upload_duplicates():
+def find_upload_duplicates(request: Request):
     try:
+        user = _file_access_user(request)
         groups = {}
-        for p in UPLOAD_DIR.iterdir():
-            if not p.is_file():
-                continue
+        files = (
+            desktop_vault.logical_files(UPLOAD_DIR)
+            if desktop_vault.is_initialized()
+            else [p for p in UPLOAD_DIR.iterdir() if p.is_file()]
+        )
+        for p in files:
+            if user:
+                try:
+                    _require_owned_file(str(p), user)
+                except HTTPException as error:
+                    if error.status_code == 404:
+                        continue
+                    raise
             try:
-                sz = p.stat().st_size
+                readable = desktop_vault.materialize(p) if desktop_vault.is_initialized() else p
+                sz = readable.stat().st_size
             except Exception:
                 sz = None
             groups.setdefault(sz, []).append(p)
@@ -3685,8 +4234,9 @@ def find_upload_duplicates():
             hashes = {}
             for f in files:
                 try:
+                    readable = desktop_vault.materialize(f) if desktop_vault.is_initialized() else f
                     h = hashlib.sha256()
-                    with open(f, "rb") as fh:
+                    with open(readable, "rb") as fh:
                         while True:
                             chunk = fh.read(8192)
                             if not chunk:
@@ -3701,12 +4251,14 @@ def find_upload_duplicates():
                     dup_groups.append({"hash": digest, "paths": paths, "size": sz})
 
         return {"duplicates": dup_groups}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/uploads/explanations")
-def persist_explanations(spec: ExplanationsLogSpec):
+def persist_explanations(spec: ExplanationsLogSpec, request: Request):
     """Persist explanation history for a source upload.
 
     Body: { source_path, recipe_id, explanations }
@@ -3714,24 +4266,34 @@ def persist_explanations(spec: ExplanationsLogSpec):
     an `explanations_history` array (newest first).
     """
     try:
+        user = _file_access_user(request)
+        _require_owned_file(spec.source_path, user)
         src = Path(spec.source_path)
         # prefer exact path, otherwise attempt to find matching upload by name
-        if not src.exists():
-            candidates = list(UPLOAD_DIR.glob(src.name))
+        if not desktop_vault.exists(src):
+            candidates = (
+                [p for p in desktop_vault.logical_files(UPLOAD_DIR) if p.name == src.name]
+                if desktop_vault.is_initialized()
+                else list(UPLOAD_DIR.glob(src.name))
+            )
             if candidates:
                 src = candidates[0]
             else:
-                matches = [p for p in UPLOAD_DIR.iterdir() if p.name == src.name]
+                matches = (
+                    [p for p in desktop_vault.logical_files(UPLOAD_DIR) if p.name == src.name]
+                    if desktop_vault.is_initialized()
+                    else [p for p in UPLOAD_DIR.iterdir() if p.name == src.name]
+                )
                 if matches:
                     src = matches[0]
-        if not src.exists():
+        if not desktop_vault.exists(src):
             raise HTTPException(status_code=404, detail="Source upload not found")
 
         meta = src.parent / (src.name + ".meta.json")
         existing = {}
-        if meta.exists():
+        if desktop_vault.exists(meta):
             try:
-                existing = json.loads(meta.read_text(encoding="utf-8"))
+                existing = json.loads(desktop_vault.read_text(meta))
             except Exception:
                 existing = {}
 
@@ -3740,7 +4302,11 @@ def persist_explanations(spec: ExplanationsLogSpec):
         hist.insert(0, entry)
         # cap history length
         existing["explanations_history"] = hist[:20]
-        meta.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
+        serialized = json.dumps(existing, indent=2, ensure_ascii=False).encode("utf-8")
+        if desktop_vault.is_initialized():
+            desktop_vault.write_encrypted_bytes(meta, serialized)
+        else:
+            meta.write_bytes(serialized)
         return {"ok": True}
     except HTTPException:
         raise
@@ -3749,76 +4315,137 @@ def persist_explanations(spec: ExplanationsLogSpec):
 
 
 @app.post("/consent/export-job")
-def enqueue_export_job(user_id: Optional[str] = None):
+def enqueue_export_job(request: Request, user_id: Optional[str] = None):
     try:
-        # block jobs targeting opted-out users
-        if user_id and _is_opted_out(user_id=user_id):
-            _consent_audit("blocked_enqueue_export_opt_out", {"user_id": user_id})
-            raise HTTPException(status_code=403, detail="Target user has opted out of exports")
-
-        job = {"type": "export_consents", "user_id": user_id, "status": "pending", "created_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}
-        jid = _write_job(job)
-        _consent_audit("enqueue_export", {"job_id": jid, "user_id": user_id})
-        # dispatch celery task
-        try:
-            celery_process_export_job.delay(jid)
-        except Exception:
-            try:
-                celery_process_export_job(jid)
-            except Exception:
-                pass
-        return {"job_id": jid}
+        auth_user = _require_job_auth(request)
+        requester_id = (auth_user or {}).get("id")
+        if not requester_id and _is_local_desktop_mode():
+            requester_id = user_id
+        if not requester_id:
+            raise HTTPException(status_code=401, detail="Authenticated user required")
+        if user_id and user_id != requester_id:
+            raise HTTPException(status_code=403, detail="Cannot export another user's consent records")
+        return _enqueue_consent_job("export_consents", requester_id, requester_id)
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.exception("Unable to enqueue consent export job")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/consent/delete-job")
-def enqueue_delete_job(user_id: Optional[str] = None):
+def enqueue_delete_job(request: Request, user_id: Optional[str] = None):
     try:
-        if not user_id:
-            raise HTTPException(status_code=400, detail="Missing user_id")
-        job = {"type": "delete_consents", "user_id": user_id, "status": "pending", "created_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')}
-        jid = _write_job(job)
-        _consent_audit("enqueue_delete", {"job_id": jid, "user_id": user_id})
-        try:
-            celery_process_delete_job.delay(jid)
-        except Exception:
-            try:
-                celery_process_delete_job(jid)
-            except Exception:
-                pass
-        return {"job_id": jid}
+        auth_user = _require_job_auth(request)
+        requester_id = (auth_user or {}).get("id")
+        if not requester_id and _is_local_desktop_mode():
+            requester_id = user_id
+        if not requester_id:
+            raise HTTPException(status_code=401, detail="Authenticated user required")
+        if user_id and user_id != requester_id:
+            raise HTTPException(status_code=403, detail="Cannot delete another user's consent records")
+        return _enqueue_consent_job("delete_consents", requester_id, requester_id)
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Unable to enqueue consent deletion job")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/jobs/{job_id}")
-def get_job_status(job_id: str, download: bool = False):
+def get_job_status(job_id: str, request: Request, download: bool = False):
     try:
-        jf = JOBS_DIR / f"{job_id}.json"
-        if not jf.exists():
+        auth_user = _require_job_auth(request)
+        if not re.fullmatch(r"job_[0-9a-f]{8}", job_id):
             raise HTTPException(status_code=404, detail="Job not found")
-        job = json.loads(jf.read_text(encoding="utf-8"))
+        job_file = _job_file_path(job_id)
+        if not job_file.is_file():
+            raise HTTPException(status_code=404, detail="Job not found")
+        job = json.loads(job_file.read_text(encoding="utf-8"))
+        requester_id = (auth_user or {}).get("id")
+        if not _is_local_desktop_mode() and (
+            not requester_id or job.get("requester_user_id") != requester_id
+        ):
+            raise HTTPException(status_code=404, detail="Job not found")
         if download:
-            res = job.get("result") or {}
-            # if job targeted a specific user, block download if they opted out
+            if job.get("type") != "export_consents" or job.get("status") != "completed":
+                raise HTTPException(status_code=404, detail="Export not available")
             target_user = job.get("user_id")
             if target_user and _is_opted_out(user_id=target_user):
                 _consent_audit("blocked_job_download_opt_out", {"job_id": job_id, "user_id": target_user})
                 raise HTTPException(status_code=403, detail="Target user has opted out of exports")
-            export_path = res.get("export_path")
-            if export_path and Path(export_path).exists():
-                return FileResponse(export_path, filename=Path(export_path).name, media_type='application/json', headers={"Content-Disposition": f"attachment; filename=\"{Path(export_path).name}\""})
-        return job
+            export_path = (job.get("result") or {}).get("export_path")
+            consent_root = (Path("data") / "consents").resolve()
+            expected_dir = (consent_root / "exports").resolve()
+            if not isinstance(export_path, str):
+                raise HTTPException(status_code=404, detail="Export not available")
+            resolved_export = Path(export_path).resolve()
+            expected_name = f"export_{job_id}.json"
+            if (
+                expected_dir.parent != consent_root
+                or resolved_export.parent != expected_dir
+                or resolved_export.name != expected_name
+                or not resolved_export.is_file()
+            ):
+                raise HTTPException(status_code=404, detail="Export not available")
+            return FileResponse(
+                resolved_export,
+                filename=expected_name,
+                media_type="application/json",
+            )
+        return {
+            "job_id": job_id,
+            "type": job.get("type"),
+            "status": job.get("status"),
+            "created_at": job.get("created_at"),
+            "updated_at": job.get("updated_at"),
+        }
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception("Unable to retrieve consent job")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _enqueue_consent_job(job_type: str, target_user_id: str, requester_user_id: str):
+    if job_type not in {"export_consents", "delete_consents"}:
+        raise ValueError("Unsupported consent job type")
+    if not target_user_id or not requester_user_id:
+        raise HTTPException(status_code=400, detail="A user ID is required")
+    if job_type == "export_consents" and _is_opted_out(user_id=target_user_id):
+        _consent_audit("blocked_enqueue_export_opt_out", {"user_id": target_user_id})
+        raise HTTPException(status_code=403, detail="Target user has opted out of exports")
+
+    job = {
+        "type": job_type,
+        "user_id": target_user_id,
+        "requester_user_id": requester_user_id,
+        "status": "pending",
+        "created_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
+    job_id = _write_job(job)
+    _consent_audit(
+        "enqueue_export" if job_type == "export_consents" else "enqueue_delete",
+        {"job_id": job_id, "user_id": target_user_id},
+    )
+    task = celery_process_export_job if job_type == "export_consents" else celery_process_delete_job
+    try:
+        if _is_local_desktop_mode() and os.environ.get("FALCONBROOM_DESKTOP_SECRET"):
+            task(job_id)
+        else:
+            try:
+                task.delay(job_id)
+            except Exception:
+                task(job_id)
+    except Exception as e:
+        _update_job_status(job_id, "failed", {"error": "job_dispatch_failed"})
+        logger.exception("Consent job dispatch failed for %s", job_id)
+        raise HTTPException(status_code=503, detail="Consent job could not be started") from e
+    return {"job_id": job_id}
 @app.post("/consent")
 def record_consent(spec: ConsentSpec, request: Request):
     try:
+        auth_user = _require_production_auth(request)
         CONSENT_DIR = Path("data") / "consents"
         CONSENT_DIR.mkdir(parents=True, exist_ok=True)
         cid = f"consent_{uuid4().hex[:8]}"
@@ -3827,7 +4454,7 @@ def record_consent(spec: ConsentSpec, request: Request):
         ua = spec.user_agent or request.headers.get("user-agent")
         payload = {
             "id": cid,
-            "user_id": spec.user_id,
+            "user_id": auth_user.get("id") if auth_user else spec.user_id,
             "consents": spec.consents,
             "user_agent": ua,
             "ip": ip,
@@ -3837,17 +4464,22 @@ def record_consent(spec: ConsentSpec, request: Request):
         dest.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
         # audit
         try:
-            _consent_audit("record_consent", {"id": cid, "user_id": spec.user_id, "ip": ip, "user_agent": ua})
+            _consent_audit("record_consent", {"id": cid, "user_id": payload["user_id"], "ip": ip, "user_agent": ua})
         except Exception:
             pass
         return {"ok": True, "id": cid}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/consent")
-def get_consents(user_id: Optional[str] = None):
+def get_consents(request: Request, user_id: Optional[str] = None):
     try:
+        auth_user = _require_production_auth(request)
+        if auth_user:
+            user_id = auth_user.get("id")
         CONSENT_DIR = Path("data") / "consents"
         out = []
         if not CONSENT_DIR.exists():
@@ -3855,7 +4487,7 @@ def get_consents(user_id: Optional[str] = None):
         for p in sorted(CONSENT_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
             try:
                 data = json.loads(p.read_text(encoding="utf-8"))
-                if user_id and data.get("user_id") != user_id:
+                if data.get("user_id") != user_id:
                     continue
                 out.append(data)
             except Exception:
@@ -3868,11 +4500,14 @@ def get_consents(user_id: Optional[str] = None):
 
 
 @app.get("/consent/export")
-def export_consents(user_id: Optional[str] = None):
+def export_consents(request: Request, user_id: Optional[str] = None):
     """Export consent receipts as a JSON attachment. If `user_id` is provided,
     only exports receipts for that user, otherwise exports all receipts.
     """
     try:
+        auth_user = _require_production_auth(request)
+        if auth_user:
+            user_id = auth_user.get("id")
         CONSENT_DIR = Path("data") / "consents"
         out = []
         if not CONSENT_DIR.exists():
@@ -3892,14 +4527,17 @@ def export_consents(user_id: Optional[str] = None):
                 continue
         # return as inline JSON; clients can save the response
         return {"consents": out}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/consent/{consent_id}")
-def delete_consent(consent_id: str):
+def delete_consent(consent_id: str, request: Request):
         """Delete a single consent receipt immediately. Also logs an audit entry."""
         try:
+            auth_user = _require_production_auth(request)
             CONSENT_DIR = Path("data") / "consents"
             p = CONSENT_DIR / f"{consent_id}.json"
             if not p.exists():
@@ -3908,6 +4546,8 @@ def delete_consent(consent_id: str):
                 data = json.loads(p.read_text(encoding="utf-8"))
             except Exception:
                 data = None
+            if auth_user and data and data.get("user_id") != auth_user.get("id"):
+                raise HTTPException(status_code=403, detail="Cannot delete another user's consent record")
             p.unlink()
             _consent_audit("delete_consent", {"id": consent_id, "user_id": data.get("user_id") if data else None})
             return {"deleted": consent_id}
@@ -3918,12 +4558,15 @@ def delete_consent(consent_id: str):
 
 
 @app.delete("/consent")
-def delete_consents_by_user(user_id: Optional[str] = None):
+def delete_consents_by_user(request: Request, user_id: Optional[str] = None):
         """Delete all consent receipts for a given `user_id`. If no user_id provided,
         returns 400. This endpoint can be used to withdraw consent and erase records.
         """
         try:
-            if not user_id:
+            auth_user = _require_production_auth(request)
+            if auth_user:
+                user_id = auth_user.get("id")
+            elif not user_id:
                 raise HTTPException(status_code=400, detail="Missing user_id")
             CONSENT_DIR = Path("data") / "consents"
             if not CONSENT_DIR.exists():
@@ -3947,13 +4590,23 @@ def delete_consents_by_user(user_id: Optional[str] = None):
 def _write_job(job: dict):
     jid = job.get("id") or f"job_{uuid4().hex[:8]}"
     job["id"] = jid
-    job_file = JOBS_DIR / f"{jid}.json"
+    job_file = _job_file_path(jid)
     job_file.write_text(json.dumps(job, indent=2, ensure_ascii=False), encoding="utf-8")
     return jid
 
 
+def _job_file_path(job_id: str):
+    if not isinstance(job_id, str) or not re.fullmatch(r"job_[0-9a-f]{8}", job_id):
+        raise ValueError("Invalid job ID")
+    jobs_root = JOBS_DIR.resolve()
+    job_file = (jobs_root / f"{job_id}.json").resolve()
+    if job_file.parent != jobs_root:
+        raise ValueError("Invalid job path")
+    return job_file
+
+
 def _update_job_status(jid: str, status: str, result: Optional[dict] = None):
-    job_file = JOBS_DIR / f"{jid}.json"
+    job_file = _job_file_path(jid)
     try:
         job = json.loads(job_file.read_text(encoding="utf-8"))
     except Exception:
@@ -3969,6 +4622,8 @@ def _process_export_job(job: dict):
     jid = job.get("id")
     user_id = job.get("user_id")
     try:
+        if not user_id:
+            return {"error": "missing_target_user"}
         # If the job targets an opted-out user, abort and audit
         if user_id and _is_opted_out(user_id=user_id):
             _consent_audit("blocked_process_export_opt_out", {"job_id": jid, "user_id": user_id})
@@ -3986,8 +4641,12 @@ def _process_export_job(job: dict):
                     out.append(data)
                 except Exception:
                     continue
-        export_dir = CONSENT_DIR / "exports"
+        consent_root = CONSENT_DIR.resolve()
+        export_dir = consent_root / "exports"
         export_dir.mkdir(parents=True, exist_ok=True)
+        export_dir = export_dir.resolve()
+        if export_dir.parent != consent_root:
+            raise ValueError("Invalid consent export directory")
         export_path = export_dir / f"export_{jid}.json"
         export_path.write_text(json.dumps({"consents": out}, indent=2, ensure_ascii=False), encoding="utf-8")
         _consent_audit("export_consents", {"job_id": jid, "user_id": user_id, "export_path": str(export_path)})
@@ -4021,7 +4680,7 @@ def _process_delete_job(job: dict):
 @celery_app.task(name='fbroom.process_export_job')
 def celery_process_export_job(jid: str):
     # load job file
-    jf = JOBS_DIR / f"{jid}.json"
+    jf = _job_file_path(jid)
     try:
         job = json.loads(jf.read_text(encoding="utf-8"))
     except Exception:
@@ -4033,7 +4692,7 @@ def celery_process_export_job(jid: str):
 
 @celery_app.task(name='fbroom.process_delete_job')
 def celery_process_delete_job(jid: str):
-    jf = JOBS_DIR / f"{jid}.json"
+    jf = _job_file_path(jid)
     try:
         job = json.loads(jf.read_text(encoding="utf-8"))
     except Exception:
@@ -4090,6 +4749,14 @@ def _verify_password(password: str, salt_hex: str, hash_hex: str) -> bool:
     return dk.hex() == hash_hex
 
 
+def _is_uuid(value: Optional[str]) -> bool:
+    try:
+        UUID(str(value))
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
 def _find_user_by_username(username: str):
     d = _users_dir()
     for p in d.glob("*.json"):
@@ -4128,6 +4795,7 @@ def _create_user(username: str, email: str, password: str, role: Optional[str] =
         "email": email,
         "pw_salt": salt,
         "pw_hash": ph,
+        "auth_provider": "local",
         "created_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),
         "role": r,
         "is_admin": True if (is_admin or r == "admin") else False,
@@ -4210,7 +4878,10 @@ def _get_user_by_id(user_id: str):
     if not p.exists():
         return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        user = json.loads(p.read_text(encoding="utf-8"))
+        if user.get("account_deletion_status") == "pending":
+            return None
+        return user
     except Exception:
         return None
 
@@ -4304,7 +4975,7 @@ def _get_user_from_token(token: str):
                         if not jwks_url:
                             supabase_url = os.environ.get('SUPABASE_URL')
                             if supabase_url:
-                                jwks_url = supabase_url.rstrip('/') + '/auth/v1/certs'
+                                jwks_url = supabase_url.rstrip('/') + '/auth/v1/.well-known/jwks.json'
                         # As a last resort, try issuer from unverified claims
                         if not jwks_url:
                             try:
@@ -4392,9 +5063,16 @@ def _get_user_from_token(token: str):
                 if not uid:
                     logger.info("Token decoded but no uid found in claims")
                     return None
-                local = _get_user_by_id(uid)
-                if local:
-                    return local
+                local_path = _users_dir() / f"{uid}.json"
+                if local_path.is_file():
+                    try:
+                        local = json.loads(local_path.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        local = None
+                    if local:
+                        if local.get("account_deletion_status") == "pending":
+                            return None
+                        return local
                 try:
                     user = {
                         'id': uid,
@@ -4402,7 +5080,8 @@ def _get_user_from_token(token: str):
                         'email': payload.get('email'),
                         'created_at': datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),
                         'role': payload.get('role') or payload.get('app_role') or 'member',
-                        'is_admin': True if (payload.get('role') == 'admin') else False
+                        'is_admin': True if (payload.get('role') == 'admin') else False,
+                        'auth_provider': 'supabase' if _is_uuid(uid) else 'local',
                     }
                     p = _users_dir() / f"{uid}.json"
                     p.write_text(json.dumps(user, indent=2, ensure_ascii=False), encoding='utf-8')
@@ -4625,6 +5304,27 @@ def _require_auth(request: Request):
     if not user:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     return user
+
+
+def _is_local_desktop_mode():
+    return os.environ.get("FALCONBROOM_LOCAL_MODE", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _require_job_auth(request: Request):
+    if _is_local_desktop_mode():
+        return None
+    return _require_auth(request)
+
+
+def _require_team_features():
+    if not TEAM_FEATURES_ENABLED:
+        raise HTTPException(status_code=404, detail="Team and sharing features are disabled")
+
+
+def _require_production_auth(request: Request):
+    if os.environ.get("ENV", "").strip().lower() == "production":
+        return _require_auth(request)
+    return None
 
 
 def _require_admin(request: Request):
@@ -5094,152 +5794,426 @@ def dsar_request(request: Request, payload: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _has_verified_deletion_request(user_id: Optional[str]) -> bool:
+    if not user_id:
+        return False
+    dsar_dir = Path("data") / "dsar"
+    if not dsar_dir.exists():
+        return False
+    for path in dsar_dir.glob("dsar_*.json"):
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (
+            record.get("user_id") == user_id
+            and record.get("action") == "delete"
+            and record.get("status") == "verified"
+        ):
+            return True
+    return False
+
+
+async def _verify_supabase_password(email: str, password: str, expected_user_id: str):
+    supabase_url = os.environ.get("SUPABASE_URL")
+    anon_key = os.environ.get("SUPABASE_ANON_KEY")
+    if not supabase_url or not anon_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Supabase password verification is not configured",
+        )
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                f"{supabase_url.rstrip('/')}/auth/v1/token?grant_type=password",
+                headers={"apikey": anon_key, "Content-Type": "application/json"},
+                json={"email": email, "password": password},
+            )
+    except httpx.HTTPError as error:
+        logger.warning("Supabase reauthentication request failed: %s", error)
+        raise HTTPException(status_code=503, detail="Unable to verify account password")
+    if response.status_code in (400, 401, 403):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if response.status_code != 200:
+        logger.warning("Supabase reauthentication returned status %s", response.status_code)
+        raise HTTPException(status_code=503, detail="Unable to verify account password")
+    try:
+        verified_user_id = response.json().get("user", {}).get("id")
+    except (ValueError, AttributeError):
+        verified_user_id = None
+    if str(verified_user_id or "").lower() != str(expected_user_id).lower():
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+
+def _is_supabase_account(user: dict) -> bool:
+    return user.get("auth_provider") == "supabase" or _is_uuid(user.get("id"))
+
+
+def _delete_owned_file(path: Path, root: Path):
+    resolved_root = root.resolve()
+    resolved_path = path.resolve()
+    if resolved_root not in resolved_path.parents:
+        raise ValueError(f"Refusing to delete a path outside {resolved_root}")
+    if desktop_vault.is_initialized() and path.name.endswith(".fbenc"):
+        desktop_vault.delete(desktop_vault.logical_path(path))
+    elif desktop_vault.is_initialized():
+        desktop_vault.delete(path)
+    elif path.is_file() or path.is_symlink():
+        path.unlink()
+
+
+@app.post("/desktop/clear-workspace")
+def clear_desktop_workspace(payload: dict, request: Request):
+    if not _is_local_desktop_mode() or not os.environ.get("FALCONBROOM_DESKTOP_SECRET"):
+        raise HTTPException(status_code=403, detail="Only available in the packaged desktop app")
+    if payload.get("confirm_text") != "DELETE LOCAL WORKSPACE":
+        raise HTTPException(status_code=400, detail="Confirmation text mismatch")
+    roots = (UPLOAD_DIR, OUTPUTS_DIR, RECIPES_DIR, HISTORY_DIR, INSPECTIONS_DIR)
+    data_dir = Path.cwd().resolve() / "data"
+    if data_dir.resolve() != data_dir:
+        raise HTTPException(status_code=409, detail="Data directory is redirected; cleanup stopped")
+    paths = []
+    for root in roots:
+        if root.is_symlink() or root.resolve().parent != data_dir:
+            raise HTTPException(status_code=409, detail="Workspace contains a symbolic link; cleanup stopped")
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if path.is_symlink():
+                raise HTTPException(status_code=409, detail="Workspace contains a symbolic link; cleanup stopped")
+            if path.is_file():
+                if not path.resolve().is_relative_to(root.resolve()):
+                    raise HTTPException(status_code=409, detail="Workspace path is outside its data directory")
+                paths.append((path, root))
+    try:
+        for path, root in paths:
+            _delete_owned_file(path, root)
+        if desktop_vault.is_initialized():
+            desktop_vault.cleanup_abandoned_scratch()
+    except (OSError, ValueError):
+        logger.exception("Desktop workspace cleanup failed")
+        raise HTTPException(status_code=500, detail="Workspace cleanup incomplete; retry or contact support")
+    return {"ok": True, "deleted_files": len(paths)}
+
+
+@app.post("/desktop/protect-inspections")
+def protect_desktop_inspections(payload: dict, request: Request):
+    if not _is_local_desktop_mode() or not os.environ.get("FALCONBROOM_DESKTOP_SECRET"):
+        raise HTTPException(status_code=403, detail="Only available in the packaged desktop app")
+    if payload.get("confirm_text") != "PROTECT INSPECTIONS":
+        raise HTTPException(status_code=400, detail="Confirmation text mismatch")
+    try:
+        migrated = migrate_inspections(INSPECTIONS_DIR)
+    except (OSError, ValueError, RuntimeError) as error:
+        logger.exception("Inspection migration failed")
+        raise HTTPException(status_code=500, detail="Inspection migration incomplete; check your backup and retry") from error
+    return {"ok": True, "migrated": migrated}
+
+
+def _delete_local_user_data(user_id: str, user_email: Optional[str] = None):
+    failures = []
+
+    def remove(path: Path, root: Path):
+        try:
+            _delete_owned_file(path, root)
+            return True
+        except (OSError, ValueError) as error:
+            failures.append(f"{path.name}: {error.__class__.__name__}")
+            return False
+
+    def read_record(path: Path):
+        try:
+            return read_inspection(path) if path.parent == INSPECTIONS_DIR else json.loads(desktop_vault.read_text(path))
+        except (OSError, ValueError, RuntimeError) as error:
+            failures.append(f"{path.name}: unreadable ownership metadata ({error.__class__.__name__})")
+            return None
+
+    upload_files = desktop_vault.logical_files(UPLOAD_DIR) if desktop_vault.is_initialized() else list(UPLOAD_DIR.iterdir())
+    for meta_path in upload_files:
+        if not meta_path.name.endswith(".meta.json"):
+            continue
+        path = meta_path.with_name(meta_path.name[:-len(".meta.json")])
+        metadata = read_record(meta_path)
+        if isinstance(metadata, dict) and (metadata.get("owner") or {}).get("user_id") == user_id:
+            if remove(path, UPLOAD_DIR):
+                remove(meta_path, UPLOAD_DIR)
+
+    for session_path in _sessions_dir().glob("session_*.json"):
+        try:
+            session = _read_session_file(session_path)
+        except Exception as error:
+            failures.append(f"{session_path.name}: unreadable session ({error.__class__.__name__})")
+            continue
+        if session.get("user_id") == user_id:
+            remove(session_path, _sessions_dir())
+
+    owned_history_outputs = []
+    for root in (RECIPES_DIR, HISTORY_DIR, INSPECTIONS_DIR):
+        if not root.exists():
+            continue
+        paths = _record_files(root) if root != INSPECTIONS_DIR else list(root.glob("*.json"))
+        for path in paths:
+            record = read_record(path)
+            if not isinstance(record, dict):
+                continue
+            if (record.get("owner") or {}).get("user_id") != user_id:
+                continue
+            if root == HISTORY_DIR:
+                record_outputs = []
+                output_path = record.get("output_path")
+                if isinstance(output_path, str) and output_path.strip():
+                    record_outputs.append(Path(output_path))
+                for output in record.get("outputs") or []:
+                    candidate = output.get("path") if isinstance(output, dict) else output
+                    if isinstance(candidate, str) and candidate.strip():
+                        record_outputs.append(Path(candidate))
+                try:
+                    for output in record_outputs:
+                        if desktop_vault.exists(output):
+                            _require_owned_file(str(output), {"id": user_id}, (OUTPUTS_DIR,))
+                except HTTPException:
+                    failures.append(f"{path.name}: cannot verify output ownership")
+                    continue
+                owned_history_outputs.extend(record_outputs)
+            remove(path, root)
+
+    for output_path in owned_history_outputs:
+        remove(output_path, OUTPUTS_DIR)
+
+    for root in (OUTPUTS_DIR, HISTORY_DIR / "snapshots"):
+        if not root.exists():
+            continue
+        metadata_paths = root.rglob("*.meta.json*") if desktop_vault.is_initialized() else root.rglob("*.meta.json")
+        for stored_path in metadata_paths:
+            metadata_path = desktop_vault.logical_path(stored_path) if desktop_vault.is_initialized() else stored_path
+            if not metadata_path.name.endswith(".meta.json"):
+                continue
+            metadata = read_record(metadata_path)
+            owner = metadata.get("owner") if isinstance(metadata, dict) else None
+            if not isinstance(owner, dict) or str(owner.get("user_id") or "") != str(user_id):
+                continue
+            artifact = metadata_path.with_name(metadata_path.name[:-len(".meta.json")])
+            if remove(artifact, root):
+                remove(metadata_path, root)
+
+    consent_dir = Path("data") / "consents"
+    if consent_dir.exists():
+        for path in consent_dir.glob("consent_*.json"):
+            record = read_record(path)
+            if isinstance(record, dict) and record.get("user_id") == user_id:
+                remove(path, consent_dir)
+
+    for path in JOBS_DIR.glob("job_*.json"):
+        record = read_record(path)
+        if not isinstance(record, dict) or record.get("type") not in {
+            "export_consents",
+            "delete_consents",
+        }:
+            continue
+        if user_id not in {record.get("user_id"), record.get("requester_user_id")}:
+            continue
+        export_path = (record.get("result") or {}).get("export_path")
+        if isinstance(export_path, str) and export_path:
+            if not remove(Path(export_path), consent_dir / "exports"):
+                continue
+        remove(path, JOBS_DIR)
+
+    dsar_dir = Path("data") / "dsar"
+    if dsar_dir.exists():
+        for path in dsar_dir.glob("dsar_*.json"):
+            record = read_record(path)
+            if not isinstance(record, dict) or record.get("user_id") != user_id:
+                continue
+            export_path = record.get("export_path")
+            if isinstance(export_path, str) and export_path:
+                if not remove(Path(export_path), OUTPUTS_DIR):
+                    continue
+            remove(path, dsar_dir)
+
+    email_dir = Path("data") / "emails"
+    if user_email and email_dir.exists():
+        for path in email_dir.glob("email_*.json"):
+            record = read_record(path)
+            if isinstance(record, dict) and str(record.get("to") or "").lower() == user_email.lower():
+                remove(path, email_dir)
+
+    if user_email:
+        optouts = _load_privacy_json("opt_outs.json", []) or []
+        filtered_optouts = [
+            item
+            for item in optouts
+            if item.get("user_id") != user_id
+            and str(item.get("email") or "").lower() != user_email.lower()
+        ]
+        if len(filtered_optouts) != len(optouts):
+            _save_privacy_json("opt_outs.json", filtered_optouts)
+
+    if failures:
+        logger.error("Account data deletion incomplete for %s (%s failures)", user_id, len(failures))
+        raise RuntimeError(f"Could not verify or remove {len(failures)} local data item(s)")
+
+
+def _save_account_deletion_job(job: dict):
+    deletion_dir = Path("data") / "account_deletions"
+    deletion_dir.mkdir(parents=True, exist_ok=True)
+    path = deletion_dir / f"{job['id']}.json"
+    temp_path = deletion_dir / f".{job['id']}.{uuid4().hex}.tmp"
+    try:
+        temp_path.write_text(json.dumps(job, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(temp_path, path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
+async def _process_account_deletion_job(job: dict):
+    user_id = job["user_id"]
+    user_file = _users_dir() / f"{user_id}.json"
+    try:
+        user = json.loads(user_file.read_text(encoding="utf-8")) if user_file.exists() else {
+            "id": user_id,
+            "email": job.get("email"),
+            "auth_provider": job.get("auth_provider"),
+        }
+        if user_file.is_file() and user.get("account_deletion_status") != "pending":
+            user["account_deletion_status"] = "pending"
+            user_file.write_text(json.dumps(user, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        if job["steps"]["local_data"] != "completed":
+            _delete_local_user_data(user_id, user.get("email"))
+            job["steps"]["local_data"] = "completed"
+            _save_account_deletion_job(job)
+
+        if _is_supabase_account(user):
+            if job["steps"]["supabase_data"] != "completed":
+                response = await _call_supabase_service_role(
+                    "/rest/v1/rpc/falconbroom_delete_user_data",
+                    method="POST",
+                    json_body={"p_user_id": user_id},
+                )
+                if getattr(response, "status_code", None) != 200:
+                    raise RuntimeError("Supabase user-data deletion failed")
+                result = response.json()
+                storage_objects = result.get("storage_objects") if isinstance(result, dict) else None
+                if not isinstance(storage_objects, list):
+                    raise RuntimeError("Supabase user-data deletion returned an invalid result")
+                job["storage_objects"] = storage_objects
+                job["steps"]["supabase_data"] = "completed"
+                _save_account_deletion_job(job)
+
+            if job["steps"]["supabase_storage"] != "completed":
+                objects = job.get("storage_objects") or []
+                by_bucket = {}
+                for item in objects:
+                    if not isinstance(item, dict):
+                        raise RuntimeError("Supabase storage deletion returned an invalid object")
+                    bucket = item.get("bucket_id")
+                    name = item.get("name")
+                    if not isinstance(bucket, str) or not bucket or not isinstance(name, str) or not name:
+                        raise RuntimeError("Supabase storage deletion returned an invalid object")
+                    by_bucket.setdefault(bucket, []).append(name)
+                for bucket, names in by_bucket.items():
+                    response = await _call_supabase_service_role(
+                        f"/storage/v1/object/{quote(bucket, safe='')}",
+                        method="DELETE",
+                        json_body={"prefixes": names},
+                    )
+                    if getattr(response, "status_code", None) not in (200, 204):
+                        raise RuntimeError("Supabase Storage deletion failed")
+                job["steps"]["supabase_storage"] = "completed"
+                _save_account_deletion_job(job)
+
+            if job["steps"]["supabase_auth"] != "completed":
+                response = await _call_supabase_service_role(
+                    f"/auth/v1/admin/users/{user_id}",
+                    method="DELETE",
+                )
+                if getattr(response, "status_code", None) not in (200, 204, 404):
+                    raise RuntimeError("Supabase Auth account deletion failed")
+                job["steps"]["supabase_auth"] = "completed"
+        else:
+            job["steps"]["supabase_data"] = "skipped"
+            job["steps"]["supabase_storage"] = "skipped"
+            job["steps"]["supabase_auth"] = "skipped"
+
+        for session_path in _sessions_dir().glob("session_*.json"):
+            try:
+                session = _read_session_file(session_path)
+            except Exception:
+                continue
+            if session.get("user_id") == user_id:
+                session_path.unlink(missing_ok=True)
+        user_file.unlink(missing_ok=True)
+        job.update(status="completed", completed_at=datetime.now(timezone.utc).isoformat())
+        job.pop("storage_objects", None)
+        job.pop("user_id", None)
+        job.pop("email", None)
+        job.pop("auth_provider", None)
+        _save_account_deletion_job(job)
+        _consent_audit("account_deletion_completed", {"job_id": job["id"]})
+        return {"ok": True, "job_id": job["id"], "status": "completed"}
+    except Exception as error:
+        job.update(
+            status="needs_attention",
+            updated_at=datetime.now(timezone.utc).isoformat(),
+            last_error=error.__class__.__name__,
+        )
+        _save_account_deletion_job(job)
+        logger.exception("Account deletion job %s needs attention", job["id"])
+        return {
+            "ok": False,
+            "job_id": job["id"],
+            "status": "needs_attention",
+            "message": "Deletion is incomplete and requires a retry by an administrator.",
+        }
+
+
+async def _start_account_deletion(user: dict):
+    if _is_supabase_account(user) and os.environ.get("FALCONBROOM_DESKTOP_SECRET"):
+        raise HTTPException(status_code=503, detail="Supabase account deletion is not yet available in the desktop app; contact support")
+    user_id = str(user.get("id") or "")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", user_id):
+        raise HTTPException(status_code=401, detail="Authenticated user required")
+    if _is_supabase_account(user) and not _is_uuid(user_id):
+        raise HTTPException(status_code=401, detail="Invalid Supabase account ID")
+    job = {
+        "id": f"deletion_{uuid4().hex}",
+        "user_id": user_id,
+        "email": user.get("email"),
+        "auth_provider": "supabase" if _is_supabase_account(user) else "local",
+        "status": "in_progress",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "steps": {
+            "local_data": "pending",
+            "supabase_data": "pending",
+            "supabase_storage": "pending",
+            "supabase_auth": "pending",
+        },
+    }
+    _save_account_deletion_job(job)
+    return await _process_account_deletion_job(job)
+
+
 @app.post("/dsar/delete")
-def dsar_delete(request: Request, payload: dict):
+async def dsar_delete(request: Request, payload: dict):
     """Perform deletion of user data after DSAR verification. Requires password in payload."""
     try:
         user = _require_auth(request)
         pwd = payload.get("password")
-        # allow deletion if password verified OR a prior DSAR verification was completed
-        verified = False
-        if pwd and _verify_password(pwd, user.get("pw_salt"), user.get("pw_hash")):
-            verified = True
-        else:
-            # look for a verified DSAR record for this user
-            try:
-                dsar_dir = Path("data") / "dsar"
-                for p in dsar_dir.glob("dsar_*.json"):
-                    try:
-                        r = json.loads(p.read_text(encoding="utf-8"))
-                        if r.get("user_id") == user.get("id") and r.get("action") == "delete" and r.get("status") == "verified":
-                            verified = True
-                            break
-                    except Exception:
-                        continue
-            except Exception:
-                pass
+        verified = _has_verified_deletion_request(user.get("id"))
+        if not verified and pwd:
+            if _is_supabase_account(user):
+                await _verify_supabase_password(
+                    user.get("email") or "",
+                    pwd,
+                    str(user.get("id") or ""),
+                )
+                verified = True
+            elif user.get("pw_salt") and user.get("pw_hash"):
+                verified = _verify_password(pwd, user["pw_salt"], user["pw_hash"])
         if not verified:
             raise HTTPException(status_code=401, detail="Identity verification failed")
-        # perform deletion: user file, sessions, uploads owned by user, outputs and history (best-effort)
-        uid = user.get("id")
-        deleted = []
-        # delete user file
-        try:
-            p = _users_dir() / f"{uid}.json"
-            if p.exists():
-                p.unlink()
-                deleted.append(str(p))
-        except Exception:
-            pass
-        # delete sessions
-        try:
-            for p in _sessions_dir().glob("session_*.json"):
-                try:
-                    s = _read_session_file(p)
-                    if s.get("user_id") == uid:
-                        p.unlink()
-                        deleted.append(str(p))
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        # delete uploads where meta.owner matches user
-        try:
-            for p in UPLOAD_DIR.iterdir():
-                try:
-                    if not p.is_file():
-                        continue
-                    meta = p.parent / (p.name + ".meta.json")
-                    owner = {}
-                    if meta.exists():
-                        try:
-                            owner = json.loads(meta.read_text(encoding="utf-8"))
-                        except Exception:
-                            owner = {}
-                    o = owner.get("owner") or {}
-                    if o.get("user_id") == uid or (o.get("email") and o.get("email").lower() == (user.get("email") or "").lower()):
-                        try:
-                            p.unlink()
-                        except Exception:
-                            pass
-                        try:
-                            if meta.exists():
-                                meta.unlink()
-                        except Exception:
-                            pass
-                        deleted.append(str(p))
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        # delete history/run records and associated outputs owned by user
-        try:
-            for p in HISTORY_DIR.glob("*.json"):
-                try:
-                    j = json.loads(p.read_text(encoding="utf-8"))
-                    owner = j.get("owner") or {}
-                    if owner.get("user_id") == uid:
-                        # delete referenced output files if present
-                        # common naming: {rid}_{run_id} or run id in filename
-                        run_id = j.get("id")
-                        rid = j.get("recipe_id")
-                        try:
-                            for outp in OUTPUTS_DIR.iterdir():
-                                try:
-                                    if run_id and run_id in outp.name:
-                                        outp.unlink()
-                                        deleted.append(str(outp))
-                                    elif rid and rid in outp.name:
-                                        # also try recipe-based outputs
-                                        outp.unlink()
-                                        deleted.append(str(outp))
-                                except Exception:
-                                    continue
-                        except Exception:
-                            pass
-                        try:
-                            p.unlink()
-                            deleted.append(str(p))
-                        except Exception:
-                            pass
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-        # best-effort: delete any outputs that reference user id in filename
-        try:
-            for outp in OUTPUTS_DIR.iterdir():
-                try:
-                    if (user.get("id") and user.get("id") in outp.name) or (user.get("email") and user.get("email") in outp.name):
-                        try:
-                            outp.unlink()
-                            deleted.append(str(outp))
-                        except Exception:
-                            pass
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-        # write propagation record for third-party/manual actions
-        try:
-            dsar_dir = Path("data") / "dsar"
-            dsar_dir.mkdir(parents=True, exist_ok=True)
-            prop = dsar_dir / f"propagation_{uuid4().hex[:8]}.json"
-            try:
-                save_sensitive_json(prop, {"user_id": uid, "deleted": deleted, "ts": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')})
-            except Exception:
-                prop.write_text(json.dumps({"user_id": uid, "deleted": deleted, "ts": datetime.now(timezone.utc).isoformat().replace('+00:00','Z')} , indent=2), encoding="utf-8")
-            # audit
-            try:
-                _append_audit_event(dsar_dir, "delete", {"user_id": uid, "deleted_count": len(deleted)})
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-        return {"ok": True, "deleted_count": len(deleted)}
+        return await _start_account_deletion(user)
     except HTTPException:
         raise
     except Exception as e:
@@ -6067,6 +7041,7 @@ def admin_queue_delete(request: Request, payload: dict):
 @app.post("/team/invite")
 def team_invite(payload: dict, request: Request):
     try:
+        _require_team_features()
         user = _require_auth(request)
         email = (payload.get("email") or "").strip()
         role = payload.get("role") or "member"
@@ -6108,6 +7083,7 @@ def team_invite(payload: dict, request: Request):
 def team_accept(payload: dict, request: Request):
     """Join a team using an invite token. The caller must be signed in as the invited email."""
     try:
+        _require_team_features()
         user = _require_auth(request)
         token = payload.get("token")
         if not token:
@@ -6146,9 +7122,11 @@ def share_upload(name: str, payload: dict, request: Request):
     Persists a small .meta.json file beside the upload to record sharing metadata.
     """
     try:
+        _require_team_features()
         user = _require_auth(request)
         shared = bool(payload.get("shared"))
         upath = UPLOAD_DIR / name
+        _require_owned_file(str(upath), user)
         if not upath.exists():
             raise HTTPException(status_code=404, detail="Upload not found")
         # enforce opt-out: do not allow sharing if user opted-out of sale/targeting
@@ -6212,7 +7190,7 @@ def _shared_uploads_for(user: dict):
                 if not meta.exists():
                     continue
                 mj = json.loads(meta.read_text(encoding="utf-8"))
-                if mj.get("shared_with_team") and mj.get("shared_by") in team_ids:
+                if mj.get("shared_with_team") and mj.get("shared_by") in team_ids and _record_is_owned(mj, user):
                     st = p.stat()
                     out.append({"name": p.name, "path": str(p), "size": st.st_size, "modified_at": datetime.utcfromtimestamp(st.st_mtime).isoformat() + "Z", "shared_by": mj.get("shared_by"), "shared_at": mj.get("shared_at")})
             except Exception:
@@ -6224,6 +7202,7 @@ def _shared_uploads_for(user: dict):
 
 @app.get("/uploads/shared")
 def list_shared_uploads(request: Request):
+    _require_team_features()
     return _shared_uploads_for(_require_auth(request))
 
 
@@ -6399,6 +7378,9 @@ def privacy_record(payload: dict):
 
 @app.websocket("/ws/shared")
 async def ws_shared(websocket: WebSocket):
+    if not TEAM_FEATURES_ENABLED:
+        await websocket.close(code=1008)
+        return
     token = websocket.query_params.get("token") or ""
     user = _get_user_from_token(token) if token else None
     if not user:
@@ -6428,6 +7410,9 @@ def me(request: Request):
         user = _require_auth(request)
         # don't expose password data
         safe = {k: v for k, v in user.items() if k not in ("pw_hash", "pw_salt")}
+        if not TEAM_FEATURES_ENABLED:
+            for key in ("team_name", "team_members", "team_roles", "team_owner"):
+                safe.pop(key, None)
         return safe
     except HTTPException:
         raise
@@ -6439,6 +7424,7 @@ def me(request: Request):
 @app.get("/team/invites")
 def list_team_invites(request: Request):
     try:
+        _require_team_features()
         user = _require_auth(request)
         invdir = Path("data") / "invites"
         out = []
@@ -6504,6 +7490,7 @@ def list_team_invites(request: Request):
 @app.get("/team/members")
 def list_team_members(request: Request):
     try:
+        _require_team_features()
         user = _require_auth(request)
         # determine owner of the team
         owner = None
@@ -6556,6 +7543,7 @@ def list_team_members(request: Request):
 @app.delete("/team/invites/{invite_id}")
 def revoke_invite(invite_id: str, request: Request):
     try:
+        _require_team_features()
         user = _require_auth(request)
         invdir = Path("data") / "invites"
         p = invdir / invite_id
@@ -6589,6 +7577,7 @@ def revoke_invite(invite_id: str, request: Request):
 @app.post("/team/invite/decline")
 def decline_invite(payload: dict):
     try:
+        _require_team_features()
         token = payload.get("token")
         if not token:
             raise HTTPException(status_code=400, detail="Missing token")
@@ -6629,6 +7618,7 @@ def decline_invite(payload: dict):
 @app.patch("/team/members")
 def update_team_member(payload: dict, request: Request):
     try:
+        _require_team_features()
         user = _require_auth(request)
         # restrict to canonical team owner for this user's team
         if not user.get("team_name"):
@@ -6678,6 +7668,7 @@ def update_team_member(payload: dict, request: Request):
 @app.post("/team/owners")
 def manage_team_owner(payload: dict, request: Request):
     try:
+        _require_team_features()
         user = _require_auth(request)
         # only canonical owner may manage owners
         if not user.get("team_name"):
@@ -6826,7 +7817,7 @@ async def _call_supabase_service_role(path: str, method: str = 'GET', json_body:
         elif method.upper() == 'PATCH':
             r = await client.patch(url, headers=headers, json=json_body)
         elif method.upper() == 'DELETE':
-            r = await client.delete(url, headers=headers, json=json_body)
+            r = await client.request('DELETE', url, headers=headers, json=json_body)
         else:
             r = await client.request(method, url, headers=headers, json=json_body)
     return r
@@ -7067,7 +8058,10 @@ def account_export(request: Request):
     try:
         user = _require_auth(request)
         # enqueue export job scoped to this user
-        return enqueue_export_job(user_id=user.get("id"))
+        user_id = user.get("id")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Authenticated user required")
+        return _enqueue_consent_job("export_consents", user_id, user_id)
     except HTTPException:
         raise
     except Exception as e:
@@ -7075,37 +8069,55 @@ def account_export(request: Request):
 
 
 @app.post("/account/delete")
-def account_delete(spec: DeleteAccountRequest, request: Request):
+async def account_delete(spec: DeleteAccountRequest, request: Request):
     try:
-        # Utah-style verifiable request: require password and explicit confirm text
         user = _require_auth(request)
         if spec.confirm_text.strip() != "DELETE MY ACCOUNT":
             raise HTTPException(status_code=400, detail="Confirmation text mismatch; type exactly: DELETE MY ACCOUNT")
-        if not _verify_password(spec.password, user.get("pw_salt"), user.get("pw_hash")):
+        if _is_supabase_account(user) and os.environ.get("FALCONBROOM_DESKTOP_SECRET"):
+            raise HTTPException(status_code=503, detail="Supabase account deletion is not yet available in the desktop app; contact support")
+        if _is_supabase_account(user):
+            await _verify_supabase_password(
+                user.get("email") or "",
+                spec.password,
+                str(user.get("id") or ""),
+            )
+        elif not (
+            user.get("pw_salt")
+            and user.get("pw_hash")
+            and _verify_password(spec.password, user["pw_salt"], user["pw_hash"])
+        ):
             raise HTTPException(status_code=401, detail="Invalid password")
-        # enqueue deletion of consents for this user
-        resp = enqueue_delete_job(user_id=user.get("id"))
-        # remove user record and sessions
-        try:
-            p = _users_dir() / f"{user.get('id')}.json"
-            if p.exists():
-                p.unlink()
-        except Exception:
-            pass
-        # remove all sessions for user
-        for s in _sessions_dir().glob("session_*.json"):
-            try:
-                data = json.loads(s.read_text(encoding="utf-8"))
-                if data.get("user_id") == user.get("id"):
-                    s.unlink()
-            except Exception:
-                continue
-        _consent_audit("account_delete_requested", {"user_id": user.get("id")})
-        return resp
+        return await _start_account_deletion(user)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/account-deletion/{job_id}/retry")
+async def retry_account_deletion(job_id: str, request: Request):
+    try:
+        _require_admin(request)
+        if not re.fullmatch(r"deletion_[0-9a-f]{32}", job_id):
+            raise HTTPException(status_code=404, detail="Deletion job not found")
+        job_path = Path("data") / "account_deletions" / f"{job_id}.json"
+        if not job_path.is_file():
+            raise HTTPException(status_code=404, detail="Deletion job not found")
+        job = json.loads(job_path.read_text(encoding="utf-8"))
+        if job.get("status") == "completed":
+            return {"ok": True, "job_id": job_id, "status": "completed"}
+        if not job.get("user_id") or not isinstance(job.get("steps"), dict):
+            raise HTTPException(status_code=409, detail="Deletion job cannot be retried")
+        job["status"] = "in_progress"
+        job.pop("last_error", None)
+        _save_account_deletion_job(job)
+        return await _process_account_deletion_job(job)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unable to retry account deletion %s", job_id)
+        raise HTTPException(status_code=500, detail="Unable to retry account deletion")
 
 
 @app.patch("/account")
@@ -7113,7 +8125,9 @@ def account_update(payload: dict, request: Request):
     try:
         user = _require_auth(request)
         # allow updating email and team info
-        allowed = {"email", "team_name", "team_members"}
+        allowed = {"email"}
+        if TEAM_FEATURES_ENABLED:
+            allowed.update({"team_name", "team_members"})
         changed = False
         for k, v in payload.items():
             if k in allowed:
@@ -7124,6 +8138,9 @@ def account_update(payload: dict, request: Request):
             p.write_text(json.dumps(user, indent=2, ensure_ascii=False), encoding="utf-8")
             _consent_audit("account_update", {"user_id": user.get("id"), "changes": {k: payload.get(k) for k in payload if k in allowed}})
         safe = {kk: vv for kk, vv in user.items() if kk not in ("pw_hash", "pw_salt")}
+        if not TEAM_FEATURES_ENABLED:
+            for key in ("team_name", "team_members", "team_roles", "team_owner"):
+                safe.pop(key, None)
         return safe
     except HTTPException:
         raise
@@ -7133,8 +8150,16 @@ def account_update(payload: dict, request: Request):
 
 
 @app.post("/preview")
-def preview_recipe(recipe: Recipe, recipe_id: Optional[str] = None, n: Optional[int] = None):
+def preview_recipe(recipe: Recipe, request: Request, recipe_id: Optional[str] = None, n: Optional[int] = None):
     try:
+        user = _recipe_auth_user(request)
+        if recipe_id:
+            _, stored_recipe, _ = _load_recipe_for_request(recipe_id, request)
+            _require_recipe_sources_owned(stored_recipe.get("recipe") or {}, user)
+        _require_recipe_sources_owned(
+            recipe.model_dump() if hasattr(recipe, "model_dump") else recipe.dict(),
+            user,
+        )
         # Debug: log incoming recipe payload (truncated) and recipe_id
         try:
             raw = recipe.json() if hasattr(recipe, 'json') else str(recipe)
@@ -7145,7 +8170,7 @@ def preview_recipe(recipe: Recipe, recipe_id: Optional[str] = None, n: Optional[
         src = recipe.sources[0]["path"] if recipe.sources else None
         if not src:
             raise HTTPException(status_code=400, detail="Recipe missing source path")
-        if not Path(src).exists():
+        if not desktop_vault.exists(Path(src)):
             raise HTTPException(status_code=400, detail=f"Source path not found: {src}")
         # if UI sent empty cleaning_steps, attempt to fallback to last generated recipe for this source
         try:
@@ -7172,14 +8197,15 @@ def preview_recipe(recipe: Recipe, recipe_id: Optional[str] = None, n: Optional[
                         recipe = new_recipe
         except Exception:
             pass
+        _require_recipe_sources_owned(recipe, user)
         out = cleaner.preview_recipe(recipe, n=(n if n is not None else 5))
         # schema drift: compare expected columns from saved recipe (if provided)
         schema_warnings = []
         if recipe_id:
             stored = RECIPES_DIR / f"{recipe_id}.json"
-            if stored.exists():
+            if desktop_vault.exists(stored):
                 try:
-                    data = json.loads(stored.read_text(encoding="utf-8"))
+                    data = _read_record(stored)
                     expected = set(data.get("expected_columns", []))
                     # profile current source
                     src = recipe.sources[0]["path"] if recipe.sources else None

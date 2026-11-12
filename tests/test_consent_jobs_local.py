@@ -1,6 +1,61 @@
 import importlib, os, time, json
 from pathlib import Path
 
+import pytest
+
+
+@pytest.mark.parametrize("job_type", ["export_consents", "delete_consents"])
+def test_packaged_desktop_runs_consent_job_before_request_returns(tmp_path, monkeypatch, job_type):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FALCONBROOM_LOCAL_MODE", "1")
+    monkeypatch.setenv("FALCONBROOM_DESKTOP_SECRET", "a" * 64)
+    import fbroom.main as main
+    importlib.reload(main)
+
+    consent_dir = Path("data") / "consents"
+    consent_dir.mkdir(parents=True, exist_ok=True)
+    (consent_dir / "consent_a.json").write_text(
+        json.dumps({"id": "consent_a", "user_id": "user_a"}), encoding="utf-8"
+    )
+
+    dispatches = []
+
+    def unexpected_dispatch(*args, **kwargs):
+        dispatches.append((args, kwargs))
+
+    task = main.celery_process_export_job if job_type == "export_consents" else main.celery_process_delete_job
+    monkeypatch.setattr(task, "delay", unexpected_dispatch)
+    result = main._enqueue_consent_job(job_type, "user_a", "user_a")
+    job = json.loads((Path("data") / "jobs" / f"{result['job_id']}.json").read_text())
+    assert not dispatches
+    assert job["status"] == "completed"
+    if job_type == "export_consents":
+        assert Path(job["result"]["export_path"]).is_file()
+    else:
+        assert not (consent_dir / "consent_a.json").exists()
+
+
+def test_packaged_desktop_reports_consent_job_failure(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("FALCONBROOM_LOCAL_MODE", "1")
+    monkeypatch.setenv("FALCONBROOM_DESKTOP_SECRET", "a" * 64)
+    import fbroom.main as main
+    importlib.reload(main)
+
+    def fail_job(job_id):
+        raise RuntimeError("job failed")
+
+    monkeypatch.setattr(main, "celery_process_export_job", fail_job)
+    with pytest.raises(main.HTTPException) as exc_info:
+        main._enqueue_consent_job("export_consents", "user_a", "user_a")
+    assert exc_info.value.status_code == 503
+    jobs = list((Path("data") / "jobs").glob("job_*.json"))
+    assert len(jobs) == 1
+    job = json.loads(jobs[0].read_text())
+    assert job["status"] == "failed"
+    assert job["result"]["error"] == "job_dispatch_failed"
+
+
 def test_export_and_delete_jobs_local(tmp_path, monkeypatch):
     # run module with CWD set to tmp_path so data/ dirs are created there
     monkeypatch.chdir(tmp_path)
@@ -17,7 +72,7 @@ def test_export_and_delete_jobs_local(tmp_path, monkeypatch):
     (CONSENT_DIR / 'consent_b.json').write_text(json.dumps(sample2))
 
     # enqueue export job
-    res = main.enqueue_export_job(user_id='user_a')
+    res = main._enqueue_consent_job('export_consents', 'user_a', 'user_a')
     jid = res.get('job_id')
     assert jid
 
@@ -37,7 +92,7 @@ def test_export_and_delete_jobs_local(tmp_path, monkeypatch):
         assert audit.exists()
 
     # enqueue delete job
-    res2 = main.enqueue_delete_job(user_id='user_a')
+    res2 = main._enqueue_consent_job('delete_consents', 'user_a', 'user_a')
     jid2 = res2.get('job_id')
     assert jid2
     time.sleep(0.1)

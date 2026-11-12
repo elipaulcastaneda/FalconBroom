@@ -7,6 +7,13 @@ import SignOut from './components/SignOut'
 import SuggestionList from './components/SuggestionList'
 import { useAccountUser } from './auth'
 import tokenStore from './tokenStore'
+import { readAnalyticsConsent, saveAnalyticsConsent, shouldLoadAnalytics } from './analyticsConsent.mjs'
+import { isDesktop } from './credentialStorage'
+import privacyNotice from '../../docs/customer-privacy-notice-draft.md?raw'
+
+function BetaDataNotice() {
+  return <p>Beta: use synthetic or non-sensitive data. Do not upload sensitive data or data belonging to other people or organizations until FalconBroom's safeguards have been assessed.</p>
+}
 
 function PathBasename(p){
   try{
@@ -19,15 +26,9 @@ function PathBasename(p){
 function DownloadLink({ url, label }){
   async function handleClick(e){
     e && e.preventDefault && e.preventDefault()
-    // Try opening a new window/tab first (user gesture)
+    // Fetch through the app session and trigger a blob download.
     try{
-      const w = window.open(url)
-      if (w) return
-    }catch(err){/* continue to fallback */}
-
-    // Fallback: fetch the resource and trigger a blob download
-    try{
-      const res = await fetch(url, { credentials: 'include' })
+      const res = await authFetch(url, { credentials: 'include' })
       if (!res.ok) throw new Error('Download failed')
       const blob = await res.blob()
       // try to parse filename from content-disposition
@@ -50,8 +51,7 @@ function DownloadLink({ url, label }){
       URL.revokeObjectURL(objUrl)
       return
     }catch(err){
-      // Last resort: navigate the window (may trigger download or show file)
-      try{ window.location.href = url }catch(e){}
+      console.error('Download failed', err)
     }
   }
 
@@ -64,7 +64,7 @@ function DownloadLink({ url, label }){
 }
 
   // end DownloadLink
-// Team collaboration is hidden for the individual-analyst beta. Set to true to re-enable.
+// Team collaboration is disabled while FalconBroom is limited to individual accounts.
 const TEAM_ENABLED = false
 
 const NAV_ITEMS = [
@@ -236,8 +236,6 @@ export default function App() {
   const [joinExporting, setJoinExporting] = useState(false)
   const [exportFormat, setExportFormat] = useState('csv')
   const [exportFilename, setExportFilename] = useState('joined')
-  const [joinTargetUser, setJoinTargetUser] = useState('')
-  const [exportTargetUser, setExportTargetUser] = useState('')
   const [joinLeftOn, setJoinLeftOn] = useState('')
   const [joinRightOn, setJoinRightOn] = useState('')
   const [joinType, setJoinType] = useState('inner')
@@ -283,7 +281,7 @@ export default function App() {
   }
   async function reviewSuggestion(s) {
     const sourcePath = path || (uploadsList[0] && uploadsList[0].path)
-    const res = await fetch(`${BACKEND}/review-options`, {
+    const res = await authFetch(`${BACKEND}/review-options`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: sourcePath, text: s.text, column: s.column || null }),
@@ -363,14 +361,19 @@ export default function App() {
   })
   const [workflowCheckpoints, setWorkflowCheckpoints] = useState(() => loadWorkflowCheckpoints(userId))
   const [consent, setConsent] = useState(() => {
-    try { return JSON.parse(window.localStorage.getItem('falconbroom_consent') || 'null') } catch { return null }
+    try { return readAnalyticsConsent(window.localStorage) } catch (e) {
+      console.warn('Failed to read analytics preference', e)
+      return null
+    }
   })
   const [consentHistory, setConsentHistory] = useState(null)
   const [showConsentHistory, setShowConsentHistory] = useState(false)
-  const [analyticsId, setAnalyticsId] = useState(() => {
+  const [savingConsent, setSavingConsent] = useState(false)
+  const [analyticsId] = useState(() => {
     try { return window.localStorage.getItem('falconbroom_analytics_id') || '' } catch { return '' }
   })
-  const [authToken, setAuthToken] = useState(() => { try { return window.localStorage.getItem('falconbroom_access_token') || '' } catch { return '' } })
+  const [authToken, setAuthToken] = useState(() => { try { return isDesktop ? '' : window.localStorage.getItem('falconbroom_access_token') || '' } catch { return '' } })
+  const [showPrivacyNotice, setShowPrivacyNotice] = useState(false)
   const [refreshingAuth, setRefreshingAuth] = useState(false)
   const [accountUser, setAccountUser] = useState(null)
   const { accountUser: remoteAccountUser, loading: accountLoading, reload: reloadAccount } = useAccountUser()
@@ -418,6 +421,14 @@ export default function App() {
     (async () => {
       try { const a = await tokenStore.getAccess(); if (a) setAuthToken(a) } catch(e){}
     })()
+  }, [])
+  useEffect(() => {
+    function warn() {
+      addToast('Secure credential storage is unavailable. Your session may be temporary; sign in again after restarting. Check and remove any saved credentials on this device.', 'warn', 12000)
+    }
+    window.addEventListener('fb_credential_storage_warning', warn)
+    if (window.__FB_CREDENTIAL_STORAGE_WARNING) warn()
+    return () => window.removeEventListener('fb_credential_storage_warning', warn)
   }, [])
   const [teamMembers, setTeamMembers] = useState([])
   const [teamMemberObjects, setTeamMemberObjects] = useState([])
@@ -467,6 +478,8 @@ export default function App() {
   const [newMemberEmail, setNewMemberEmail] = useState('')
   const [deletePassword, setDeletePassword] = useState('')
   const [deleteConfirmTextLocal, setDeleteConfirmTextLocal] = useState('')
+  const [workspaceDeleteConfirmation, setWorkspaceDeleteConfirmation] = useState('')
+  const [inspectionProtectionConfirmation, setInspectionProtectionConfirmation] = useState('')
   const [dsarAction, setDsarAction] = useState('export')
   const [dsarPassword, setDsarPassword] = useState('')
   const [dsarToken, setDsarToken] = useState('')
@@ -573,7 +586,6 @@ export default function App() {
       compositePairs,
       exportFormat,
       exportFilename,
-      joinTargetUser,
     }
   }
 
@@ -674,7 +686,6 @@ export default function App() {
     setCompositePairs(state.compositePairs || [])
     setExportFormat(state.exportFormat || "csv")
     setExportFilename(state.exportFilename || "joined")
-    setJoinTargetUser(state.joinTargetUser || "")
     setJoinPreviewResult(null)
     setJoinLeftPreview(null)
     setJoinRightPreview(null)
@@ -959,7 +970,7 @@ export default function App() {
 
   async function doInspectSource(nextPath, nextOffset = 0) {
     try {
-      const res = await fetch(`${BACKEND}/inspect`, {
+      const res = await authFetch(`${BACKEND}/inspect`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ path: nextPath, offset: nextOffset, limit: INSPECT_PAGE_SIZE }),
@@ -1021,7 +1032,7 @@ export default function App() {
 
   async function loadPlainSuggestions(nextPath) {
     try {
-      const mdRes = await fetch(`${BACKEND}/metadata`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: nextPath }) })
+      const mdRes = await authFetch(`${BACKEND}/metadata`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: nextPath }) })
       if (!mdRes.ok) return
       const md = await mdRes.json()
       const pls = md?.metadata?.plain_language_suggestions || []
@@ -1034,7 +1045,7 @@ export default function App() {
   async function doProfileForPath(nextPath) {
     setProfileLoading(true)
     try {
-      const profileRes = await fetch(`${BACKEND}/profile`, {
+      const profileRes = await authFetch(`${BACKEND}/profile`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ path: nextPath }),
@@ -1051,7 +1062,7 @@ export default function App() {
       await doInspectSource(nextPath, 0)
       // fetch metadata (suggestions) to populate plain-language suggestions
       try {
-        const mdRes = await fetch(`${BACKEND}/metadata`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: nextPath }) })
+        const mdRes = await authFetch(`${BACKEND}/metadata`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: nextPath }) })
         if (mdRes.ok) {
           const md = await mdRes.json()
           const pls = md?.metadata?.plain_language_suggestions || []
@@ -1160,7 +1171,7 @@ export default function App() {
       <div className="auth-root" style={{display:'flex',justifyContent:'center',alignItems:'center',minHeight:'100vh',padding:48}}>
         <div style={{maxWidth:920,display:'flex',gap:28,alignItems:'stretch',width:'100%'}}>
           <div className="card" style={{flex:1}}>
-            <div className="card-header"><h2>Welcome back</h2><p>Log in to access your team, uploads, and recipes.</p></div>
+            <div className="card-header"><h2>Welcome back</h2><p>Log in to access your account, uploads, and recipes.</p></div>
             <div style={{padding:12}}>
               <label>Email</label>
               <input type="email" value={loginIdentity} onChange={(e)=>setLoginIdentity(e.target.value)} placeholder="you@example.com" />
@@ -1175,7 +1186,7 @@ export default function App() {
             </div>
           </div>
           <div className="card" style={{flex:1}}>
-            <div className="card-header"><h2>Create account</h2><p>Sign up to save your work and invite teammates.</p></div>
+            <div className="card-header"><h2>Create account</h2><p>Sign up to save your work and access your account.</p></div>
             <div style={{padding:12}}>
               <label>Username</label>
               <input value={signupUsername} onChange={(e)=>setSignupUsername(e.target.value)} placeholder="username" />
@@ -1485,22 +1496,29 @@ export default function App() {
   }
 
   async function doLogout() {
+    let failed = false
     try {
       const supabase = (await import('./supabaseClient')).default
-      await supabase.auth.signOut()
-    } catch (e) { /* ignore */ }
+      const { error } = await supabase.auth.signOut()
+      if (error) throw error
+    } catch (e) {
+      console.error('Sign-out failed', e)
+      failed = true
+    }
     setAccountUser(null); setAuthToken(''); try { window.localStorage.removeItem('falconbroom_access_token') } catch {}
     // refresh cookie cleared by server during logout
     try { window.localStorage.setItem('fb_manual_signed_out', '1') } catch (e) {}
-    try { await tokenStore.removeAccess(); await tokenStore.removeRefresh() } catch(e){}
-    addToast('Logged out', 'info')
+    for (const remove of [tokenStore.removeAccess, tokenStore.removeRefresh]) {
+      try { await remove() } catch (e) { console.error('Credential removal failed', e); failed = true }
+    }
+    addToast(failed ? 'Sign-out or credential removal failed. Retry and check this device’s saved credentials.' : 'Logged out', failed ? 'error' : 'info')
   }
 
   async function saveAccountUpdates() {
     try {
       const token = authToken || await tokenStore.getAccess()
       if (!token) { addToast('Not authenticated', 'error'); return }
-      const body = { email: accountUser?.email || '', team_name: teamName, team_members: teamMembers }
+      const body = { email: accountUser?.email || '' }
       const res = await authFetch(`${BACKEND}/account`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
       if (!res.ok) { addToast('Update failed', 'error'); return }
       const j = await res.json()
@@ -1544,9 +1562,53 @@ export default function App() {
       if (!token) { addToast('Not authenticated', 'error'); return }
       const res = await authFetch(`${BACKEND}/account/delete`, { method: 'POST', headers: { 'Content-Type':'application/json' }, body: JSON.stringify({ password: deletePassword, confirm_text: deleteConfirmTextLocal }) })
       if (!res.ok) { const t = await res.text(); addToast('Delete failed: ' + t, 'error'); return }
-      addToast('Account deletion requested', 'info')
-      doLogout()
+      const result = await res.json()
+      if (result.status === 'completed') {
+        addToast('Account and associated app data deleted', 'success')
+      } else {
+        addToast(`Deletion needs attention. Contact support with job ${result.job_id}.`, 'warn', 9000)
+      }
+      setDeletePassword('')
+      await doLogout()
     } catch (e) { addToast('Delete error: ' + e.message, 'error') }
+  }
+
+  async function clearDesktopWorkspace() {
+    try {
+      const res = await authFetch(`${BACKEND}/desktop/clear-workspace`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm_text: workspaceDeleteConfirmation }),
+      })
+      if (!res.ok) {
+        const detail = await res.text()
+        addToast(`Local workspace cleanup failed: ${detail}`, 'error')
+        return
+      }
+      setWorkspaceDeleteConfirmation('')
+      addToast('Local workspace files deleted. Restart FalconBroom to clear the current view.', 'success')
+    } catch (e) {
+      addToast(`Local workspace cleanup failed: ${e.message}`, 'error')
+    }
+  }
+
+  async function protectInspections() {
+    try {
+      const res = await authFetch(`${BACKEND}/desktop/protect-inspections`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirm_text: inspectionProtectionConfirmation }),
+      })
+      if (!res.ok) {
+        addToast(`Inspection protection failed: ${await res.text()}`, 'error')
+        return
+      }
+      const result = await res.json()
+      setInspectionProtectionConfirmation('')
+      addToast(`Protected ${result.migrated} existing inspection records.`, 'success')
+    } catch (e) {
+      addToast(`Inspection protection failed: ${e.message}`, 'error')
+    }
   }
 
   async function doDsarRequest(action) {
@@ -1670,7 +1732,7 @@ export default function App() {
     const form = new FormData()
     form.append("file", file)
 
-    const res = await fetch(`${BACKEND}/upload`, {
+    const res = await authFetch(`${BACKEND}/upload`, {
       method: "POST",
       body: form,
     })
@@ -1734,7 +1796,7 @@ export default function App() {
   async function fetchUploads() {
     setUploadsLoading(true)
     try {
-      const res = await fetch(`${BACKEND}/uploads`)
+      const res = await authFetch(`${BACKEND}/uploads`)
       const j = await res.json()
       setUploadsList(j.uploads || [])
     } catch (e) {
@@ -1761,7 +1823,7 @@ export default function App() {
             let recipe_name = null
             let status = null
             try {
-              const rres = await fetch(`${BACKEND}/recipes/${encodeURIComponent(rid)}`)
+              const rres = await authFetch(`${BACKEND}/recipes/${encodeURIComponent(rid)}`)
               if (rres.ok) {
                 const rj = await rres.json()
                 status = rj.status || null
@@ -1821,7 +1883,7 @@ export default function App() {
     regressionModel, regressionFeatures, regressionGroupBy, treatAsMissing,
     selectedCells, selectedColumns, previewRows, leftPath, rightPath, joinLeftOn,
     joinRightOn, joinType, joinSampleSize, suffixLeft, suffixRight, preferResolve,
-    mappingText, joinLeftOnArr, joinRightOnArr, compositePairs, exportFormat, exportFilename, joinTargetUser,
+    mappingText, joinLeftOnArr, joinRightOnArr, compositePairs, exportFormat, exportFilename,
   ])
 
   // When the generated recipe or the rowsToShow selection changes, refresh the generated preview
@@ -1834,7 +1896,7 @@ export default function App() {
         const previewQs = []
         if (nParam != null) previewQs.push(`n=${encodeURIComponent(nParam)}`)
         const previewUrl = `${BACKEND}/preview${previewQs.length ? `?${previewQs.join('&')}` : ''}`
-        const res = await fetch(previewUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(recipeFromText) })
+        const res = await authFetch(previewUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(recipeFromText) })
         if (!res.ok) {
           console.warn('Generated preview refresh failed', await res.text())
           return
@@ -1875,7 +1937,7 @@ export default function App() {
       try {
         const presentPaths = (uploadsList || []).map((u) => u.path)
         if (!presentPaths.includes(leftPath)) { setJoinLeftColsOptions([]); return }
-        const res = await fetch(`${BACKEND}/inspect`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: leftPath, offset: 0, limit: 1 }) })
+        const res = await authFetch(`${BACKEND}/inspect`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: leftPath, offset: 0, limit: 1 }) })
         if (!res.ok) return
         const j = await res.json()
         if (cancelled) return
@@ -1897,7 +1959,7 @@ export default function App() {
       try {
         const presentPaths = (uploadsList || []).map((u) => u.path)
         if (!presentPaths.includes(rightPath)) { setJoinRightColsOptions([]); return }
-        const res = await fetch(`${BACKEND}/inspect`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: rightPath, offset: 0, limit: 1 }) })
+        const res = await authFetch(`${BACKEND}/inspect`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: rightPath, offset: 0, limit: 1 }) })
         if (!res.ok) return
         const j = await res.json()
         if (cancelled) return
@@ -2107,7 +2169,7 @@ export default function App() {
     if (runWholeRecipe) {
       try {
         persistWorkflowCheckpoint("source")
-        const res = await fetch(`${BACKEND}/apply-patch`, {
+        const res = await authFetch(`${BACKEND}/apply-patch`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ path, patches: [], recipe: recipeForApply })
         })
@@ -2143,7 +2205,7 @@ export default function App() {
     }
     try {
       persistWorkflowCheckpoint("source")
-      const res = await fetch(`${BACKEND}/apply-patch`, {
+      const res = await authFetch(`${BACKEND}/apply-patch`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path, patches })
       })
@@ -2212,13 +2274,13 @@ export default function App() {
     setInspectingPath(item.path)
     // look for an existing inspection saved for this path
     try {
-      const res = await fetch(`${BACKEND}/inspections`)
+      const res = await authFetch(`${BACKEND}/inspections`)
       const j = await res.json()
       const candidates = (j.inspections || []).filter((ins) => _normalizePathMatch(ins.path || '', item.path || ''))
       if (candidates.length > 0) {
         // pick the latest created
         const latest = candidates.sort((a,b)=> (a.created_at < b.created_at ? 1 : -1))[0]
-        const got = await fetch(`${BACKEND}/inspections/${encodeURIComponent(latest.id)}`)
+        const got = await authFetch(`${BACKEND}/inspections/${encodeURIComponent(latest.id)}`)
         const payload = await got.json()
         const inspection = payload.inspection || payload
         const sanitized = sanitizeInspection(inspection)
@@ -2246,7 +2308,7 @@ export default function App() {
         setInspectingPath(null)
         // fetch metadata to populate plain-language suggestions
         try {
-          const mdRes = await fetch(`${BACKEND}/metadata`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: item.path }) })
+          const mdRes = await authFetch(`${BACKEND}/metadata`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: item.path }) })
           if (mdRes.ok) {
             const md = await mdRes.json()
             const pls = md?.metadata?.plain_language_suggestions || []
@@ -2289,7 +2351,7 @@ export default function App() {
 
   async function fetchDuplicates(){
     try{
-      const res = await fetch(`${BACKEND}/uploads/duplicates`)
+      const res = await authFetch(`${BACKEND}/uploads/duplicates`)
       if(!res.ok){ addToast('Failed to check duplicates','error'); return }
       const j = await res.json()
       setDuplicateGroups(j.duplicates || [])
@@ -2300,7 +2362,7 @@ export default function App() {
 
   async function deleteUploadFromModal(path){
     try{
-      const res = await fetch(`${BACKEND}/uploads/delete`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({path}) })
+      const res = await authFetch(`${BACKEND}/uploads/delete`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({path}) })
       if(!res.ok){ const txt = await res.text(); addToast('Delete failed: '+txt,'error'); return }
       // remove from uploads list
       setUploadsList((u)=> (u||[]).filter(x=> x.path !== path))
@@ -2340,7 +2402,7 @@ export default function App() {
   }
 
   async function doCleaningSuggestions() {
-    const res = await fetch(`${BACKEND}/cleaning-suggestions`, {
+    const res = await authFetch(`${BACKEND}/cleaning-suggestions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path: path || (uploadsList[0] && uploadsList[0].path) }),
@@ -2368,7 +2430,7 @@ export default function App() {
       }
       const sentinelsArr = parseSentinels(treatAsMissing)
 
-      const res = await fetch(`${BACKEND}/recipe-from-text`, {
+      const res = await authFetch(`${BACKEND}/recipe-from-text`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -2439,7 +2501,7 @@ export default function App() {
         if (nParam != null) previewQs.push(`n=${encodeURIComponent(nParam)}`)
         if (j && j.id) previewQs.push(`recipe_id=${encodeURIComponent(j.id)}`)
         const previewUrl = `${BACKEND}/preview${previewQs.length ? `?${previewQs.join('&')}` : ''}`
-        const previewRes = await fetch(previewUrl, {
+        const previewRes = await authFetch(previewUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(j.recipe),
@@ -2484,7 +2546,7 @@ export default function App() {
 
     let j
     try {
-      const res = await fetch(`${BACKEND}/join-suggestions`, {
+      const res = await authFetch(`${BACKEND}/join-suggestions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ left_path: leftPath, right_path: rightPath }),
@@ -2517,8 +2579,8 @@ export default function App() {
     // also fetch cleaning suggestions for both sides and merge into suggested step list
     try {
       const [ls, rs] = await Promise.all([
-        fetch(`${BACKEND}/suggest`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: leftPath }) }).then(r => r.json()).catch(() => ({ suggestions: [] })),
-        fetch(`${BACKEND}/suggest`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: rightPath }) }).then(r => r.json()).catch(() => ({ suggestions: [] })),
+        authFetch(`${BACKEND}/suggest`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: leftPath }) }).then(r => r.json()).catch(() => ({ suggestions: [] })),
+        authFetch(`${BACKEND}/suggest`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path: rightPath }) }).then(r => r.json()).catch(() => ({ suggestions: [] })),
       ])
       // combine and set as `suggest` for Recipe preview card
       const combined = []
@@ -2563,7 +2625,7 @@ export default function App() {
       const conflict = { suffix_left: suffixLeft, suffix_right: suffixRight, prefer: preferResolve, rename_map: mappings }
       const payload = { left_path: leftPath, right_path: rightPath, left_on, right_on, join_type: joinType, sample: Number(joinSampleSize), conflict_resolution: conflict }
       console.log('join-preview payload:', payload)
-      const res = await fetch(`${BACKEND}/join-preview`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+      const res = await authFetch(`${BACKEND}/join-preview`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
       if(!res.ok) {
         const txt = await res.text()
         throw new Error(txt || 'Join preview failed')
@@ -2574,8 +2636,8 @@ export default function App() {
       // also fetch before-samples for left and right via /inspect to show before/after
       try{
         const [linsp, rins] = await Promise.all([
-          fetch(`${BACKEND}/inspect`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({path:leftPath, offset:0, limit: Number(joinSampleSize)})}).then(r=>r.json()).catch(()=>null),
-          fetch(`${BACKEND}/inspect`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({path:rightPath, offset:0, limit: Number(joinSampleSize)})}).then(r=>r.json()).catch(()=>null),
+          authFetch(`${BACKEND}/inspect`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({path:leftPath, offset:0, limit: Number(joinSampleSize)})}).then(r=>r.json()).catch(()=>null),
+          authFetch(`${BACKEND}/inspect`, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({path:rightPath, offset:0, limit: Number(joinSampleSize)})}).then(r=>r.json()).catch(()=>null),
         ])
         setJoinLeftPreview(linsp && linsp.inspection && linsp.inspection.rows ? linsp.inspection.rows : (linsp && linsp.inspection? linsp.inspection : null))
         setJoinRightPreview(rins && rins.inspection && rins.inspection.rows ? rins.inspection.rows : (rins && rins.inspection? rins.inspection : null))
@@ -2617,10 +2679,9 @@ export default function App() {
       })
       const conflict = { suffix_left: suffixLeft, suffix_right: suffixRight, prefer: preferResolve, rename_map: mappings }
       const payload = { left_path: leftPath, right_path: rightPath, left_on, right_on, join_type: joinType, export_format: exportFormat, filename: exportFilename, conflict_resolution: conflict }
-      if (joinTargetUser) payload.target_user = joinTargetUser
       console.log('join-export payload:', payload)
       persistWorkflowCheckpoint("joins")
-      const res = await fetch(`${BACKEND}/join-export`, {
+      const res = await authFetch(`${BACKEND}/join-export`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload)
       })
       if(!res.ok) {
@@ -2632,43 +2693,38 @@ export default function App() {
       recordWorkflowAction("joins", "Join exported")
       // surface download link to user
       setApplyRes((prev)=> ({...(prev||{}), last_export: j.export_path}))
-      // Auto-download the created export by opening the backend download endpoint
+      // Auto-download the created export through the authenticated backend request.
       try {
           if (j && j.export_path) {
           const dl = `${BACKEND}/download?path=${encodeURIComponent(j.export_path)}`
-          // Try opening in a new tab/window so the browser can handle the FileResponse.
-          // If popup is blocked (e.g. embedded webview), fallback to fetching the blob
           try {
-            const w = (() => { try { return window.open(dl, '_blank') } catch(e) { return null } })()
-            if (!w) {
-              const res2 = await fetch(dl, { credentials: 'include' })
-              if (!res2.ok) throw new Error('Download fetch failed')
-              const blob = await res2.blob()
-              // prefer server-provided filename (preserves extension), fall back to `exportFilename`
-              let filename = 'download'
-              try {
-                if (j && j.export_path) {
-                  const parts = String(j.export_path).split(/\\|\//)
-                  if (parts.length) filename = parts[parts.length-1]
-                }
-              } catch (e) {}
-              if (!filename || filename === 'download') filename = (exportFilename && String(exportFilename).trim()) || 'download'
-              try{
-                const cd = res2.headers.get('content-disposition') || ''
-                let m = /filename\*=UTF-8''([^;\n]+)/i.exec(cd)
-                if (!m) m = /filename=\"?([^\";]+)\"?/i.exec(cd)
-                if (m && m[1]) filename = decodeURIComponent(m[1])
-              }catch(e){}
-              const objUrl = URL.createObjectURL(blob)
-              const a = document.createElement('a')
-              a.href = objUrl
-              a.download = filename
-              document.body.appendChild(a)
-              a.click()
-              a.remove()
-              try { window.dispatchEvent(new CustomEvent('fb_download_completed', { detail: { filename } })) } catch (e) {}
-              URL.revokeObjectURL(objUrl)
-            }
+            const res2 = await authFetch(dl)
+            if (!res2.ok) throw new Error('Download fetch failed')
+            const blob = await res2.blob()
+            // prefer server-provided filename (preserves extension), fall back to `exportFilename`
+            let filename = 'download'
+            try {
+              if (j && j.export_path) {
+                const parts = String(j.export_path).split(/\\|\//)
+                if (parts.length) filename = parts[parts.length-1]
+              }
+            } catch (e) {}
+            if (!filename || filename === 'download') filename = (exportFilename && String(exportFilename).trim()) || 'download'
+            try{
+              const cd = res2.headers.get('content-disposition') || ''
+              let m = /filename\*=UTF-8''([^;\n]+)/i.exec(cd)
+              if (!m) m = /filename="?([^";]+)"?/i.exec(cd)
+              if (m && m[1]) filename = decodeURIComponent(m[1])
+            }catch(e){}
+            const objUrl = URL.createObjectURL(blob)
+            const a = document.createElement('a')
+            a.href = objUrl
+            a.download = filename
+            document.body.appendChild(a)
+            a.click()
+            a.remove()
+            try { window.dispatchEvent(new CustomEvent('fb_download_completed', { detail: { filename } })) } catch (e) {}
+            URL.revokeObjectURL(objUrl)
           } catch (e) {
             console.warn('auto-download failed', e)
           }
@@ -2753,14 +2809,14 @@ export default function App() {
           if (maybeId && ex && ex.length > 0) {
             // fetch saved recipe to find source path
             try {
-              const rres = await fetch(`${BACKEND}/recipes/${encodeURIComponent(maybeId)}`)
+              const rres = await authFetch(`${BACKEND}/recipes/${encodeURIComponent(maybeId)}`)
               if (rres.ok) {
                 const rj = await rres.json()
                 const src = (rj.recipe && rj.recipe.sources && rj.recipe.sources[0] && rj.recipe.sources[0].path) || null
                   if (src) {
                   // persist on server and refresh uploads listing
                   try {
-                    const pres = await fetch(`${BACKEND}/uploads/explanations`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source_path: src, recipe_id: maybeId, explanations: ex }) })
+                    const pres = await authFetch(`${BACKEND}/uploads/explanations`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source_path: src, recipe_id: maybeId, explanations: ex }) })
                     if (pres && pres.ok) await fetchUploads()
                   } catch (e) {}
                   setUploadsList((list) => {
@@ -2792,7 +2848,7 @@ export default function App() {
       const nParam = typeof rowsToShow === 'number' ? rowsToShow : Number(rowsToShow)
       if (nParam != null) qs.push(`sample_rows=${encodeURIComponent(nParam)}`)
       const url = `${BACKEND}/recipes/${encodeURIComponent(recipeId)}/explain${qs.length ? `?${qs.join('&')}` : ''}`
-      const res = await fetch(url)
+      const res = await authFetch(url)
       if (!res.ok) {
         const txt = await res.text()
         throw new Error(txt || 'Explain fetch failed')
@@ -2804,14 +2860,14 @@ export default function App() {
       // if we have explanations and a recipe id, log into matching upload's explanations_history
       try {
         if (ex && ex.length > 0 && recipeId) {
-          const rres = await fetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}`)
+          const rres = await authFetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}`)
           if (rres.ok) {
             const rj = await rres.json()
             const src = (rj.recipe && rj.recipe.sources && rj.recipe.sources[0] && rj.recipe.sources[0].path) || null
             if (src) {
               // persist on server and refresh uploads listing
               try {
-                const pres = await fetch(`${BACKEND}/uploads/explanations`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source_path: src, recipe_id: recipeId, explanations: ex }) })
+                const pres = await authFetch(`${BACKEND}/uploads/explanations`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source_path: src, recipe_id: recipeId, explanations: ex }) })
                 if (pres && pres.ok) await fetchUploads()
               } catch (e) {}
               setUploadsList((list) => {
@@ -2841,120 +2897,71 @@ export default function App() {
   }
 
   async function persistConsent(consents) {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 5000)
     try {
       const payload = { user_id: userId, consents, user_agent: navigator.userAgent }
-      const res = await fetch(`${BACKEND}/consent`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
-      if (res.ok) {
-        // refresh consent history
-        await fetchConsentHistory()
-      }
+      const res = await authFetch(`${BACKEND}/consent`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: controller.signal })
+      if (!res.ok) throw new Error(`Consent history request failed (${res.status})`)
+      if (showConsentHistory) fetchConsentHistory()
     } catch (e) {
       console.warn('Failed to persist consent', e)
+      addToast('Analytics preference saved on this device, but consent history could not be saved.', 'warn')
+    } finally {
+      clearTimeout(timeout)
     }
   }
 
   async function fetchConsentHistory() {
     try {
-      const res = await fetch(`${BACKEND}/consent?user_id=${encodeURIComponent(userId)}`)
+      const res = await authFetch(`${BACKEND}/consent?user_id=${encodeURIComponent(userId)}`)
       if (!res.ok) return
       const j = await res.json()
       setConsentHistory(j.consents || [])
     } catch (e) { console.warn('Failed to fetch consent history', e) }
   }
 
-  function acceptAllConsents() {
-    const cons = { essential: true, analytics: true, marketing: true, personalized_ads: true }
-    setConsent(cons)
-    try { window.localStorage.setItem('falconbroom_consent', JSON.stringify(cons)) } catch {}
-    persistConsent(cons)
-  }
-
-  function rejectNonEssential() {
-    const cons = { essential: true, analytics: false, marketing: false, personalized_ads: false }
-    setConsent(cons)
-    try { window.localStorage.setItem('falconbroom_consent', JSON.stringify(cons)) } catch {}
-    persistConsent(cons)
-  }
-
-  // Dynamic analytics loader — loads/unloads analytics scripts based on consent
-  function loadAnalyticsScript() {
-    if (!consent || !consent.analytics) return
-    if (!analyticsId) return
-    if (document.getElementById('analytics-script')) return
-    // Dynamic loader: analytics provider ID must be supplied in Settings.
-    const s = document.createElement('script')
-    s.id = 'analytics-script'
-    s.async = true
-    s.src = `https://www.googletagmanager.com/gtag/js?id=${encodeURIComponent(analyticsId)}`
-    s.onload = () => {
-      try {
-        window.dataLayer = window.dataLayer || []
-        function gtag(){window.dataLayer.push(arguments)}
-        window.gtag = gtag
-        gtag('js', new Date())
-        gtag('config', analyticsId)
-        addToast('Analytics enabled', 'info')
-      } catch (e) { console.warn(e) }
-    }
-    document.head.appendChild(s)
-  }
-
-  function unloadAnalyticsScript() {
-    const s = document.getElementById('analytics-script')
-    if (s) s.remove()
-    if (window.gtag) try { delete window.gtag } catch(e){}
-    addToast('Analytics disabled', 'info')
-  }
-
-  // Initialize cookieconsent CMP when available
-  React.useEffect(() => {
-    // load/unload analytics based on consent state
-    if (consent && consent.analytics) {
-      loadAnalyticsScript()
-    } else {
-      unloadAnalyticsScript()
-    }
-  }, [consent])
-
-  React.useEffect(() => {
-    // Initialize Osano CookieConsent if present and not yet initialized
+  async function updateAnalyticsConsent(allowed) {
+    let next
     try {
-      if (window.cookieconsent && !window._falconbroom_cookieconsent_init) {
-        window.cookieconsent.initialise({
-          palette: { popup: { background: '#2f2f2f' }, button: { background: '#f1d600' } },
-          theme: 'classic',
-          position: 'bottom',
-          content: {
-            message: 'FalconBroom uses cookies to improve your experience.',
-            dismiss: 'Accept all',
-            deny: 'Reject non-essential',
-            link: 'Manage',
-            href: '#',
-          },
-          // on initialisation, sync state with our consent handlers
-          onInitialise: function(status) {
-            // status is 'allow' or 'deny'
-            window._falconbroom_cookieconsent_init = true
-            if (status === 'allow') acceptAllConsents()
-            else rejectNonEssential()
-          },
-          onStatusChange: function(status) {
-            if (status === 'allow') acceptAllConsents()
-            else rejectNonEssential()
-          },
-          onRevokeChoice: function() {
-            // user revoked consent; treat as revoke
-            rejectNonEssential()
-          }
-        })
-      }
-    } catch (e) { console.warn('cookieconsent init failed', e) }
-  }, [])
+      next = saveAnalyticsConsent(window.localStorage, allowed)
+    } catch (e) {
+      console.warn('Failed to save analytics preference', e)
+      addToast('Could not save your analytics preference on this device.', 'error')
+      return
+    }
+    const shouldReload = !isDesktop && consent?.analytics && !allowed && analyticsId
+    setConsent(next)
+    setSavingConsent(true)
+    try {
+      await persistConsent(next)
+      if (shouldReload) window.location.reload()
+    } finally {
+      setSavingConsent(false)
+    }
+  }
 
-  // Persist analyticsId when changed
   React.useEffect(() => {
-    try { window.localStorage.setItem('falconbroom_analytics_id', analyticsId || '') } catch {}
-  }, [analyticsId])
+    if (!shouldLoadAnalytics(isDesktop, consent, analyticsId)) return
+    const script = document.createElement('script')
+    script.id = 'analytics-script'
+    script.async = true
+    script.src = `https://www.googletagmanager.com/gtag/js?id=${encodeURIComponent(analyticsId)}`
+    script.onload = () => {
+      window.dataLayer = window.dataLayer || []
+      window.gtag = function(){ window.dataLayer.push(arguments) }
+      window.gtag('js', new Date())
+      window.gtag('config', analyticsId)
+    }
+    script.onerror = () => addToast('Could not load Google Analytics.', 'warn')
+    document.head.appendChild(script)
+    return () => {
+      script.onload = null
+      script.onerror = null
+      script.remove()
+      delete window.gtag
+    }
+  }, [consent?.analytics, analyticsId])
 
   async function doApply() {
     setApplyLoading(true)
@@ -2973,7 +2980,7 @@ export default function App() {
         throw new Error('No recipe available to apply')
       }
       persistWorkflowCheckpoint("source")
-      const res = await fetch(`${BACKEND}/apply`, {
+      const res = await authFetch(`${BACKEND}/apply`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(recipe),
@@ -3015,7 +3022,7 @@ export default function App() {
       }
 
       recordWorkflowAction("source", "Recipe save requested")
-      const res = await fetch(`${BACKEND}/recipes`, {
+      const res = await authFetch(`${BACKEND}/recipes`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name, recipe }),
@@ -3035,7 +3042,7 @@ export default function App() {
       setRecipeId(j.id)
       // fetch saved record to get status
       if (j.id) {
-        const saved = await fetch(`${BACKEND}/recipes/${encodeURIComponent(j.id)}`)
+        const saved = await authFetch(`${BACKEND}/recipes/${encodeURIComponent(j.id)}`)
         if (saved.ok) {
           const sdata = await saved.json()
           setRecipeStatus(sdata.status || "draft")
@@ -3070,7 +3077,7 @@ export default function App() {
       return
     }
     try {
-      const res = await fetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}/approve`, { method: "POST" })
+      const res = await authFetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}/approve`, { method: "POST" })
       if (!res.ok) {
         const txt = await res.text()
         throw new Error(txt || 'Approve failed')
@@ -3102,7 +3109,7 @@ export default function App() {
     }
     try {
       recordWorkflowAction("source", "Run requested")
-      const res = await fetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}/run?export_format=${encodeURIComponent(format)}`, { method: "POST" })
+      const res = await authFetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}/run?export_format=${encodeURIComponent(format)}`, { method: "POST" })
       const j = await res.json()
       // add to history UI
       setHistoryList((h) => [j.run, ...h])
@@ -3149,7 +3156,7 @@ export default function App() {
       recordWorkflowAction("source", "Run and download requested")
       setRunDownloadLoading(true)
       addToast('Running recipe on server...', 'info')
-      const res = await fetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}/run?export_format=${encodeURIComponent(format)}`, { method: 'POST' })
+      const res = await authFetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}/run?export_format=${encodeURIComponent(format)}`, { method: 'POST' })
       if (!res.ok) {
         let err = 'Run failed'
         try { const j = await res.json(); err = j.detail || j.message || JSON.stringify(j) } catch { err = await res.text() }
@@ -3171,7 +3178,7 @@ export default function App() {
       const downloadUrl = `${BACKEND}/download?path=${encodeURIComponent(out)}`
       console.log('Download URL', downloadUrl)
       try {
-        const fileRes = await fetch(downloadUrl)
+        const fileRes = await authFetch(downloadUrl)
         if (!fileRes.ok) {
           let err = 'Download failed'
           try { const js = await fileRes.json(); err = js.detail || js.message || JSON.stringify(js) } catch { err = await fileRes.text() }
@@ -3209,7 +3216,7 @@ export default function App() {
 
   async function fetchHistory() {
     try {
-      const res = await fetch(`${BACKEND}/history`)
+      const res = await authFetch(`${BACKEND}/history`)
       const j = await res.json()
       setHistoryList(j.history || [])
     } catch (e) {
@@ -3306,7 +3313,7 @@ export default function App() {
 
   async function rollbackRun(runId) {
     try {
-      const res = await fetch(`${BACKEND}/history/${encodeURIComponent(runId)}/rollback`, { method: "POST" })
+      const res = await authFetch(`${BACKEND}/history/${encodeURIComponent(runId)}/rollback`, { method: "POST" })
       const j = await res.json()
       addToast(`Rollback created: ${j.rollback.rollback_path}`, "success")
       fetchHistory()
@@ -3321,8 +3328,7 @@ export default function App() {
       return
     }
     try {
-      const body = exportTargetUser ? JSON.stringify({ target_user: exportTargetUser }) : undefined
-      const res = await fetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}/export_sheets`, { method: "POST", headers: body ? { 'Content-Type': 'application/json' } : undefined, body })
+      const res = await authFetch(`${BACKEND}/recipes/${encodeURIComponent(recipeId)}/export_sheets`, { method: "POST" })
       if (res.ok) {
         const j = await res.json()
         addToast(`Export queued: ${j.export_id || 'queued'}`, "info")
@@ -3343,7 +3349,7 @@ export default function App() {
 
   async function deleteHistory(runId) {
     try {
-      const res = await fetch(`${BACKEND}/history/${encodeURIComponent(runId)}`, { method: "DELETE" })
+      const res = await authFetch(`${BACKEND}/history/${encodeURIComponent(runId)}`, { method: "DELETE" })
       if (res.ok) {
         const j = await res.json()
         addToast(`Deleted run ${j.deleted}`, 'success')
@@ -3360,7 +3366,7 @@ export default function App() {
 
   async function dedupeHistory() {
     try {
-      const res = await fetch(`${BACKEND}/history/dedupe`, { method: "POST" })
+      const res = await authFetch(`${BACKEND}/history/dedupe`, { method: "POST" })
       const j = await res.json()
       addToast(`Removed ${j.removed.length} duplicate runs`, 'info')
       fetchHistory()
@@ -3439,6 +3445,7 @@ export default function App() {
             title="Data file and task setup"
             subtitle="Choose a local file, write an instruction, and let the engine build a deterministic recipe."
           >
+            <BetaDataNotice />
             <label>Local file path</label>
             <input value={path} onChange={(e) => setPath(e.target.value)} placeholder="C:/data/customers.csv" />
             <input
@@ -3666,6 +3673,7 @@ export default function App() {
           />
           {renderWorkflowCheckpointPanel("joins")}
           <Card eyebrow="Joins" title="Join hints" subtitle="Find the most likely keys before blending datasets.">
+            <BetaDataNotice />
             <div className="inline-grid">
               <div>
                 <label>Left CSV</label>
@@ -3916,11 +3924,10 @@ export default function App() {
                 <option value="sql">SQLite</option>
               </select>
               <input value={exportFilename} onChange={(e)=>setExportFilename(e.target.value)} placeholder="filename" style={{marginLeft:8}} />
-              <input placeholder="target user id or email" value={joinTargetUser} onChange={(e)=>setJoinTargetUser(e.target.value)} style={{marginLeft:8,width:220}} />
               <button className="primary" onClick={doJoinExport} disabled={joinExporting}>{joinExporting ? 'Exporting…' : 'Export Join'}</button>
             </div>
             {applyRes && applyRes.last_export ? (
-              <div style={{marginTop:8}}>Download: <a href={`${BACKEND}/download?path=${encodeURIComponent(applyRes.last_export)}`} target="_blank" rel="noreferrer">{applyRes.last_export}</a></div>
+              <div style={{marginTop:8}}>Download: <DownloadLink url={`${BACKEND}/download?path=${encodeURIComponent(applyRes.last_export)}`} label={applyRes.last_export} /></div>
             ) : null}
           </Card>
         </div>
@@ -4017,7 +4024,7 @@ export default function App() {
                       <button
                         onClick={async ()=>{
                           try{
-                            const res = await fetch(`${BACKEND}/uploads/delete`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({path: item.path}) })
+                            const res = await authFetch(`${BACKEND}/uploads/delete`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({path: item.path}) })
                             if(!res.ok){ const txt = await res.text(); addToast('Delete failed: '+txt,'error'); return }
                             setUploadsList((u)=> (u||[]).filter(x=> x.path !== item.path))
                             addToast('Deleted ' + item.name, 'success')
@@ -4240,6 +4247,41 @@ export default function App() {
           </Card>
           <Card eyebrow="Account" title="Settings" subtitle="Manage your account and privacy preferences">
             <div style={{display:'grid',gridTemplateColumns:'1fr',gap:12}}>
+              <div>
+                <h4>Privacy notice (draft)</h4>
+                <button onClick={() => setShowPrivacyNotice(value => !value)}>{showPrivacyNotice ? 'Hide privacy notice' : 'Read privacy notice'}</button>
+                {showPrivacyNotice && <pre style={{whiteSpace:'pre-wrap', overflowWrap:'anywhere', fontFamily:'inherit'}}>{privacyNotice}</pre>}
+              </div>
+              <div>
+                <h4>Clear local workspace</h4>
+                <p>Some local data is protected, but other outputs and temporary files may contain plaintext. Use device encryption and avoid sensitive data.</p>
+                <p>This permanently deletes FalconBroom uploads, outputs, recipes, inspections, history and snapshots on this device for every account, and abandoned protected workspaces. Active workspaces, older untracked temporary files, accounts, consent records, downloaded exports, backups and files elsewhere are not deleted.</p>
+                <label style={{display:'flex',flexDirection:'column',gap:6}}>
+                  <span>Type exactly: DELETE LOCAL WORKSPACE</span>
+                  <input value={workspaceDeleteConfirmation} onChange={(e) => setWorkspaceDeleteConfirmation(e.target.value)} />
+                </label>
+                <button disabled={workspaceDeleteConfirmation !== 'DELETE LOCAL WORKSPACE'} onClick={clearDesktopWorkspace}>Delete local workspace</button>
+              </div>
+              {isDesktop && <div>
+                <h4>Protect existing inspection records</h4>
+                <p>New inspections use Windows user-bound protection. Uploads, recipes, history, snapshots and outputs from supported processing routes are encrypted, and existing files in those folders migrate on startup. Other outputs, consent and audit data, backups and exports may remain plaintext. Processing creates plaintext temporary files; abandoned protected workspaces are cleaned on startup, but older untracked files and other remnants may remain. These protections do not stop software running as your Windows user, and losing access to this Windows profile can make protected data unreadable. Back up your workspace before upgrading or migrating older inspections.</p>
+                <label style={{display:'flex',flexDirection:'column',gap:6}}>
+                  <span>After backing up, type exactly: PROTECT INSPECTIONS</span>
+                  <input value={inspectionProtectionConfirmation} onChange={(e) => setInspectionProtectionConfirmation(e.target.value)} />
+                </label>
+                <button disabled={inspectionProtectionConfirmation !== 'PROTECT INSPECTIONS'} onClick={protectInspections}>Protect existing inspections</button>
+              </div>}
+              <div>
+                <h4>Analytics preference</h4>
+                {isDesktop ? <p>Analytics is disabled in this desktop release.</p> : <>
+                <p>Optional Google Analytics loads only if configured and allowed. Changing this choice may reload the app; previously stored analytics cookies may remain.</p>
+                <p>Current choice: {!consent ? 'Not set' : consent.analytics ? 'Allowed' : 'Not allowed'}</p>
+                <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+                  <button disabled={savingConsent} onClick={() => updateAnalyticsConsent(true)}>Allow analytics</button>
+                  <button disabled={savingConsent} onClick={() => updateAnalyticsConsent(false)}>Do not allow analytics</button>
+                </div>
+                </>}
+              </div>
               <div>
                 <h4>Account</h4>
                 {!accountUser ? (
@@ -4574,7 +4616,7 @@ export default function App() {
                   </div>
                 )}
 
-                <div style={{marginTop:18}}>
+                {TEAM_ENABLED && <div style={{marginTop:18}}>
                   <h5>Team settings</h5>
                   <label style={{display:'flex',flexDirection:'column',gap:6}}>
                     <span style={{fontSize:12,color:'var(--muted)'}}>Team name</span>
@@ -4599,7 +4641,7 @@ export default function App() {
                       <button className="primary" onClick={saveAccountUpdates}>Save team</button>
                     </div>
                   </div>
-                </div>
+                </div>}
               </div>
               <div>
                 <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
@@ -4683,17 +4725,16 @@ export default function App() {
           <h1 className="app-title">FalconBroom</h1>
         </div>
       </header>
-      {/* CMP banner */}
-      {!consent && (
+      {!isDesktop && !consent && (
         <div className="cmp-banner card" style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:12}}>
           <div>
-            <strong>FalconBroom uses cookies</strong>
-            <div style={{color:'var(--muted)'}}>We use essential cookies and optional analytics/marketing cookies to improve the product. You can manage preferences in Settings.</div>
+            <strong>Privacy and analytics</strong>
+            <div style={{color:'var(--muted)'}}>FalconBroom stores sign-in and preferences on this device. Optional Google Analytics loads only if configured and allowed. You can change your choice in Settings.</div>
+            <button onClick={() => { setActiveTab('settings'); setShowPrivacyNotice(true) }}>Read privacy notice (draft)</button>
           </div>
-          <div style={{display:'flex',gap:8}}>
-            <button className="primary" onClick={() => { acceptAllConsents() }}>Accept all</button>
-            <button onClick={() => { rejectNonEssential() }}>Reject non-essential</button>
-            <button onClick={() => setActiveTab('settings')}>Manage</button>
+          <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+            <button disabled={savingConsent} onClick={() => updateAnalyticsConsent(true)}>Allow analytics</button>
+            <button disabled={savingConsent} onClick={() => updateAnalyticsConsent(false)}>Do not allow analytics</button>
           </div>
         </div>
       )}
@@ -4705,7 +4746,7 @@ export default function App() {
           <div className="card">
             <div className="card-header"><h2>Welcome back</h2><p>Thanks for signing in again.</p></div>
             <div style={{padding:12,display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-              <div style={{color:'var(--muted)'}}>We've saved your team and uploads — welcome back.</div>
+              <div style={{color:'var(--muted)'}}>Your account and uploads are ready.</div>
               <div style={{display:'flex',gap:8}}>
                 <button onClick={()=>setShowWelcomeBack(false)}>Dismiss</button>
               </div>
@@ -5321,7 +5362,6 @@ export default function App() {
                 <button onClick={() => runAndDownloadSavedRecipe('sqlite')} disabled={!recipeId || recipeStatus !== 'approved' || runDownloadLoading}>Run &amp; Download SQLITE</button>
                 {/* Google Sheets export is not connected yet.
                 <button onClick={exportToSheets} disabled={!recipeId}>Export to Google Sheets</button>
-                <input placeholder="target user id or email" value={exportTargetUser} onChange={(e)=>setExportTargetUser(e.target.value)} style={{marginLeft:8,width:220}} />
                 */}
                 <button disabled title="Google Sheets export is coming soon">Export to Google Sheets (coming soon)</button>
               </div>

@@ -31,7 +31,7 @@
         if (Date.now() > deadline) {
           document.body.className = 'error';
           document.getElementById('msg').textContent =
-            'FalconBroom could not start its local engine. Please close the app and try again.';
+            'FalconBroom could not start its local engine. Please close the app and try again. If this continues, do not delete your data: the Windows profile key or a data migration may need attention.';
           return;
         }
         setTimeout(tick, 500);
