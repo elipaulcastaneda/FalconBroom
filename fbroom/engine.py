@@ -12,6 +12,7 @@ import time
 
 from .connectors import resolve_source
 from . import desktop_vault
+from . import desktop_remote_services as remote_services
 
 try:
     import polars as pl
@@ -123,6 +124,8 @@ def _convert_currency_column(df, col, params=None):
             fetched = _fetch_exchange_rate(provider, frm, to, api_key=api_key, cache_ttl=cache_ttl)
             if fetched:
                 rate = fetched
+        except remote_services.RemoteServiceError:
+            raise
         except Exception:
             rate = None
 
@@ -267,6 +270,7 @@ _GEOCODE_CACHE = {}
 def _geocode_address(addr, provider='nominatim', timeout=5):
     if not addr:
         return None
+    remote_services.require("geocoding")
     key = ('geocode', provider, addr)
     now = int(time.time())
     entry = _GEOCODE_CACHE.get(key)
@@ -277,7 +281,8 @@ def _geocode_address(addr, provider='nominatim', timeout=5):
         if provider == 'nominatim':
             url = 'https://nominatim.openstreetmap.org/search'
             params = {'q': addr, 'format': 'json', 'limit': 1}
-            resp = httpx.get(url, params=params, timeout=timeout, headers={'User-Agent':'fbroom/1.0'})
+            with remote_services.network_access("geocoding"):
+                resp = httpx.get(url, params=params, timeout=timeout, headers={'User-Agent':'fbroom/1.0'})
             if resp.status_code == 200:
                 data = resp.json()
                 if data:
@@ -285,6 +290,8 @@ def _geocode_address(addr, provider='nominatim', timeout=5):
                     res = {'lat': float(d.get('lat')), 'lon': float(d.get('lon')), 'display_name': d.get('display_name')}
                     _GEOCODE_CACHE[key] = (res, now)
                     return res
+    except remote_services.RemoteServiceError:
+        raise
     except Exception:
         return None
     return None
@@ -292,6 +299,7 @@ def _geocode_address(addr, provider='nominatim', timeout=5):
 
 def _geocode_column(df, col, params=None):
     params = params or {}
+    remote_services.require("geocoding")
     provider = params.get('provider', 'nominatim')
     out_lat = params.get('lat_col') or f"{col}__lat"
     out_lon = params.get('lon_col') or f"{col}__lon"
@@ -309,12 +317,16 @@ def _geocode_column(df, col, params=None):
                     lons.append(None)
             df = df.with_columns(pl.Series(out_lat, lats).alias(out_lat), pl.Series(out_lon, lons).alias(out_lon))
             return df
+        except remote_services.RemoteServiceError:
+            raise
         except Exception:
             try:
                 pd = df.to_pandas()
                 pd[out_lat] = pd[col].apply(lambda v: (_geocode_address(v, provider) or {}).get('lat'))
                 pd[out_lon] = pd[col].apply(lambda v: (_geocode_address(v, provider) or {}).get('lon'))
                 return pl.from_pandas(pd)
+            except remote_services.RemoteServiceError:
+                raise
             except Exception:
                 return df
     else:
@@ -323,6 +335,8 @@ def _geocode_column(df, col, params=None):
             pd[out_lat] = pd[col].apply(lambda v: (_geocode_address(v, provider) or {}).get('lat'))
             pd[out_lon] = pd[col].apply(lambda v: (_geocode_address(v, provider) or {}).get('lon'))
             return pd
+        except remote_services.RemoteServiceError:
+            raise
         except Exception:
             return df
 
@@ -847,6 +861,8 @@ def _external_lookup(df, params=None):
     """
     params = params or {}
     mode = params.get('mode', 'http')
+    if mode == 'http':
+        remote_services.require("http_lookup")
     mapping = params.get('map') or {}
     timeout = int(params.get('timeout', 5))
 
@@ -875,12 +891,15 @@ def _external_lookup(df, params=None):
                 if entry and now - entry[1] < int(params.get('cache_ttl', 3600)):
                     data = entry[0]
                 else:
-                    resp = httpx.get(url, timeout=timeout, headers=headers)
+                    with remote_services.network_access("http_lookup"):
+                        resp = httpx.get(url, timeout=timeout, headers=headers)
                     data = resp.json() if resp.status_code == 200 else {}
                     _EXTERNAL_LOOKUP_CACHE[cache_key] = (data, now)
                 for jkey, outcol in mapping.items():
                     val = data.get(jkey)
                     results.setdefault(outcol, []).append(val)
+            except remote_services.RemoteServiceError:
+                raise
             except Exception:
                 for outcol in mapping.values():
                     results.setdefault(outcol, []).append(None)
@@ -967,6 +986,9 @@ def _fetch_exchange_rate(provider, frm, to, api_key=None, cache_ttl=3600, timeou
     Returns numeric rate or None on failure. Caches results in-memory for `cache_ttl` seconds.
     Supported providers: 'exchangerate.host' (no key), 'openexchangerates' (requires `api_key`).
     """
+    service = {"exchangerate.host": "exchangerate_host", "openexchangerates": "openexchangerates"}.get(provider)
+    if service:
+        remote_services.require(service)
     key = (provider, frm, to)
     now = int(time.time())
     entry = _EXCHANGE_RATE_CACHE.get(key)
@@ -980,7 +1002,8 @@ def _fetch_exchange_rate(provider, frm, to, api_key=None, cache_ttl=3600, timeou
         import httpx
         if provider == 'exchangerate.host':
             url = f"https://api.exchangerate.host/convert?from={frm}&to={to}"
-            resp = httpx.get(url, timeout=timeout)
+            with remote_services.network_access("exchangerate_host"):
+                resp = httpx.get(url, timeout=timeout)
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, dict) and data.get('result') is not None:
@@ -991,7 +1014,8 @@ def _fetch_exchange_rate(provider, frm, to, api_key=None, cache_ttl=3600, timeou
             if not api_key:
                 return None
             url = f"https://openexchangerates.org/api/latest.json?app_id={api_key}"
-            resp = httpx.get(url, timeout=timeout)
+            with remote_services.network_access("openexchangerates"):
+                resp = httpx.get(url, timeout=timeout)
             if resp.status_code == 200:
                 data = resp.json()
                 rates = data.get('rates') or {}
@@ -1004,6 +1028,8 @@ def _fetch_exchange_rate(provider, frm, to, api_key=None, cache_ttl=3600, timeou
                     r = float(rates.get(to)) / float(rates.get(frm))
                 _EXCHANGE_RATE_CACHE[key] = (r, now)
                 return r
+    except remote_services.RemoteServiceError:
+        raise
     except Exception:
         return None
     return None
@@ -1499,10 +1525,7 @@ def _write_csv(df, out_path):
             pass
         return df.write_csv(out_path)
     else:
-        try:
-            return df.to_csv(out_path, index=False)
-        except Exception:
-            return None
+        return df.to_csv(out_path, index=False)
 
 
 _TEXT_COLUMN_REGISTRY: dict = {}
@@ -1512,7 +1535,8 @@ _CSV_NULL_VALUES = ["", "NA", "N/A", "null", "None"]
 def _file_key(path):
     try:
         p = Path(path).resolve()
-        st = p.stat()
+        stored = desktop_vault.encrypted_path(p) if desktop_vault.is_initialized() and not p.is_file() else p
+        st = stored.stat()
         return str(p), (st.st_size, st.st_mtime_ns)
     except Exception:
         return None, None
@@ -1548,6 +1572,45 @@ def _retyped_text_columns(df, written_path):
         return [c for c, t in back.schema.items() if t != pl.Utf8]
     except Exception:
         return []
+
+
+class _BoundedCsvBuffer(io.BytesIO):
+    def __init__(self, limit):
+        super().__init__()
+        self.limit = limit
+        self.exceeded = False
+
+    def write(self, data):
+        if self.tell() + len(data) > self.limit:
+            self.exceeded = True
+            raise OSError("CSV exceeds the in-memory buffer limit")
+        return super().write(data)
+
+
+def _write_managed_csv(df, out_path):
+    """Write managed desktop CSVs without an untracked plaintext output."""
+    out_path = Path(out_path)
+    staged = desktop_vault.stage_managed_output(out_path)
+    if staged == out_path:
+        return False
+    if _is_polars_df(df):
+        with _BoundedCsvBuffer(8 * 1024 * 1024) as buffer:
+            try:
+                _write_csv(df, buffer)
+            except OSError:
+                if not buffer.exceeded:
+                    raise
+            if not buffer.exceeded:
+                buffer.seek(0)
+                text_cols = _retyped_text_columns(df, buffer)
+                desktop_vault.write_encrypted_bytes(out_path, buffer.getvalue())
+                _register_text_columns(str(out_path), text_cols)
+                return True
+    _write_csv(df, str(staged))
+    text_cols = _retyped_text_columns(df, str(staged))
+    desktop_vault.publish_staged_output(staged, out_path)
+    _register_text_columns(str(out_path), text_cols)
+    return True
 
 
 def _resolve_conflict_name(existing_names, desired_name):
@@ -2922,12 +2985,12 @@ def _percentile_bucketize(df, col, buckets):
         return df
 
 
-def _restore_leading_zero_columns(df, path, separator, read_kwargs):
+def _restore_leading_zero_columns(df, path, separator, read_kwargs, logical_path=None):
     """Numeric inference turns ZIP codes like 01234 into 1234; keep any numeric column whose raw text has leading zeros as text.
 
     Columns that FalconBroom wrote as text (chosen date layouts, fixed decimal places) also stay text on re-read."""
     try:
-        key, stamp = _file_key(path)
+        key, stamp = _file_key(logical_path or path)
         entry = _TEXT_COLUMN_REGISTRY.get(key) if key else None
         forced = [c for c in (entry[1] if entry and entry[0] == stamp else []) if c in df.columns and df.schema[c] != pl.Utf8]
         numeric = [c for c, t in df.schema.items() if t.is_numeric() and c not in forced]
@@ -2948,8 +3011,18 @@ def _read_table(path: str):
     if pl is None:
         raise RuntimeError("Polars not installed. See requirements.txt to install dependencies.")
 
-    resolved = resolve_source(path)
-    materialized_path = getattr(resolved, "materialized_path", None) or resolved.path
+    logical = Path(path)
+    encrypted = desktop_vault.encrypted_path(logical)
+    if (
+        desktop_vault.is_initialized()
+        and not logical.is_file()
+        and encrypted.is_file()
+        and encrypted.stat().st_size <= 8 * 1024 * 1024
+    ):
+        materialized_path = desktop_vault.read_bytes(logical)
+    else:
+        resolved = resolve_source(path)
+        materialized_path = getattr(resolved, "materialized_path", None) or resolved.path
 
     read_kwargs = {
         "infer_schema_length": 1000,
@@ -2958,39 +3031,39 @@ def _read_table(path: str):
         "null_values": ["", "NA", "N/A", "null", "None"],
         "try_parse_dates": True,
     }
-    suffix = str(materialized_path).lower()
-    logger.info("_read_table materialized_path=%s suffix=%s", materialized_path, suffix)
+    suffix = str(logical).lower()
+    logger.info("_read_table source=%s suffix=%s", logical, suffix)
     df = None
     if suffix.endswith(".parquet"):
         try:
             df = pl.read_parquet(materialized_path)
             logger.info("_read_table parquet read ok, columns=%s", list(df.columns if _is_polars_df(df) else list(df.columns)))
         except Exception as e:
-            logger.exception("_read_table failed to read parquet %s: %s", materialized_path, e)
+            logger.exception("_read_table failed to read parquet %s: %s", logical, e)
             raise
     # try common separators
     last_exc = None
     if df is None:
         for separator in (",", "\t", ";"):
             try:
-                logger.info("_read_table trying separator '%s' for %s", separator, materialized_path)
+                logger.info("_read_table trying separator '%s' for %s", separator, logical)
                 df = pl.read_csv(materialized_path, separator=separator, **read_kwargs)
-                df = _restore_leading_zero_columns(df, materialized_path, separator, read_kwargs)
+                df = _restore_leading_zero_columns(df, materialized_path, separator, read_kwargs, path)
                 logger.info("_read_table csv read ok with separator '%s', columns=%s", separator, list(df.columns if _is_polars_df(df) else list(df.columns)))
                 break
             except Exception as e:
-                logger.warning("_read_table csv read failed with separator '%s' for %s: %s", separator, materialized_path, e)
+                logger.warning("_read_table csv read failed with separator '%s' for %s: %s", separator, logical, e)
                 last_exc = e
                 df = None
                 continue
     # fallback: try reading without header into a single column
     if df is None:
         try:
-            logger.info("_read_table falling back to has_header=False for %s", materialized_path)
+            logger.info("_read_table falling back to has_header=False for %s", logical)
             df = pl.read_csv(materialized_path, has_header=False, new_columns=["value"], **read_kwargs)
             logger.info("_read_table fallback read ok, columns=%s", list(df.columns if _is_polars_df(df) else list(df.columns)))
         except Exception as e:
-            logger.exception("_read_table fallback read failed for %s: %s", materialized_path, e)
+            logger.exception("_read_table fallback read failed for %s: %s", logical, e)
             # raise the last exception for visibility
             raise last_exc or e
 
@@ -3024,7 +3097,7 @@ def _read_table(path: str):
                         logger.info("_read_table reconstructed table with columns=%s", list(data[0].keys()) if data else [])
                         return pl.DataFrame(data)
             except Exception:
-                logger.exception("_read_table reconstruction failed for %s", materialized_path)
+                logger.exception("_read_table reconstruction failed for %s", logical)
                 # fall through to returning original df
                 pass
     except Exception:
@@ -4127,6 +4200,9 @@ class Cleaner:
         """
         if not recipe.sources:
             raise ValueError("Recipe must contain at least one source")
+        for step in recipe.cleaning_steps:
+            if getattr(step, "action", None) in ("external_lookup", "lookup_join") and (step.params or {}).get("mode", "http") == "http":
+                remote_services.require("http_lookup")
         src = recipe.sources[0]["path"]
         df = _read_table(src)
         # If source is long-form extraction, reconstruct a wide table first
@@ -4178,8 +4254,12 @@ class Cleaner:
                         res = _external_lookup(df, params)
                         if res is not None:
                             df = res
+                    except remote_services.RemoteServiceError:
+                        raise
                     except Exception:
                         pass
+            except remote_services.RemoteServiceError:
+                raise
             except Exception:
                 # ensure dataset-level hooks do not stop the runner
                 pass
@@ -4527,6 +4607,12 @@ class Cleaner:
                     raise
                 snapshot_info = None
 
+            if _write_managed_csv(df, out_p):
+                result = {"written": str(out_p), "diagnostics": diagnostics}
+                if snapshot_info:
+                    result["snapshot"] = snapshot_info
+                return result
+
             # Write to a temp file in the destination directory then atomically replace
             tmp = None
             try:
@@ -4602,6 +4688,9 @@ class Cleaner:
                 pass
         if not recipe.sources:
             raise ValueError("Recipe must contain at least one source")
+        for step in recipe.cleaning_steps:
+            if getattr(step, "action", None) in ("external_lookup", "lookup_join") and (step.params or {}).get("mode", "http") == "http":
+                remote_services.require("http_lookup")
         src = recipe.sources[0]["path"]
         df = _read_table(src)
         wide_df = None
@@ -4685,8 +4774,12 @@ class Cleaner:
                         res = _external_lookup(df_after, params)
                         if res is not None:
                             df_after = res
+                    except remote_services.RemoteServiceError:
+                        raise
                     except Exception:
                         pass
+            except remote_services.RemoteServiceError:
+                raise
             except Exception:
                 pass
         def _step_cols(step):

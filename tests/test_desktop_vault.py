@@ -9,10 +9,341 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import pyzipper
 
 from fastapi.testclient import TestClient
 
 from fbroom import desktop_vault, main as fb
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
+def test_managed_csv_memory_limit_and_failure_cleanup(tmp_path, monkeypatch):
+    import polars as pl
+    from fbroom import engine
+
+    root = tmp_path / "data"
+    outputs = root / "outputs"
+    outputs.mkdir(parents=True)
+    monkeypatch.setattr(desktop_vault, "_root", None)
+    monkeypatch.setattr(desktop_vault, "_master_key", None)
+    desktop_vault.initialize(root)
+    destination = outputs / "data.csv"
+    staged_paths = []
+    write_targets = []
+    stage = desktop_vault.stage_managed_output
+    write_csv = engine._write_csv
+
+    def track_stage(path):
+        result = stage(path)
+        staged_paths.append(result)
+        return result
+
+    def track_write(df, target):
+        write_targets.append(target)
+        return write_csv(df, target)
+
+    monkeypatch.setattr(desktop_vault, "stage_managed_output", track_stage)
+    monkeypatch.setattr(engine, "_write_csv", track_write)
+    with desktop_vault.request_workspace():
+        assert engine._write_managed_csv(
+            pl.DataFrame({"value": ["private-small"], "price": ["12.50"], "date": ["2026-01-02"]}),
+            destination,
+        )
+        assert isinstance(write_targets[-1], io.BytesIO)
+        assert not staged_paths[-1].exists()
+        assert b"private-small" in desktop_vault.read_bytes(destination)
+        assert not destination.exists()
+        with monkeypatch.context() as patch:
+            patch.setattr(desktop_vault, "materialize", lambda path: pytest.fail("small table was materialized"))
+            read_back = engine._read_table(str(destination))
+        assert read_back["price"].to_list() == ["12.50"]
+        assert read_back["date"].to_list() == ["2026-01-02"]
+
+        assert engine._write_managed_csv(pl.DataFrame({"value": ["x" * (9 * 1024 * 1024)]}), destination)
+        assert Path(write_targets[-1]) == staged_paths[-1]
+        assert not staged_paths[-1].exists()
+        assert len(desktop_vault.read_bytes(destination)) > 8 * 1024 * 1024
+        assert not destination.exists()
+
+    previous = desktop_vault.encrypted_path(destination).read_bytes()
+    def failing_write(df, target):
+        if isinstance(target, engine._BoundedCsvBuffer):
+            target.exceeded = True
+            raise OSError("buffer limit")
+        Path(target).write_bytes(b"unfinished private data")
+        raise OSError("write failed")
+
+    monkeypatch.setattr(engine, "_write_csv", failing_write)
+    with pytest.raises(OSError, match="write failed"):
+        with desktop_vault.request_workspace() as workspace:
+            engine._write_managed_csv(pl.DataFrame({"value": ["private"]}), destination)
+    assert not workspace.exists() and not staged_paths[-1].exists()
+    assert desktop_vault.encrypted_path(destination).read_bytes() == previous
+    assert not destination.exists()
+
+    from openpyxl import Workbook
+    from openpyxl.worksheet._writer import WorksheetWriter
+    write_sheet = WorksheetWriter.write
+
+    def failing_sheet(writer):
+        write_sheet(writer)
+        raise OSError("worksheet write failed")
+
+    monkeypatch.setattr(WorksheetWriter, "write", failing_sheet)
+    with desktop_vault.request_workspace() as workspace:
+        workbook = Workbook()
+        workbook.active.append(["private"])
+        staged = desktop_vault.stage_managed_output(outputs / "failed.xlsx")
+        with pytest.raises(OSError, match="worksheet write failed"):
+            fb._save_export_workbook(workbook, staged)
+        assert not list(workspace.rglob("*.xml"))
+    assert not workspace.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
+def test_streaming_upload_consumes_raw_body_and_rejects_nonlocal(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    root.mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(desktop_vault, "_root", None)
+    monkeypatch.setattr(desktop_vault, "_master_key", None)
+    desktop_vault.initialize(root)
+    monkeypatch.setenv("ENV", "development")
+    monkeypatch.setenv("FALCONBROOM_LOCAL_MODE", "1")
+    monkeypatch.setenv("FALCONBROOM_DESKTOP_SECRET", "a" * 64)
+    received = bytearray()
+
+    async def consume(request, file):
+        while chunk := await file.read(32768):
+            assert len(chunk) <= 32768
+            received.extend(chunk)
+        return {"name": file.filename, "size": len(received)}
+
+    monkeypatch.setattr(fb, "_process_upload", consume)
+    client = TestClient(fb.app)
+    headers = {"X-FalconBroom-Desktop-Token": "a" * 64, "X-FalconBroom-Filename": "caf%C3%A9.csv"}
+    content = b"private" * 300000
+    response = client.post("/desktop/upload-stream", headers=headers, content=content)
+    assert response.status_code == 200 and response.json() == {"name": "caf\u00e9.csv", "size": len(content)}
+    assert received == content
+    assert client.post("/desktop/upload-stream", content=b"x").status_code == 401
+    monkeypatch.setenv("FALCONBROOM_LOCAL_MODE", "0")
+    assert client.post("/desktop/upload-stream", headers=headers, content=b"x").status_code == 404
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
+def test_desktop_streaming_download_validates_and_cleans_up(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    outputs = root / "outputs"
+    outputs.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(desktop_vault, "_root", None)
+    monkeypatch.setattr(desktop_vault, "_master_key", None)
+    desktop_vault.initialize(root)
+    monkeypatch.setattr(fb, "OUTPUTS_DIR", outputs)
+    monkeypatch.setenv("ENV", "development")
+    monkeypatch.setenv("FALCONBROOM_LOCAL_MODE", "1")
+    monkeypatch.setenv("FALCONBROOM_DESKTOP_SECRET", "a" * 64)
+    headers = {"X-FalconBroom-Desktop-Token": "a" * 64}
+    path = outputs / "sample.csv"
+    contents = b"secret-value\n" * 100000
+    desktop_vault.write_encrypted_bytes(path, contents)
+    client = TestClient(fb.app)
+
+    def reject_materialize(*args):
+        raise AssertionError("ordinary download materialized plaintext")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(desktop_vault, "materialize_to", reject_materialize)
+        response = client.get("/download", headers=headers, params={"path": str(path)})
+    assert response.status_code == 200 and response.content == contents
+    assert int(response.headers["content-length"]) == len(contents)
+    assert response.headers["cache-control"] == "no-store"
+    assert not list((root.parent / "temporary").glob("fb-v2-*"))
+
+    import asyncio
+    from starlette.requests import Request
+
+    async def cancel_download():
+        request = Request({
+            "type": "http", "method": "GET", "path": "/download",
+            "headers": [], "scheme": "http", "server": ("127.0.0.1", 80),
+        })
+        streamed = fb.download(str(path), request)
+        first = await streamed.body_iterator.__anext__()
+        assert first and first == contents[:len(first)]
+        await streamed.body_iterator.aclose()
+
+    asyncio.run(cancel_download())
+    assert not list((root.parent / "temporary").glob("fb-v2-*"))
+
+    async def disconnect_download():
+        from starlette.requests import ClientDisconnect
+
+        scope = {
+            "type": "http", "method": "GET", "path": "/download",
+            "headers": [], "scheme": "http", "server": ("127.0.0.1", 80),
+            "asgi": {"spec_version": "2.4"},
+        }
+        streamed = fb.download(str(path), Request(scope))
+
+        async def receive():
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                raise OSError("client disconnected")
+
+        with pytest.raises(ClientDisconnect):
+            await streamed(scope, receive, send)
+
+    asyncio.run(disconnect_download())
+    assert not list((root.parent / "temporary").glob("fb-v2-*"))
+
+    response = client.get("/download", headers={**headers, "Range": "bytes=0-5"}, params={"path": str(path)})
+    assert response.status_code == 206 and response.content == contents[:6]
+    assert not list((root.parent / "temporary").glob("fb-v2-*"))
+
+    sealed = desktop_vault.encrypted_path(path)
+    sealed.write_bytes(sealed.read_bytes()[:-1])
+    response = client.get("/download", headers=headers, params={"path": str(path)})
+    assert response.status_code == 500
+    assert b"secret-value" not in response.content
+    assert not list((root.parent / "temporary").glob("fb-v2-*"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
+def test_scratch_workspace_has_protected_windows_acl(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    root.mkdir()
+    monkeypatch.setattr(desktop_vault, "_root", None)
+    monkeypatch.setattr(desktop_vault, "_master_key", None)
+    desktop_vault.initialize(root)
+    folder, lock = desktop_vault.create_scratch()
+    try:
+        child = folder / "test.txt"
+        child.write_text("test", encoding="utf-8")
+        command = (
+            "$a=Get-Acl -LiteralPath $env:FB_TEST_FOLDER; "
+            "$b=Get-Acl -LiteralPath $env:FB_TEST_FILE; "
+            "Write-Output $a.AreAccessRulesProtected; Write-Output $a.Sddl; Write-Output $b.Sddl"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            env={**os.environ, "FB_TEST_FOLDER": str(folder), "FB_TEST_FILE": str(child)},
+            capture_output=True, text=True, check=True,
+        )
+        lines = result.stdout.splitlines()
+        assert lines[0].strip() == "True"
+        assert ";;;OW)" in lines[1] and ";;;SY)" in lines[1]
+        assert "S-1-3-4" in lines[2] or ";;;OW)" in lines[2]
+    finally:
+        desktop_vault.release_scratch(folder, lock)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
+def test_scratch_cleanup_failure_is_reported_and_retryable(tmp_path, monkeypatch, caplog):
+    root = tmp_path / "data"
+    root.mkdir()
+    monkeypatch.setattr(desktop_vault, "_root", None)
+    monkeypatch.setattr(desktop_vault, "_master_key", None)
+    desktop_vault.initialize(root)
+    folder, lock = desktop_vault.create_scratch()
+    (folder / "test.txt").write_text("private", encoding="utf-8")
+    with monkeypatch.context() as patch:
+        def fail_cleanup(*args):
+            raise OSError("cleanup failed")
+        patch.setattr(desktop_vault, "_remove_scratch", fail_cleanup)
+        with pytest.raises(OSError, match="cleanup failed"):
+            desktop_vault.release_scratch(folder, lock)
+    assert lock.closed and folder.exists()
+    assert "Could not remove a desktop temporary workspace" in caplog.text
+    assert desktop_vault.cleanup_abandoned_scratch() == 1
+    assert not folder.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
+def test_encrypted_download_streams_managed_output_and_preview(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    root = tmp_path / "data"
+    outputs = root / "outputs"
+    uploads = root / "uploads"
+    outputs.mkdir(parents=True)
+    uploads.mkdir()
+    monkeypatch.setattr(desktop_vault, "_root", None)
+    monkeypatch.setattr(desktop_vault, "_master_key", None)
+    desktop_vault.initialize(root)
+    monkeypatch.setattr(fb, "OUTPUTS_DIR", outputs)
+    monkeypatch.setattr(fb, "UPLOAD_DIR", uploads)
+    monkeypatch.setenv("ENV", "development")
+    monkeypatch.setenv("FALCONBROOM_LOCAL_MODE", "1")
+    monkeypatch.setenv("FALCONBROOM_DESKTOP_SECRET", "a" * 64)
+    client = TestClient(fb.app)
+    headers = {"X-FalconBroom-Desktop-Token": "a" * 64}
+    password = "a-random-long-test-password"
+    contents = b"private-data\n" * 100000
+    source = outputs / "private-name.csv"
+    source.write_bytes(contents)
+    desktop_vault.seal_file(source)
+
+    response = client.post(
+        "/desktop/encrypted-download", headers=headers, json={"path": str(source), "password": password}
+    )
+    assert response.status_code == 200, response.text
+    assert b"private-data" not in response.content
+    assert b"private-name" not in response.content
+    with pyzipper.AESZipFile(io.BytesIO(response.content)) as archive:
+        assert archive.namelist() == ["export.csv"]
+        with pytest.raises(RuntimeError):
+            archive.read("export.csv", pwd=b"wrong-password")
+        assert archive.read("export.csv", pwd=password.encode()) == contents
+        info = archive.getinfo("export.csv")
+    damaged = bytearray(response.content)
+    name_length, extra_length = struct.unpack_from("<HH", damaged, info.header_offset + 26)
+    encrypted_data = info.header_offset + 30 + name_length + extra_length + 18
+    damaged[encrypted_data] ^= 1
+    with pyzipper.AESZipFile(io.BytesIO(damaged)) as archive:
+        with pytest.raises(pyzipper.BadZipFile, match="HMAC"):
+            archive.read("export.csv", pwd=password.encode())
+    assert not source.exists()
+    assert client.get("/download", headers=headers, params={"path": str(source)}).content == contents
+
+    preview = client.post(
+        "/desktop/encrypted-download", headers=headers,
+        json={"preview_csv": "name\nprivate\n", "password": password},
+    )
+    assert preview.status_code == 200
+    with pyzipper.AESZipFile(io.BytesIO(preview.content)) as archive:
+        assert archive.read("export.csv", pwd=password.encode()) == b"name\nprivate\n"
+    assert client.post("/desktop/encrypted-download", headers=headers, json={"path": str(source), "password": "short"}).status_code == 400
+    assert client.post("/desktop/encrypted-download", headers=headers, json={"path": str(tmp_path / "outside.csv"), "password": password}).status_code == 403
+    assert client.post("/desktop/encrypted-download", json={"path": str(source), "password": password}).status_code == 401
+    corrupt = outputs / "corrupt.csv"
+    corrupt.write_bytes(b"private-data")
+    sealed = desktop_vault.seal_file(corrupt)
+    sealed.write_bytes(sealed.read_bytes()[:-1])
+    scratch_folders = []
+    create_scratch = desktop_vault.create_scratch
+
+    def track_scratch():
+        folder, lock = create_scratch()
+        scratch_folders.append(folder)
+        return folder, lock
+
+    monkeypatch.setattr(desktop_vault, "create_scratch", track_scratch)
+    failing_client = TestClient(fb.app, raise_server_exceptions=False)
+    assert failing_client.post("/desktop/encrypted-download", headers=headers, json={"path": str(corrupt), "password": password}).status_code == 500
+    assert scratch_folders and all(not folder.exists() for folder in scratch_folders)
+    with desktop_vault.request_workspace():
+        fb._write_file_owner(source, {"id": "owner"})
+    monkeypatch.setenv("ENV", "production")
+    client = TestClient(fb.app, base_url="https://testserver")
+    monkeypatch.setattr(fb, "_require_auth", lambda request: {"id": "other-user"})
+    assert client.post("/desktop/encrypted-download", headers=headers, json={"path": str(source), "password": password}).status_code == 404
+    monkeypatch.setattr(fb, "_require_auth", lambda request: {"id": "owner"})
+    assert client.post("/desktop/encrypted-download", headers=headers, json={"path": str(source), "password": password}).status_code == 200
+    monkeypatch.setenv("FALCONBROOM_LOCAL_MODE", "0")
+    assert client.post("/desktop/encrypted-download", headers=headers, json={"path": str(source), "password": password}).status_code == 404
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
@@ -246,7 +577,14 @@ def test_desktop_upload_provenance_uses_relative_logical_path(tmp_path, monkeypa
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
-def test_desktop_upload_source_inspection_and_join_remain_usable(tmp_path, monkeypatch):
+@pytest.mark.parametrize("block_remote", [False, True])
+def test_desktop_upload_source_inspection_and_join_remain_usable(tmp_path, monkeypatch, block_remote):
+    import openpyxl.worksheet._writer as worksheet_writer
+
+    def reject_untracked_excel_temp(*args, **kwargs):
+        raise AssertionError("Excel output tried to use the system temporary directory")
+
+    monkeypatch.setattr(worksheet_writer, "create_temporary_file", reject_untracked_excel_temp)
     monkeypatch.chdir(tmp_path)
     root = tmp_path / "data"
     upload_dir = root / "uploads"
@@ -268,6 +606,10 @@ def test_desktop_upload_source_inspection_and_join_remain_usable(tmp_path, monke
     monkeypatch.setenv("ENV", "development")
     monkeypatch.setenv("FALCONBROOM_LOCAL_MODE", "1")
     monkeypatch.setenv("FALCONBROOM_DESKTOP_SECRET", "a" * 64)
+    if block_remote:
+        from fbroom import desktop_remote_services
+        monkeypatch.setenv("FALCONBROOM_REMOTE_POLICY_FILE", str(root / "remote-services.json"))
+        desktop_remote_services.write_policy({name: False for name in desktop_remote_services.SERVICES})
     headers = {"X-FalconBroom-Desktop-Token": "a" * 64}
     client = TestClient(fb.app)
 
@@ -277,12 +619,15 @@ def test_desktop_upload_source_inspection_and_join_remain_usable(tmp_path, monke
         files={"file": ("left.csv", b"id,name\n1,private-left\n", "text/csv")},
     )
     right = client.post(
-        "/upload",
-        headers=headers,
-        files={"file": ("right.csv", b"id,amount\n1,42\n", "text/csv")},
+        "/desktop/upload-stream",
+        headers={**headers, "X-FalconBroom-Filename": "right.csv", "Content-Type": "application/octet-stream"},
+        content=b"id,amount\n1,42\n",
     )
     assert left.status_code == 200, left.text
     assert right.status_code == 200, right.text
+    assert right.json()["name"] == "right.csv"
+    assert client.post("/desktop/upload-stream", headers=headers, content=b"data").status_code == 400
+    assert client.post("/desktop/upload-stream", headers={**headers, "X-FalconBroom-Filename": "..%2fother.csv"}, content=b"data").status_code == 400
     left_path = Path(left.json()["path"])
     right_path = Path(right.json()["path"])
     assert not left_path.exists()
@@ -349,6 +694,47 @@ def test_desktop_upload_source_inspection_and_join_remain_usable(tmp_path, monke
     assert client.post(f"/recipes/{recipe_id}/approve", headers=headers).status_code == 200
     run = client.post(f"/recipes/{recipe_id}/run", headers=headers)
     assert run.status_code == 200, run.text
+    encrypted_source = client.post(
+        "/desktop/encrypted-download", headers=headers,
+        json={"path": run.json()["run"]["output_path"], "password": "a-random-long-test-password"},
+    )
+    assert encrypted_source.status_code == 200, encrypted_source.text
+    with pyzipper.AESZipFile(io.BytesIO(encrypted_source.content)) as archive:
+        assert b"private-left" in archive.read("export.csv", pwd=b"a-random-long-test-password")
+    for export_format, extension, signature in (
+        ("xlsx", ".xlsx", b"PK"),
+        ("pkl", ".pkl", b"\x80"),
+        ("sqlite", ".sqlite", b"SQLite format 3"),
+    ):
+        converted = client.post(
+            f"/recipes/{recipe_id}/run", headers=headers, params={"export_format": export_format}
+        )
+        assert converted.status_code == 200, converted.text
+        path = Path(converted.json()["run"]["output_path"])
+        assert path.suffix == extension
+        assert not path.exists() and desktop_vault.encrypted_path(path).is_file()
+        download = client.get("/download", headers=headers, params={"path": str(path)})
+        assert download.status_code == 200 and download.content.startswith(signature)
+        if export_format == "xlsx":
+            from openpyxl import load_workbook
+            workbook = load_workbook(io.BytesIO(download.content), read_only=True)
+            assert any("private-left" in str(row) for row in workbook.active.values)
+            workbook.close()
+    for patches, patch_recipe in (([{"row": 0, "column": "name", "value": "changed"}], None), ([], recipe)):
+        payload = {"path": str(left_path), "patches": patches}
+        if patch_recipe:
+            payload["recipe"] = patch_recipe
+        patched = client.post("/apply-patch", headers=headers, json=payload)
+        assert patched.status_code == 200, patched.text
+        for field in ("patched_path", "upload_path"):
+            path = Path(patched.json()[field])
+            assert not path.exists() and desktop_vault.encrypted_path(path).is_file()
+            assert client.get("/download", headers=headers, params={"path": str(path)}).status_code == 200
+    parquet = client.post("/write-parquet", headers=headers, json={"path": str(left_path)})
+    assert parquet.status_code == 200, parquet.text
+    path = Path(parquet.json()["path"])
+    assert not path.exists() and desktop_vault.encrypted_path(path).is_file()
+    assert client.get("/download", headers=headers, params={"path": str(path)}).content.startswith(b"PAR1")
     run_id = run.json()["run"]["id"]
     assert desktop_vault.encrypted_path(history_dir / f"{run_id}.json").is_file()
     history = client.get("/history", headers=headers)
@@ -411,6 +797,13 @@ def test_desktop_upload_source_inspection_and_join_remain_usable(tmp_path, monke
     )
     assert downloaded.status_code == 200, downloaded.text
     assert b"private-left" in downloaded.content
+    encrypted_join = client.post(
+        "/desktop/encrypted-download", headers=headers,
+        json={"path": str(export_path), "password": "a-random-long-test-password"},
+    )
+    assert encrypted_join.status_code == 200, encrypted_join.text
+    with pyzipper.AESZipFile(io.BytesIO(encrypted_join.content)) as archive:
+        assert b"private-left" in archive.read("export.csv", pwd=b"a-random-long-test-password")
 
     for export_format in ("xlsx", "pandas", "sql"):
         alternate = client.post(
@@ -428,7 +821,13 @@ def test_desktop_upload_source_inspection_and_join_remain_usable(tmp_path, monke
         path = Path(alternate.json()["export_path"])
         assert desktop_vault.encrypted_path(path).is_file()
         assert not path.exists()
-        assert client.get("/download", headers=headers, params={"path": str(path)}).status_code == 200
+        downloaded_format = client.get("/download", headers=headers, params={"path": str(path)})
+        assert downloaded_format.status_code == 200
+        if export_format == "xlsx":
+            from openpyxl import load_workbook
+            workbook = load_workbook(io.BytesIO(downloaded_format.content), read_only=True)
+            assert any("private-left" in str(row) for row in workbook.active.values)
+            workbook.close()
 
     monkeypatch.setattr(fb, "_require_auth", lambda request: {"id": "test-owner"})
     with desktop_vault.request_workspace():

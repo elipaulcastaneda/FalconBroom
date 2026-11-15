@@ -1,5 +1,6 @@
 import { createClient } from 'npm:@supabase/supabase-js@2.112.4'
-import { handleDeletionPreflight, supabaseConfig, supabaseDependencies } from './core.mjs'
+import { supabaseConfig } from './core.mjs'
+import { deletionRouter } from './router.mjs'
 
 Deno.serve(async (request: Request) => {
   let config
@@ -19,6 +20,13 @@ Deno.serve(async (request: Request) => {
     })
   }
 
-  const deps = supabaseDependencies(createClient, config.url, config.anonKey, config.serviceKey, message => console.error(message))
-  return handleDeletionPreflight(request, deps)
+  const logError = (message: string) => console.error(message)
+  const route = deletionRouter({
+    config,
+    enableTestDeletion: Deno.env.get('FALCONBROOM_TEST_ACCOUNT_DELETION'),
+    workerSecret: Deno.env.get('FALCONBROOM_DELETION_WORKER_SECRET'),
+    createClient,
+    logError,
+  })
+  return route(request)
 })

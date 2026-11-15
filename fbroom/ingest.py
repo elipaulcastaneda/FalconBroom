@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover - optional dependency
     Document = None
 
 from .engine import Cleaner, _read_table, _is_polars_df, _fuzzy_dedupe, _spell_correct_column
+from . import desktop_remote_services as remote_services
 from .workflow_rules import suggest_columns_to_clean
 from .semantics import (
     column_kinds as _column_kinds, fits as _kind_fits, same_meaning as _same_meaning, swap_is_safe as _swap_is_safe,
@@ -232,8 +233,9 @@ def _download_google_drive_export(file_id: str, mime_type: str) -> bytes:
         },
     )
     try:
-        with urlopen(request, timeout=60) as response:
-            return response.read()
+        with remote_services.network_access("google_drive"):
+            with urlopen(request, timeout=60) as response:
+                return response.read()
     except HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace") if exc.fp else str(exc)
         raise RuntimeError(f"Drive export failed: {detail or exc}") from exc
@@ -266,8 +268,11 @@ def _extract_google_drive_export(source_path: Path, output_dir: Path, rows: _Csv
     if not export_info or not file_id:
         return False
 
+    remote_services.require("google_drive")
     try:
         export_bytes = _download_google_drive_export(file_id, export_info["mime_type"])
+    except remote_services.RemoteServiceError:
+        raise
     except Exception as exc:
         warnings.append(str(exc))
         return False

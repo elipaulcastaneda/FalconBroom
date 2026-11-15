@@ -2,9 +2,13 @@ from pathlib import Path
 from uuid import UUID, uuid4
 from urllib.parse import quote
 import json
+import asyncio
+from contextlib import nullcontext
 from datetime import datetime, timezone, timedelta
 import shutil
 import tempfile
+import io
+import pyzipper
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, Request, Response, WebSocket, WebSocketDisconnect
 import logging
@@ -12,7 +16,7 @@ import os
 from celery import Celery
 import threading
 import time
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -27,7 +31,9 @@ if __name__ == '__main__' and __package__ is None:
 
 from .connectors import resolve_source
 from . import desktop_vault
-from .desktop_request_gate import DesktopRequestGate
+from . import desktop_audit
+from . import desktop_remote_services as remote_services
+from .desktop_request_gate import DesktopRequestGate, desktop_startup_gate
 from .desktop_inspection_store import migrate_inspections, read_inspection, write_inspection
 from .engine import (
     Cleaner,
@@ -37,6 +43,7 @@ from .engine import (
     _suggest_buckets,
     _write_parquet,
     _write_csv,
+    _write_managed_csv,
     _copy_text_columns,
     _string_transform_column,
     _fill_null_column,
@@ -53,6 +60,7 @@ import re
 import csv
 import shutil
 import hashlib
+import secrets
 from .ingest import convert_uploaded_file, generate_plain_language_suggestions
 from .step_catalog import TEMPLATE_ACTIONS, parse_instruction, parse_machine_template
 from .ingest import _google_drive_access_token
@@ -364,6 +372,57 @@ else:
 
 app.add_middleware(DesktopRequestGate)
 
+@app.get("/desktop/remote-services")
+def get_desktop_remote_services():
+    if not remote_services.desktop_mode():
+        raise HTTPException(status_code=404, detail="Not available")
+    try:
+        return remote_services.read_policy()
+    except (OSError, ValueError) as error:
+        logger.exception("Could not read desktop remote-service preferences")
+        raise HTTPException(status_code=503, detail="Could not read remote-service preferences") from error
+
+
+@app.post("/desktop/remote-services")
+def set_desktop_remote_services(payload: dict):
+    if not remote_services.desktop_mode():
+        raise HTTPException(status_code=404, detail="Not available")
+    try:
+        if set(payload) != {"expected", "policy"} or not isinstance(payload["expected"], dict):
+            raise ValueError("Invalid remote-service preferences request")
+        policy = payload["policy"]
+        remote_services.write_policy(policy, expected=payload["expected"])
+        return policy
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except remote_services.RemoteServiceConflict as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except remote_services.RemoteServiceError as error:
+        raise HTTPException(status_code=423, detail=str(error)) from error
+    except OSError as error:
+        logger.exception("Could not save desktop remote-service preferences")
+        raise HTTPException(status_code=503, detail="Could not save remote-service preferences") from error
+
+
+@app.get("/desktop/remote-lease")
+async def desktop_remote_lease():
+    if not remote_services.desktop_mode():
+        raise HTTPException(status_code=404, detail="Not available")
+    try:
+        policy = remote_services.read_policy()
+    except (OSError, ValueError) as error:
+        logger.exception("Could not read desktop remote-service preferences")
+        raise HTTPException(status_code=503, detail="Could not read remote-service preferences") from error
+    if not all(policy.values()):
+        raise HTTPException(status_code=403, detail="Remote backend is blocked by your remote-service preferences")
+
+    async def keep_open():
+        while True:
+            yield b"\n"
+            await asyncio.sleep(1)
+
+    return StreamingResponse(keep_open(), media_type="application/octet-stream")
+
 
 @app.middleware("http")
 async def _secure_headers_middleware(request: Request, call_next):
@@ -570,6 +629,9 @@ def _save_privacy_json(name: str, data):
 
 
 def _privacy_audit(event: str, payload: dict):
+    if _is_local_desktop_mode() and desktop_vault.is_desktop_enabled():
+        _append_audit_event(PRIVACY_DIR, event, payload or {})
+        return
     rec = {"id": f"rec_{uuid4().hex[:8]}", "event": event, "timestamp": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), "payload": payload}
     logs = _load_privacy_json("privacy_records.json", []) or []
     logs.insert(0, rec)
@@ -592,6 +654,15 @@ def _append_audit_event(audit_dir: Path, event: str, payload: dict):
     Stores `audit.log` and a small `audit.prev` file containing the last HMAC.
     Requires `AUDIT_HMAC_KEY` env var to enable HMAC; otherwise falls back to plain append.
     """
+    if _is_local_desktop_mode() and desktop_vault.is_desktop_enabled():
+        try:
+            _require_desktop_consent_storage()
+            source = audit_dir.resolve().relative_to(Path("data").resolve()).as_posix()
+            desktop_audit.append(source, event, payload or {}, datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+            return True
+        except Exception:
+            logger.exception("Desktop audit storage failed")
+            raise
     try:
         audit_dir.mkdir(parents=True, exist_ok=True)
         audit_file = audit_dir / "audit.log"
@@ -849,6 +920,44 @@ def admin_metrics_tab(request: Request):
 
 @app.post("/upload")
 async def upload_file(request: Request, file: UploadFile = File(...)):
+    return await _process_upload(request, file)
+
+
+@app.post("/desktop/upload-stream")
+async def upload_desktop_stream(request: Request):
+    from urllib.parse import unquote
+
+    if not remote_services.desktop_mode() or not desktop_vault.is_initialized():
+        raise HTTPException(status_code=404, detail="Streaming upload requires the local desktop backend")
+    encoded_name = request.headers.get("X-FalconBroom-Filename", "")
+    if not encoded_name or len(encoded_name) > 2048:
+        raise HTTPException(status_code=400, detail="Invalid upload filename")
+    try:
+        filename = unquote(encoded_name, encoding="utf-8", errors="strict")
+    except UnicodeError as error:
+        raise HTTPException(status_code=400, detail="Invalid upload filename") from error
+    if not filename or len(filename) > 255 or any(char in filename for char in "\x00/\\"):
+        raise HTTPException(status_code=400, detail="Invalid upload filename")
+
+    class RequestUpload:
+        def __init__(self):
+            self.filename = filename
+            self.chunks = request.stream().__aiter__()
+            self.pending = b""
+
+        async def read(self, size):
+            while not self.pending:
+                try:
+                    self.pending = await self.chunks.__anext__()
+                except StopAsyncIteration:
+                    return b""
+            chunk, self.pending = self.pending[:size], self.pending[size:]
+            return chunk
+
+    return await _process_upload(request, RequestUpload())
+
+
+async def _process_upload(request: Request, file):
     try:
         user = _file_access_user(request)
         filename = file.filename or "upload"
@@ -910,7 +1019,9 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
                 raise HTTPException(status_code=500, detail="Could not secure upload metadata") from error
 
             metadata_user = user
-            if metadata_user is None:
+            if metadata_user is None and _desktop_test_ownership_enabled():
+                metadata_user = await _desktop_test_verified_user(request)
+            elif metadata_user is None:
                 try:
                     metadata_user = _require_auth(request)
                 except HTTPException as error:
@@ -1019,10 +1130,21 @@ def profile(spec: SourceSpec, request: Request):
 
 
 @app.post("/inspect")
-def inspect(spec: SourceInspectSpec, request: Request):
+async def inspect(spec: SourceInspectSpec, request: Request):
     try:
         user = _file_access_user(request)
         _require_owned_file(spec.path, user)
+        if user is None and _desktop_test_ownership_enabled():
+            candidate = await _desktop_test_verified_user(request)
+            if candidate is not None:
+                try:
+                    _require_owned_file(spec.path, candidate)
+                except HTTPException as error:
+                    if error.status_code != 404:
+                        raise
+                    logger.info("Desktop inspection source ownership requires review")
+                else:
+                    user = candidate
         inspection = cleaner.inspect_source(spec.path, offset=spec.offset, limit=spec.limit)
         # persist full inspection JSON for auditing and later retrieval
         insp_id = f"inspection_{uuid4().hex[:8]}"
@@ -1471,8 +1593,49 @@ class ConsentSpec(BaseModel):
     ip: Optional[str] = None
 
 
+def _require_desktop_consent_storage():
+    if _is_local_desktop_mode() and desktop_vault.is_desktop_enabled() and not desktop_vault.is_initialized():
+        raise desktop_vault.DesktopVaultError("Desktop consent storage is unavailable")
+
+
+def _consent_record_files(directory: Path):
+    _require_desktop_consent_storage()
+    if desktop_vault.is_initialized() and directory.is_symlink():
+        raise desktop_vault.DesktopVaultError("Consent storage is redirected")
+    if not directory.exists():
+        return []
+    if not desktop_vault.is_initialized():
+        return list(directory.glob("*.json"))
+    for path in directory.iterdir():
+        if path.is_symlink() and (path.name.endswith(".json") or path.name.endswith(".json.fbenc")):
+            raise desktop_vault.DesktopVaultError("Consent record is redirected")
+    paths = _record_files(directory)
+    for path in paths:
+        if path.is_symlink() or desktop_vault.encrypted_path(path).is_symlink():
+            raise desktop_vault.DesktopVaultError("Consent record is redirected")
+        if path.exists() and desktop_vault.encrypted_path(path).exists():
+            raise desktop_vault.DesktopVaultError("Conflicting consent record copies require review")
+    return paths
+
+
+def _read_consent_record(path: Path):
+    _require_desktop_consent_storage()
+    if desktop_vault.is_initialized() and (
+        path.is_symlink() or desktop_vault.encrypted_path(path).is_symlink()
+        or (path.exists() and desktop_vault.encrypted_path(path).exists())
+    ):
+        raise desktop_vault.DesktopVaultError("Consent record copies require review")
+    record = json.loads(desktop_vault.read_text(path))
+    if not isinstance(record, dict):
+        raise ValueError("Invalid consent record")
+    return record
+
+
 def _consent_audit(action: str, payload: dict):
     """Append an audit entry for consent-related operations."""
+    if _is_local_desktop_mode() and desktop_vault.is_desktop_enabled():
+        _append_audit_event(Path("data") / "consents", action, payload or {})
+        return
     try:
         CONSENT_DIR = Path("data") / "consents"
         CONSENT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1592,9 +1755,11 @@ def write_parquet(spec: WriteParquetSpec, request: Request):
             if not out.is_absolute():
                 out = OUTPUTS_DIR / out
         out.parent.mkdir(parents=True, exist_ok=True)
-        res = _write_parquet(df, str(out), compression=spec.compression, atomic=bool(spec.atomic))
+        staged = desktop_vault.stage_managed_output(out)
+        res = _write_parquet(df, str(staged), compression=spec.compression, atomic=bool(spec.atomic))
         if not res:
             raise HTTPException(status_code=500, detail="Failed to write parquet file")
+        desktop_vault.publish_staged_output(staged, out)
         _write_file_owner(out, user)
         _seal_desktop_artifact(out)
         return {"path": str(out)}
@@ -1952,6 +2117,32 @@ def _write_file_owner(path: Path, user: Optional[dict]):
         metadata_path.write_bytes(serialized)
 
 
+def _desktop_join_artifact_owner(request: Request, paths: tuple[str, str], user: Optional[dict]):
+    if (
+        user is not None
+        or not desktop_vault.is_initialized()
+        or os.environ.get("FALCONBROOM_TEST_ACCOUNT_DELETION") != "1"
+    ):
+        return user
+    try:
+        candidate = _require_auth(request)
+    except HTTPException as error:
+        if error.status_code != 401:
+            raise
+        return None
+    if not isinstance(candidate.get("id"), str) or not candidate["id"]:
+        return None
+    for path in paths:
+        try:
+            _require_owned_file(path, candidate)
+        except HTTPException as error:
+            if error.status_code != 404:
+                raise
+            logger.info("Desktop join output ownership requires review")
+            return None
+    return candidate
+
+
 def _seal_desktop_artifact(path: Path) -> Path:
     path = Path(path)
     if (
@@ -1961,6 +2152,36 @@ def _seal_desktop_artifact(path: Path) -> Path:
     ):
         desktop_vault.seal_file(path)
     return path
+
+
+def _save_export_workbook(workbook, path: Path) -> None:
+    if not desktop_vault.is_initialized():
+        workbook.save(path)
+        return
+    from openpyxl.drawing.spreadsheet_drawing import SpreadsheetDrawing
+    from openpyxl.worksheet._writer import WorksheetWriter
+    from openpyxl.writer.excel import ExcelWriter
+    import zipfile
+
+    # openpyxl's default worksheet writer uses the system temporary directory.
+    class DesktopExcelWriter(ExcelWriter):
+        def write_worksheet(self, ws):
+            ws._drawing = SpreadsheetDrawing()
+            ws._drawing.charts = ws._charts
+            ws._drawing.images = ws._images
+            xml_path = desktop_vault.current_workspace() / f"{uuid4().hex}.xml"
+            writer = WorksheetWriter(ws, out=str(xml_path))
+            try:
+                writer.write()
+                ws._rels = writer._rels
+                self._archive.write(writer.out, ws.path[1:])
+                self.manifest.append(ws)
+            finally:
+                writer.close()
+                xml_path.unlink(missing_ok=True)
+
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
+        DesktopExcelWriter(workbook, archive).save()
 
 
 def _write_snapshot_owner(result, user: Optional[dict]):
@@ -2370,7 +2591,7 @@ def run_recipe(rid: str, request: Request, export_format: str = "csv"):
         if out_path:
             try:
                 out_p = Path(out_path)
-                if not out_p.exists():
+                if not desktop_vault.exists(out_p):
                     # if runner returned a relative path that wasn't created,
                     # fallback to a canonical filename in outputs
                     out_path = str(OUTPUTS_DIR / f"{rid}_{run_id}.csv")
@@ -2381,9 +2602,11 @@ def run_recipe(rid: str, request: Request, export_format: str = "csv"):
                         # copy into outputs dir to ensure restricted download can access
                         dest = OUTPUTS_DIR / f"{rid}_{run_id}_{out_p.name}"
                         try:
-                            shutil.copyfile(str(resolved_out), str(dest))
+                            desktop_vault.copy_to_managed_output(resolved_out, dest)
                             out_path = str(dest)
                         except Exception:
+                            if desktop_vault.is_initialized():
+                                raise
                             # if copy fails, fall back to writing into outputs via _write_csv
                             try:
                                 # attempt to read and rewrite using engine helpers
@@ -2393,6 +2616,8 @@ def run_recipe(rid: str, request: Request, export_format: str = "csv"):
                             except Exception:
                                 out_path = str(OUTPUTS_DIR / f"{rid}_{run_id}.csv")
             except Exception:
+                if desktop_vault.is_initialized():
+                    raise
                 out_path = str(OUTPUTS_DIR / f"{rid}_{run_id}.csv")
         else:
             out_path = str(OUTPUTS_DIR / f"{rid}_{run_id}.csv")
@@ -2405,13 +2630,18 @@ def run_recipe(rid: str, request: Request, export_format: str = "csv"):
 
                 wb = Workbook()
                 ws = wb.active
-                with open(out_path, newline='', encoding='utf-8') as fh:
+                readable = desktop_vault.materialize(Path(out_path)) if desktop_vault.is_initialized() else Path(out_path)
+                with readable.open(newline='', encoding='utf-8') as fh:
                     reader = _csv.reader(fh)
                     for r in reader:
                         ws.append(r)
                 xlsx_path = str(Path(out_path).with_suffix('.xlsx'))
-                wb.save(xlsx_path)
+                staged = desktop_vault.stage_managed_output(Path(xlsx_path))
+                _save_export_workbook(wb, staged)
+                desktop_vault.publish_staged_output(staged, Path(xlsx_path))
                 exported = xlsx_path
+            except (desktop_vault.DesktopVaultError, OSError):
+                raise
             except Exception as exc:
                 # conversion failed; keep CSV but note warning
                 run_record.setdefault("warnings", []).append(f"xlsx conversion failed: {exc}")
@@ -2420,15 +2650,18 @@ def run_recipe(rid: str, request: Request, export_format: str = "csv"):
                 tabular = _read_table(out_path)
                 if export_format.lower() in ("pkl", "pandas"):
                     pkl_path = str(Path(out_path).with_suffix('.pkl'))
-                    tabular.to_pandas().to_pickle(pkl_path)
+                    staged = desktop_vault.stage_managed_output(Path(pkl_path))
+                    tabular.to_pandas().to_pickle(staged)
+                    desktop_vault.publish_staged_output(staged, Path(pkl_path))
                     exported = pkl_path
                 else:
                     import sqlite3
                     db_path = str(Path(out_path).with_suffix('.sqlite'))
-                    if os.path.exists(db_path):
-                        os.remove(db_path)
+                    staged = desktop_vault.stage_managed_output(Path(db_path))
+                    if staged.exists():
+                        staged.unlink()
                     names = list(tabular.columns)
-                    con = sqlite3.connect(db_path)
+                    con = sqlite3.connect(staged)
                     try:
                         quoted = ", ".join('"' + n.replace('"', '""') + '"' for n in names)
                         con.execute(f"CREATE TABLE data ({quoted})")
@@ -2439,6 +2672,7 @@ def run_recipe(rid: str, request: Request, export_format: str = "csv"):
                         con.commit()
                     finally:
                         con.close()
+                    desktop_vault.publish_staged_output(staged, Path(db_path))
                     exported = db_path
             except Exception as exc:
                 run_record.setdefault("warnings", []).append(f"{export_format} export failed: {exc}")
@@ -2511,7 +2745,7 @@ def rollback_snapshot(spec: SnapshotRollbackSpec, request: Request):
         dest_name = spec.dest_name or f"rollback_snapshot_{uuid4().hex[:8]}_{snap.name}"
         dest_path = OUTPUTS_DIR / dest_name
         readable = desktop_vault.materialize(snap) if desktop_vault.is_initialized() else snap
-        shutil.copyfile(str(readable), str(dest_path))
+        desktop_vault.copy_to_managed_output(readable, dest_path)
         _seal_desktop_artifact(dest_path)
 
         record = {"rollback_snapshot": str(snap), "performed_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), "rollback_path": str(dest_path)}
@@ -2546,6 +2780,64 @@ def validate_recipe_schema(rid: str, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class EncryptedDownloadSpec(BaseModel):
+    password: str
+    path: Optional[str] = None
+    preview_csv: Optional[str] = None
+
+
+@app.post("/desktop/encrypted-download")
+def encrypted_download(spec: EncryptedDownloadSpec, request: Request):
+    if not remote_services.desktop_mode() or not desktop_vault.is_initialized():
+        raise HTTPException(status_code=404, detail="Encrypted downloads require the local desktop backend")
+    user = _file_access_user(request)
+    if len(spec.password) < 20 or len(spec.password.encode("utf-8")) > 1024:
+        raise HTTPException(status_code=400, detail="Use a passphrase of at least 20 characters")
+    if (spec.path is None) == (spec.preview_csv is None):
+        raise HTTPException(status_code=400, detail="Choose one output or preview")
+
+    source = None
+    preview = None
+    if spec.path is not None:
+        source = Path(_desktop_legacy_output(spec.path)).resolve()
+        if user:
+            _require_owned_file(str(source), user, (OUTPUTS_DIR, UPLOAD_DIR))
+        if not any(source.is_relative_to(root.resolve()) for root in (OUTPUTS_DIR, UPLOAD_DIR)):
+            raise HTTPException(status_code=403, detail="Download restricted to outputs or uploads directory")
+        if not desktop_vault.exists(source):
+            raise HTTPException(status_code=404, detail="File not found")
+        extension = source.suffix.lower()
+        if extension not in {".csv", ".xlsx", ".pkl", ".sqlite", ".parquet", ".json", ".txt"}:
+            extension = ".bin"
+    else:
+        preview = spec.preview_csv.encode("utf-8")
+        if len(preview) > 16 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Preview is too large for encrypted download")
+        extension = ".csv"
+
+    scratch, lock = desktop_vault.create_scratch()
+    archive_path = scratch / "encrypted.zip"
+    try:
+        with pyzipper.AESZipFile(archive_path, "w", compression=pyzipper.ZIP_DEFLATED) as archive:
+            archive.setpassword(spec.password.encode("utf-8"))
+            archive.setencryption(pyzipper.WZ_AES, nbits=256)
+            with archive.open("export" + extension, "w", force_zip64=True) as output:
+                if source is not None:
+                    desktop_vault.copy_plaintext_to(source, output)
+                else:
+                    shutil.copyfileobj(io.BytesIO(preview), output)
+        return FileResponse(
+            archive_path,
+            filename="falconbroom-encrypted.zip",
+            media_type="application/zip",
+            headers={"Cache-Control": "no-store"},
+            background=BackgroundTask(desktop_vault.release_scratch, scratch, lock),
+        )
+    except Exception:
+        desktop_vault.release_scratch(scratch, lock)
+        raise
+
+
 @app.get("/download")
 def download(path: str, request: Request):
     try:
@@ -2566,6 +2858,43 @@ def download(path: str, request: Request):
                 raise HTTPException(status_code=404, detail="File not found")
             encrypted = desktop_vault.encrypted_path(resolved)
             if encrypted.is_file():
+                if "range" not in request.headers:
+                    import mimetypes
+                    from urllib.parse import quote
+
+                    stream, key, length, scratch, lock = desktop_vault.verified_download_snapshot(resolved)
+                    closed = False
+
+                    def cleanup():
+                        nonlocal closed
+                        if not closed:
+                            closed = True
+                            stream.close()
+                            desktop_vault.release_scratch(scratch, lock)
+
+                    async def body():
+                        try:
+                            for chunk in desktop_vault._iter_decrypted(stream, key):
+                                yield chunk
+                        finally:
+                            cleanup()
+
+                    class DownloadResponse(StreamingResponse):
+                        async def __call__(self, scope, receive, send):
+                            try:
+                                await super().__call__(scope, receive, send)
+                            finally:
+                                cleanup()
+
+                    return DownloadResponse(
+                        body(),
+                        media_type=mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
+                        headers={
+                            "Content-Disposition": f"attachment; filename*=utf-8''{quote(resolved.name, safe='')}",
+                            "Content-Length": str(length),
+                            "Cache-Control": "no-store",
+                        },
+                    )
                 temp_dir, temp_lock = desktop_vault.create_scratch()
                 plaintext = temp_dir / resolved.name
                 try:
@@ -3083,7 +3412,7 @@ def rollback_run(run_id: str, request: Request):
     _require_owned_file(output, user, (OUTPUTS_DIR,))
     dest = OUTPUTS_DIR / f"rollback_{run_id}_{Path(output).name}"
     source = desktop_vault.materialize(Path(output)) if desktop_vault.is_initialized() else Path(output)
-    shutil.copyfile(source, dest)
+    desktop_vault.copy_to_managed_output(source, dest)
     _write_file_owner(dest, user)
     _seal_desktop_artifact(dest)
     rollback_record = {
@@ -3835,12 +4164,33 @@ def join_export(spec: JoinExportSpec, request: Request):
             fname = f"{fname}_{uuid4().hex}"
         fmt = (spec.export_format or "csv").lower()
         out_path = OUTPUTS_DIR / f"{fname}.{ 'csv' if fmt!='pandas' and fmt!='sql' else ('pkl' if fmt=='pandas' else 'sqlite') }"
+        owner_user = _desktop_join_artifact_owner(request, (spec.left_path, spec.right_path), user)
+        if desktop_vault.is_initialized() and os.environ.get("FALCONBROOM_TEST_ACCOUNT_DELETION") == "1":
+            paths = [out_path]
+            if fmt == "xlsx":
+                paths.append(OUTPUTS_DIR / f"{fname}.xlsx")
+            if fmt == "pandas":
+                paths.append(OUTPUTS_DIR / f"{fname}.parquet")
+            for existing in paths:
+                if not existing.resolve().is_relative_to(OUTPUTS_DIR.resolve()):
+                    raise HTTPException(status_code=400, detail="Invalid output filename")
+                metadata = existing.with_name(existing.name + ".meta.json")
+                if desktop_vault.exists(existing) or desktop_vault.exists(metadata):
+                    if not owner_user:
+                        raise HTTPException(status_code=409, detail="Existing output ownership requires review")
+                    try:
+                        _require_owned_file(str(existing), owner_user, (OUTPUTS_DIR,))
+                    except HTTPException as error:
+                        if error.status_code != 404:
+                            raise
+                        raise HTTPException(status_code=409, detail="Existing output ownership requires review") from error
 
         # CSV export
         if fmt == "csv":
             try:
-                _write_csv(joined, str(out_path))
-                _write_file_owner(out_path, user)
+                if not _write_managed_csv(joined, out_path):
+                    _write_csv(joined, str(out_path))
+                _write_file_owner(out_path, owner_user)
                 # record history entry for this join export
                 try:
                     now = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
@@ -3859,8 +4209,8 @@ def join_export(spec: JoinExportSpec, request: Request):
                         "output_path": str(out_path),
                         "filename": fname,
                     }
-                    if user:
-                        rec["owner"] = {"user_id": str(user["id"])}
+                    if owner_user:
+                        rec["owner"] = {"user_id": str(owner_user["id"])}
                     outp = HISTORY_DIR / f"{rec['id']}.json"
                     _write_record(outp, rec)
                 except Exception:
@@ -3876,7 +4226,7 @@ def join_export(spec: JoinExportSpec, request: Request):
         if fmt == "xlsx":
             # write CSV first then convert to xlsx
             try:
-                tmp_csv = str(OUTPUTS_DIR / f"{fname}.csv")
+                tmp_csv = str(desktop_vault.stage_managed_output(OUTPUTS_DIR / f"{fname}.csv"))
                 _write_csv(joined, tmp_csv)
                 from openpyxl import Workbook
                 import csv as _csv
@@ -3888,15 +4238,17 @@ def join_export(spec: JoinExportSpec, request: Request):
                     for r in reader:
                         ws.append(r)
                 xlsx_path = str(OUTPUTS_DIR / f"{fname}.xlsx")
-                wb.save(xlsx_path)
-                _write_file_owner(Path(xlsx_path), user)
+                staged = desktop_vault.stage_managed_output(Path(xlsx_path))
+                _save_export_workbook(wb, staged)
+                desktop_vault.publish_staged_output(staged, Path(xlsx_path))
+                _write_file_owner(Path(xlsx_path), owner_user)
                 if user or desktop_vault.is_initialized():
                     Path(tmp_csv).unlink()
                 try:
                     now = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
                     rec = {"id": f"join_{uuid4().hex}", "type": "join", "status": "success", "started_at": now, "finished_at": now, "left_path": spec.left_path, "right_path": spec.right_path, "left_on": left_on, "right_on": right_on, "join_type": how, "export_format": 'xlsx', "output_path": xlsx_path, "filename": fname}
-                    if user:
-                        rec["owner"] = {"user_id": str(user["id"])}
+                    if owner_user:
+                        rec["owner"] = {"user_id": str(owner_user["id"])}
                     outp = HISTORY_DIR / f"{rec['id']}.json"
                     _write_record(outp, rec)
                 except Exception:
@@ -3914,13 +4266,15 @@ def join_export(spec: JoinExportSpec, request: Request):
                 import pandas as _pd
                 pd_df = joined.to_pandas() if hasattr(joined, 'to_pandas') else joined
                 pkl_path = str(OUTPUTS_DIR / f"{fname}.pkl")
-                pd_df.to_pickle(pkl_path)
-                _write_file_owner(Path(pkl_path), user)
+                staged = desktop_vault.stage_managed_output(Path(pkl_path))
+                pd_df.to_pickle(staged)
+                desktop_vault.publish_staged_output(staged, Path(pkl_path))
+                _write_file_owner(Path(pkl_path), owner_user)
                 try:
                     now = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
                     rec = {"id": f"join_{uuid4().hex}", "type": "join", "status": "success", "started_at": now, "finished_at": now, "left_path": spec.left_path, "right_path": spec.right_path, "left_on": left_on, "right_on": right_on, "join_type": how, "export_format": 'pandas', "output_path": pkl_path, "filename": fname}
-                    if user:
-                        rec["owner"] = {"user_id": str(user["id"])}
+                    if owner_user:
+                        rec["owner"] = {"user_id": str(owner_user["id"])}
                     outp = HISTORY_DIR / f"{rec['id']}.json"
                     _write_record(outp, rec)
                 except Exception:
@@ -3930,16 +4284,20 @@ def join_export(spec: JoinExportSpec, request: Request):
                         raise
                 _seal_desktop_artifact(Path(pkl_path))
                 return {"export_path": pkl_path}
+            except (desktop_vault.DesktopVaultError, OSError):
+                raise
             except Exception:
                 # fallback to parquet using polars
                 try:
                     pq_path = str(OUTPUTS_DIR / f"{fname}.parquet")
+                    staged = desktop_vault.stage_managed_output(Path(pq_path))
                     try:
-                        joined.write_parquet(pq_path)
+                        joined.write_parquet(staged)
                     except Exception:
                         # if joined is pandas
-                        pd_df.to_parquet(pq_path)
-                    _write_file_owner(Path(pq_path), user)
+                        pd_df.to_parquet(staged)
+                    desktop_vault.publish_staged_output(staged, Path(pq_path))
+                    _write_file_owner(Path(pq_path), owner_user)
                     _seal_desktop_artifact(Path(pq_path))
                     return {"export_path": pq_path}
                 except Exception as e:
@@ -3949,6 +4307,7 @@ def join_export(spec: JoinExportSpec, request: Request):
             try:
                 import sqlite3
                 db_path = str(OUTPUTS_DIR / f"{fname}.sqlite")
+                staged = desktop_vault.stage_managed_output(Path(db_path))
                 # convert to records and insert
                 recs = None
                 if hasattr(joined, 'to_dicts'):
@@ -3964,22 +4323,25 @@ def join_export(spec: JoinExportSpec, request: Request):
                     cols = list(recs[0].keys())
                 else:
                     cols = []
-                con = sqlite3.connect(db_path)
-                cur = con.cursor()
-                if cols:
-                    cols_sql = ", ".join([f'"{c}" TEXT' for c in cols])
-                    cur.execute(f'CREATE TABLE joined ({cols_sql})')
-                    placeholders = ",".join(["?" for _ in cols])
-                    to_insert = [[str(r.get(c, None)) for c in cols] for r in recs]
-                    cur.executemany(f'INSERT INTO joined VALUES ({placeholders})', to_insert)
-                    con.commit()
-                con.close()
-                _write_file_owner(Path(db_path), user)
+                con = sqlite3.connect(staged)
+                try:
+                    cur = con.cursor()
+                    if cols:
+                        cols_sql = ", ".join([f'"{c}" TEXT' for c in cols])
+                        cur.execute(f'CREATE TABLE joined ({cols_sql})')
+                        placeholders = ",".join(["?" for _ in cols])
+                        to_insert = [[str(r.get(c, None)) for c in cols] for r in recs]
+                        cur.executemany(f'INSERT INTO joined VALUES ({placeholders})', to_insert)
+                        con.commit()
+                finally:
+                    con.close()
+                desktop_vault.publish_staged_output(staged, Path(db_path))
+                _write_file_owner(Path(db_path), owner_user)
                 try:
                     now = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
                     rec = {"id": f"join_{uuid4().hex}", "type": "join", "status": "success", "started_at": now, "finished_at": now, "left_path": spec.left_path, "right_path": spec.right_path, "left_on": left_on, "right_on": right_on, "join_type": how, "export_format": 'sql', "output_path": db_path, "filename": fname}
-                    if user:
-                        rec["owner"] = {"user_id": str(user["id"])}
+                    if owner_user:
+                        rec["owner"] = {"user_id": str(owner_user["id"])}
                     outp = HISTORY_DIR / f"{rec['id']}.json"
                     _write_record(outp, rec)
                 except Exception:
@@ -3994,13 +4356,14 @@ def join_export(spec: JoinExportSpec, request: Request):
 
         # default: fallback to csv
         try:
-            _write_csv(joined, str(out_path))
-            _write_file_owner(out_path, user)
+            if not _write_managed_csv(joined, out_path):
+                _write_csv(joined, str(out_path))
+            _write_file_owner(out_path, owner_user)
             try:
                 now = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
                 rec = {"id": f"join_{uuid4().hex}", "type": "join", "status": "success", "started_at": now, "finished_at": now, "left_path": spec.left_path, "right_path": spec.right_path, "left_on": left_on, "right_on": right_on, "join_type": how, "export_format": fmt, "output_path": str(out_path), "filename": fname}
-                if user:
-                    rec["owner"] = {"user_id": str(user["id"])}
+                if owner_user:
+                    rec["owner"] = {"user_id": str(owner_user["id"])}
                 outp = HISTORY_DIR / f"{rec['id']}.json"
                 _write_record(outp, rec)
             except Exception:
@@ -4078,7 +4441,8 @@ def apply_patch(spec: PatchSpec, request: Request):
             result = cleaner.apply_recipe_from_spec(recipe_obj)
             _write_snapshot_owner(result, user)
             upload_path = UPLOAD_DIR / out_name
-            shutil.copyfile(out_path, upload_path)
+            readable = desktop_vault.materialize(out_path) if desktop_vault.is_initialized() else out_path
+            desktop_vault.copy_to_managed_output(readable, upload_path)
             _write_file_owner(out_path, user)
             _write_file_owner(upload_path, user)
             _copy_text_columns(out_path, upload_path)
@@ -4118,16 +4482,19 @@ def apply_patch(spec: PatchSpec, request: Request):
                 if c not in cols:
                     cols.append(c)
 
-        with open(out_path, "w", encoding="utf-8", newline="") as fh:
+        staged = desktop_vault.stage_managed_output(out_path)
+        with open(staged, "w", encoding="utf-8", newline="") as fh:
             writer = csv.writer(fh)
             writer.writerow(cols)
             for row in rows:
                 writer.writerow([row.get(c, "") for c in cols])
+        desktop_vault.publish_staged_output(staged, out_path)
 
         # also copy into uploads for visibility/reuse
         upload_name = out_name
         upload_path = UPLOAD_DIR / upload_name
-        shutil.copyfile(out_path, upload_path)
+        readable = desktop_vault.materialize(out_path) if desktop_vault.is_initialized() else out_path
+        desktop_vault.copy_to_managed_output(readable, upload_path)
         _write_file_owner(out_path, user)
         _write_file_owner(upload_path, user)
 
@@ -4359,15 +4726,16 @@ def get_job_status(job_id: str, request: Request, download: bool = False):
         if not re.fullmatch(r"job_[0-9a-f]{8}", job_id):
             raise HTTPException(status_code=404, detail="Job not found")
         job_file = _job_file_path(job_id)
-        if not job_file.is_file():
+        if not desktop_vault.exists(job_file):
             raise HTTPException(status_code=404, detail="Job not found")
-        job = json.loads(job_file.read_text(encoding="utf-8"))
+        job = _read_job(job_file)
         requester_id = (auth_user or {}).get("id")
         if not _is_local_desktop_mode() and (
             not requester_id or job.get("requester_user_id") != requester_id
         ):
             raise HTTPException(status_code=404, detail="Job not found")
         if download:
+            _require_desktop_consent_storage()
             if job.get("type") != "export_consents" or job.get("status") != "completed":
                 raise HTTPException(status_code=404, detail="Export not available")
             target_user = job.get("user_id")
@@ -4375,19 +4743,35 @@ def get_job_status(job_id: str, request: Request, download: bool = False):
                 _consent_audit("blocked_job_download_opt_out", {"job_id": job_id, "user_id": target_user})
                 raise HTTPException(status_code=403, detail="Target user has opted out of exports")
             export_path = (job.get("result") or {}).get("export_path")
-            consent_root = (Path("data") / "consents").resolve()
-            expected_dir = (consent_root / "exports").resolve()
+            consent_dir = Path("data") / "consents"
+            export_dir = consent_dir / "exports"
+            if desktop_vault.is_initialized() and (consent_dir.is_symlink() or export_dir.is_symlink()):
+                raise desktop_vault.DesktopVaultError("Consent export storage is redirected")
+            consent_root = consent_dir.resolve()
+            expected_dir = export_dir.resolve()
             if not isinstance(export_path, str):
                 raise HTTPException(status_code=404, detail="Export not available")
+            if desktop_vault.is_initialized() and (
+                Path(export_path).is_symlink() or desktop_vault.encrypted_path(Path(export_path)).is_symlink()
+            ):
+                raise desktop_vault.DesktopVaultError("Consent export is redirected")
             resolved_export = Path(export_path).resolve()
             expected_name = f"export_{job_id}.json"
             if (
                 expected_dir.parent != consent_root
                 or resolved_export.parent != expected_dir
                 or resolved_export.name != expected_name
-                or not resolved_export.is_file()
+                or not desktop_vault.exists(resolved_export)
             ):
                 raise HTTPException(status_code=404, detail="Export not available")
+            if desktop_vault.is_initialized() and desktop_vault.encrypted_path(resolved_export).is_file():
+                if resolved_export.exists() or resolved_export.is_symlink() or desktop_vault.encrypted_path(resolved_export).is_symlink():
+                    raise desktop_vault.DesktopVaultError("Consent export copies require review")
+                return Response(
+                    content=desktop_vault.read_bytes(resolved_export),
+                    media_type="application/json",
+                    headers={"Content-Disposition": f'attachment; filename="{expected_name}"', "Cache-Control": "no-store"},
+                )
             return FileResponse(
                 resolved_export,
                 filename=expected_name,
@@ -4407,7 +4791,34 @@ def get_job_status(job_id: str, request: Request, download: bool = False):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+class ConsentEncryptedDownloadSpec(BaseModel):
+    password: str
+
+
+@app.post("/jobs/{job_id}/encrypted-download")
+def encrypted_consent_job_download(job_id: str, spec: ConsentEncryptedDownloadSpec, request: Request):
+    if not remote_services.desktop_mode() or not desktop_vault.is_initialized():
+        raise HTTPException(status_code=404, detail="Encrypted downloads require the local desktop backend")
+    if len(spec.password) < 20 or len(spec.password.encode("utf-8")) > 1024:
+        raise HTTPException(status_code=400, detail="Use a passphrase of at least 20 characters")
+    download = get_job_status(job_id, request, download=True)
+    if isinstance(download, FileResponse):
+        content = Path(download.path).read_bytes()
+    else:
+        content = download.body
+    archive_buffer = io.BytesIO()
+    with pyzipper.AESZipFile(archive_buffer, "w", compression=pyzipper.ZIP_DEFLATED) as archive:
+        archive.setpassword(spec.password.encode("utf-8"))
+        archive.setencryption(pyzipper.WZ_AES, nbits=256)
+        archive.writestr("consents.json", content)
+    return Response(
+        content=archive_buffer.getvalue(), media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="falconbroom-consents.zip"', "Cache-Control": "no-store"},
+    )
+
+
 def _enqueue_consent_job(job_type: str, target_user_id: str, requester_user_id: str):
+    _require_desktop_consent_storage()
     if job_type not in {"export_consents", "delete_consents"}:
         raise ValueError("Unsupported consent job type")
     if not target_user_id or not requester_user_id:
@@ -4431,7 +4842,7 @@ def _enqueue_consent_job(job_type: str, target_user_id: str, requester_user_id: 
     task = celery_process_export_job if job_type == "export_consents" else celery_process_delete_job
     try:
         if _is_local_desktop_mode() and os.environ.get("FALCONBROOM_DESKTOP_SECRET"):
-            task(job_id)
+            task(job_id, coordinated=True)
         else:
             try:
                 task.delay(job_id)
@@ -4445,8 +4856,10 @@ def _enqueue_consent_job(job_type: str, target_user_id: str, requester_user_id: 
 @app.post("/consent")
 def record_consent(spec: ConsentSpec, request: Request):
     try:
+        _require_desktop_consent_storage()
         auth_user = _require_production_auth(request)
         CONSENT_DIR = Path("data") / "consents"
+        _consent_record_files(CONSENT_DIR)
         CONSENT_DIR.mkdir(parents=True, exist_ok=True)
         cid = f"consent_{uuid4().hex[:8]}"
         # prefer explicitly provided IP, otherwise infer from request headers
@@ -4461,11 +4874,13 @@ def record_consent(spec: ConsentSpec, request: Request):
             "timestamp": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'),
         }
         dest = CONSENT_DIR / f"{cid}.json"
-        dest.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        _write_record(dest, payload)
         # audit
         try:
             _consent_audit("record_consent", {"id": cid, "user_id": payload["user_id"], "ip": ip, "user_agent": ua})
         except Exception:
+            if _is_local_desktop_mode() and desktop_vault.is_desktop_enabled():
+                raise
             pass
         return {"ok": True, "id": cid}
     except HTTPException:
@@ -4477,20 +4892,21 @@ def record_consent(spec: ConsentSpec, request: Request):
 @app.get("/consent")
 def get_consents(request: Request, user_id: Optional[str] = None):
     try:
+        _require_desktop_consent_storage()
         auth_user = _require_production_auth(request)
         if auth_user:
             user_id = auth_user.get("id")
         CONSENT_DIR = Path("data") / "consents"
         out = []
-        if not CONSENT_DIR.exists():
-            return {"consents": []}
-        for p in sorted(CONSENT_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+        for p in sorted(_consent_record_files(CONSENT_DIR), key=_record_mtime, reverse=True):
             try:
-                data = json.loads(p.read_text(encoding="utf-8"))
+                data = _read_consent_record(p)
                 if data.get("user_id") != user_id:
                     continue
                 out.append(data)
             except Exception:
+                if desktop_vault.is_initialized():
+                    raise
                 continue
         return {"consents": out}
     except HTTPException:
@@ -4505,25 +4921,28 @@ def export_consents(request: Request, user_id: Optional[str] = None):
     only exports receipts for that user, otherwise exports all receipts.
     """
     try:
+        _require_desktop_consent_storage()
         auth_user = _require_production_auth(request)
         if auth_user:
             user_id = auth_user.get("id")
         CONSENT_DIR = Path("data") / "consents"
         out = []
-        if not CONSENT_DIR.exists():
+        if not _consent_record_files(CONSENT_DIR):
             return {"consents": []}
         # if exporting consents for a specific user, ensure they have not opted out
         if user_id and _is_opted_out(user_id=user_id):
             _consent_audit("blocked_export_opt_out", {"user_id": user_id})
             raise HTTPException(status_code=403, detail="Target user has opted out of exports")
 
-        for p in sorted(CONSENT_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
+        for p in sorted(_consent_record_files(CONSENT_DIR), key=_record_mtime, reverse=True):
             try:
-                data = json.loads(p.read_text(encoding="utf-8"))
+                data = _read_consent_record(p)
                 if user_id and data.get("user_id") != user_id:
                     continue
                 out.append(data)
             except Exception:
+                if desktop_vault.is_initialized():
+                    raise
                 continue
         # return as inline JSON; clients can save the response
         return {"consents": out}
@@ -4539,16 +4958,15 @@ def delete_consent(consent_id: str, request: Request):
         try:
             auth_user = _require_production_auth(request)
             CONSENT_DIR = Path("data") / "consents"
+            _require_desktop_consent_storage()
+            _consent_record_files(CONSENT_DIR)
             p = CONSENT_DIR / f"{consent_id}.json"
-            if not p.exists():
+            if p.parent.resolve() != CONSENT_DIR.resolve() or not desktop_vault.exists(p):
                 raise HTTPException(status_code=404, detail="Consent receipt not found")
-            try:
-                data = json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                data = None
+            data = _read_consent_record(p)
             if auth_user and data and data.get("user_id") != auth_user.get("id"):
                 raise HTTPException(status_code=403, detail="Cannot delete another user's consent record")
-            p.unlink()
+            _delete_record(p)
             _consent_audit("delete_consent", {"id": consent_id, "user_id": data.get("user_id") if data else None})
             return {"deleted": consent_id}
         except HTTPException:
@@ -4563,22 +4981,23 @@ def delete_consents_by_user(request: Request, user_id: Optional[str] = None):
         returns 400. This endpoint can be used to withdraw consent and erase records.
         """
         try:
+            _require_desktop_consent_storage()
             auth_user = _require_production_auth(request)
             if auth_user:
                 user_id = auth_user.get("id")
             elif not user_id:
                 raise HTTPException(status_code=400, detail="Missing user_id")
             CONSENT_DIR = Path("data") / "consents"
-            if not CONSENT_DIR.exists():
-                return {"deleted": []}
             deleted = []
-            for p in list(CONSENT_DIR.glob("*.json")):
+            for p in _consent_record_files(CONSENT_DIR):
                 try:
-                    data = json.loads(p.read_text(encoding="utf-8"))
+                    data = _read_consent_record(p)
                     if data.get("user_id") == user_id:
                         deleted.append(data.get("id") or p.stem)
-                        p.unlink()
+                        _delete_record(p)
                 except Exception:
+                    if desktop_vault.is_initialized():
+                        raise
                     continue
             return {"deleted": deleted}
         except HTTPException:
@@ -4588,40 +5007,57 @@ def delete_consents_by_user(request: Request, user_id: Optional[str] = None):
 
 
 def _write_job(job: dict):
+    _require_desktop_consent_storage()
     jid = job.get("id") or f"job_{uuid4().hex[:8]}"
     job["id"] = jid
     job_file = _job_file_path(jid)
-    job_file.write_text(json.dumps(job, indent=2, ensure_ascii=False), encoding="utf-8")
+    if desktop_vault.is_initialized() and (
+        job_file.is_symlink() or desktop_vault.encrypted_path(job_file).is_symlink()
+        or (job_file.exists() and desktop_vault.encrypted_path(job_file).exists())
+    ):
+        raise desktop_vault.DesktopVaultError("Consent job copies require review")
+    _write_record(job_file, job)
     return jid
 
 
 def _job_file_path(job_id: str):
     if not isinstance(job_id, str) or not re.fullmatch(r"job_[0-9a-f]{8}", job_id):
         raise ValueError("Invalid job ID")
+    if desktop_vault.is_initialized() and JOBS_DIR.is_symlink():
+        raise desktop_vault.DesktopVaultError("Consent job storage is redirected")
     jobs_root = JOBS_DIR.resolve()
-    job_file = (jobs_root / f"{job_id}.json").resolve()
-    if job_file.parent != jobs_root:
-        raise ValueError("Invalid job path")
-    return job_file
+    return jobs_root / f"{job_id}.json"
+
+
+def _read_job(path: Path):
+    _require_desktop_consent_storage()
+    return _read_consent_record(path)
+
+
+def _job_files():
+    return [path for path in _consent_record_files(JOBS_DIR) if path.match("job_*.json")]
 
 
 def _update_job_status(jid: str, status: str, result: Optional[dict] = None):
     job_file = _job_file_path(jid)
     try:
-        job = json.loads(job_file.read_text(encoding="utf-8"))
+        job = _read_job(job_file)
     except Exception:
+        if desktop_vault.is_initialized() or (_is_local_desktop_mode() and desktop_vault.is_desktop_enabled()):
+            raise
         job = {"id": jid}
     job["status"] = status
     if result is not None:
         job["result"] = result
     job["updated_at"] = datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
-    job_file.write_text(json.dumps(job, indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_record(job_file, job)
 
 
 def _process_export_job(job: dict):
     jid = job.get("id")
     user_id = job.get("user_id")
     try:
+        _require_desktop_consent_storage()
         if not user_id:
             return {"error": "missing_target_user"}
         # If the job targets an opted-out user, abort and audit
@@ -4632,15 +5068,18 @@ def _process_export_job(job: dict):
         # gather consents matching user_id (or all)
         CONSENT_DIR = Path("data") / "consents"
         out = []
-        if CONSENT_DIR.exists():
-            for p in sorted(CONSENT_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
-                try:
-                    data = json.loads(p.read_text(encoding="utf-8"))
-                    if user_id and data.get("user_id") != user_id:
-                        continue
-                    out.append(data)
-                except Exception:
+        for p in sorted(_consent_record_files(CONSENT_DIR), key=_record_mtime, reverse=True):
+            try:
+                data = _read_consent_record(p)
+                if user_id and data.get("user_id") != user_id:
                     continue
+                out.append(data)
+            except Exception:
+                if desktop_vault.is_initialized():
+                    raise
+                continue
+        if desktop_vault.is_initialized() and (CONSENT_DIR.is_symlink() or (CONSENT_DIR / "exports").is_symlink()):
+            raise desktop_vault.DesktopVaultError("Consent export storage is redirected")
         consent_root = CONSENT_DIR.resolve()
         export_dir = consent_root / "exports"
         export_dir.mkdir(parents=True, exist_ok=True)
@@ -4648,7 +5087,7 @@ def _process_export_job(job: dict):
         if export_dir.parent != consent_root:
             raise ValueError("Invalid consent export directory")
         export_path = export_dir / f"export_{jid}.json"
-        export_path.write_text(json.dumps({"consents": out}, indent=2, ensure_ascii=False), encoding="utf-8")
+        _write_record(export_path, {"consents": out})
         _consent_audit("export_consents", {"job_id": jid, "user_id": user_id, "export_path": str(export_path)})
         return {"export_path": str(export_path), "count": len(out)}
     except Exception as e:
@@ -4659,17 +5098,18 @@ def _process_delete_job(job: dict):
     jid = job.get("id")
     user_id = job.get("user_id")
     try:
+        _require_desktop_consent_storage()
         deleted = []
         CONSENT_DIR = Path("data") / "consents"
-        if not CONSENT_DIR.exists():
-            return {"deleted": deleted}
-        for p in list(CONSENT_DIR.glob("*.json")):
+        for p in _consent_record_files(CONSENT_DIR):
             try:
-                data = json.loads(p.read_text(encoding="utf-8"))
+                data = _read_consent_record(p)
                 if data.get("user_id") == user_id:
                     deleted.append(data.get("id") or p.stem)
-                    p.unlink()
+                    _delete_record(p)
             except Exception:
+                if desktop_vault.is_initialized():
+                    raise
                 continue
         _consent_audit("delete_consents", {"job_id": jid, "user_id": user_id, "deleted": deleted})
         return {"deleted": deleted}
@@ -4677,29 +5117,33 @@ def _process_delete_job(job: dict):
         return {"error": str(e)}
 
 
+def _run_consent_job(jid: str, processor, coordinated: bool):
+    gate = (
+        desktop_startup_gate()
+        if os.name == "nt" and _is_local_desktop_mode() and desktop_vault.is_desktop_enabled() and not coordinated
+        else nullcontext()
+    )
+    with gate:
+        jf = _job_file_path(jid)
+        try:
+            job = _read_job(jf)
+        except Exception:
+            if desktop_vault.is_initialized() or (_is_local_desktop_mode() and desktop_vault.is_desktop_enabled()):
+                raise
+            job = {"id": jid}
+        _update_job_status(jid, "processing")
+        res = processor(job)
+        _update_job_status(jid, "completed" if not res.get('error') else 'failed', res)
+
+
 @celery_app.task(name='fbroom.process_export_job')
-def celery_process_export_job(jid: str):
-    # load job file
-    jf = _job_file_path(jid)
-    try:
-        job = json.loads(jf.read_text(encoding="utf-8"))
-    except Exception:
-        job = {"id": jid}
-    _update_job_status(jid, "processing")
-    res = _process_export_job(job)
-    _update_job_status(jid, "completed" if not res.get('error') else 'failed', res)
+def celery_process_export_job(jid: str, coordinated: bool = False):
+    _run_consent_job(jid, _process_export_job, coordinated)
 
 
 @celery_app.task(name='fbroom.process_delete_job')
-def celery_process_delete_job(jid: str):
-    jf = _job_file_path(jid)
-    try:
-        job = json.loads(jf.read_text(encoding="utf-8"))
-    except Exception:
-        job = {"id": jid}
-    _update_job_status(jid, "processing")
-    res = _process_delete_job(job)
-    _update_job_status(jid, "completed" if not res.get('error') else 'failed', res)
+def celery_process_delete_job(jid: str, coordinated: bool = False):
+    _run_consent_job(jid, _process_delete_job, coordinated)
 
 
 # --- Simple user account and Utah-style privacy request flow ---
@@ -4722,6 +5166,8 @@ class UserLogin(BaseModel):
 class DeleteAccountRequest(BaseModel):
     password: str
     confirm_text: str
+    test_anon_key: Optional[str] = None
+    test_user_id: Optional[str] = None
 
 
 def _users_dir():
@@ -5171,14 +5617,15 @@ def _send_email_message(to_email: str, subject: str, body: str):
             pass
         return False
     import smtplib
-    with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as s:
-        try:
-            s.starttls()
-        except Exception:
-            pass
-        if smtp_user and smtp_pass:
-            s.login(smtp_user, smtp_pass)
-        s.send_message(msg)
+    with remote_services.network_access("smtp"):
+        with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as s:
+            try:
+                s.starttls()
+            except Exception:
+                pass
+            if smtp_user and smtp_pass:
+                s.login(smtp_user, smtp_pass)
+            s.send_message(msg)
     return True
 
 
@@ -5910,6 +6357,433 @@ def protect_desktop_inspections(payload: dict, request: Request):
     return {"ok": True, "migrated": migrated}
 
 
+@app.post("/desktop/protect-consents")
+def protect_desktop_consents(payload: dict, request: Request):
+    if not _is_local_desktop_mode() or not desktop_vault.is_desktop_enabled() or not desktop_vault.is_initialized():
+        raise HTTPException(status_code=403, detail="Only available with the local desktop vault")
+    if payload.get("confirm_text") != "PROTECT CONSENTS":
+        raise HTTPException(status_code=400, detail="Confirmation text mismatch")
+    root = Path("data") / "consents"
+    try:
+        if root.is_symlink() or root.resolve().parent != Path("data").resolve():
+            raise desktop_vault.DesktopVaultError("Consent storage is redirected")
+        count = 0
+        if root.exists():
+            for path in sorted(root.glob("consent_*.json")):
+                if path.is_symlink() or not path.is_file():
+                    raise desktop_vault.DesktopVaultError("Consent record is redirected")
+                record = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(record, dict) or record.get("id") != path.stem or not isinstance(record.get("consents"), dict):
+                    raise ValueError("Invalid consent record")
+                if not desktop_vault.encrypted_path(path).exists():
+                    desktop_vault.seal_file(path, remove_source=False)
+                desktop_vault.migrate_plaintext_file(path)
+                count += 1
+        return {"ok": True, "migrated": count}
+    except (OSError, ValueError, RuntimeError) as error:
+        logger.exception("Consent migration failed")
+        raise HTTPException(status_code=500, detail="Consent migration incomplete; check your backup and retry") from error
+
+
+@app.post("/desktop/protect-consent-jobs")
+def protect_desktop_consent_jobs(payload: dict, request: Request):
+    if not _is_local_desktop_mode() or not desktop_vault.is_desktop_enabled() or not desktop_vault.is_initialized():
+        raise HTTPException(status_code=403, detail="Only available with the local desktop vault")
+    if payload.get("confirm_text") != "PROTECT CONSENT JOBS":
+        raise HTTPException(status_code=400, detail="Confirmation text mismatch")
+    try:
+        if JOBS_DIR.is_symlink() or JOBS_DIR.resolve().parent != Path("data").resolve():
+            raise desktop_vault.DesktopVaultError("Consent job storage is redirected")
+        count = 0
+        for path in sorted(JOBS_DIR.glob("job_*.json")):
+            if path.is_symlink() or not path.is_file() or not re.fullmatch(r"job_[0-9a-f]{8}\.json", path.name):
+                raise ValueError("Consent job requires review")
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(record, dict) or record.get("id") != path.stem or record.get("type") not in {"export_consents", "delete_consents"}:
+                raise ValueError("Consent job requires review")
+            if not desktop_vault.encrypted_path(path).exists():
+                desktop_vault.seal_file(path, remove_source=False)
+            desktop_vault.migrate_plaintext_file(path)
+            count += 1
+        return {"ok": True, "migrated": count}
+    except (OSError, ValueError, RuntimeError) as error:
+        logger.exception("Consent job migration failed")
+        raise HTTPException(status_code=500, detail="Consent job migration incomplete; check your backup and retry") from error
+
+
+@app.post("/desktop/protect-audit")
+def protect_desktop_audit(payload: dict, request: Request):
+    if not _is_local_desktop_mode() or not desktop_vault.is_desktop_enabled() or not desktop_vault.is_initialized():
+        raise HTTPException(status_code=403, detail="Only available with the local desktop vault")
+    if payload.get("confirm_text") != "PROTECT AUDIT":
+        raise HTTPException(status_code=400, detail="Confirmation text mismatch")
+    try:
+        root = Path("data")
+        files = []
+        for directory in root.iterdir():
+            if directory.is_symlink():
+                raise desktop_vault.DesktopVaultError("Audit directory is redirected")
+            if directory.is_dir():
+                for name in ("audit.log", "audit.prev"):
+                    path = directory / name
+                    if path.exists() or path.is_symlink():
+                        files.append(path)
+        if PRIVACY_DIR.is_symlink():
+            raise desktop_vault.DesktopVaultError("Privacy directory is redirected")
+        for path in [PRIVACY_DIR / "privacy_records.json", *PRIVACY_DIR.glob("rec_*.json")]:
+            if path.exists() or path.is_symlink():
+                files.append(path)
+        for path in sorted(files):
+            if path.is_symlink() or not path.is_file():
+                raise desktop_vault.DesktopVaultError("Legacy audit file is redirected")
+            if path.suffix == ".json":
+                json.loads(path.read_text(encoding="utf-8"))
+            if not desktop_vault.encrypted_path(path).exists():
+                desktop_vault.seal_file(path, remove_source=False)
+            desktop_vault.migrate_plaintext_file(path)
+        return {"ok": True, "migrated": len(files)}
+    except (OSError, ValueError, RuntimeError) as error:
+        logger.exception("Legacy audit migration failed")
+        raise HTTPException(status_code=500, detail="Audit migration incomplete; check your backup and retry") from error
+
+
+def _check_desktop_deletion_ownership():
+    def owner_known(record):
+        return (
+            isinstance(record, dict)
+            and isinstance(record.get("owner"), dict)
+            and isinstance(record["owner"].get("user_id"), str)
+            and bool(record["owner"]["user_id"].strip())
+        )
+
+    def checked_files(root, recursive):
+        if not root.exists():
+            return []
+        if root.is_symlink():
+            raise RuntimeError("Workspace ownership requires review")
+        paths = root.rglob("*")
+        result = []
+        seen = set()
+        for path in paths:
+            if path.is_symlink():
+                raise RuntimeError("Workspace ownership requires review")
+            if not path.is_file():
+                continue
+            if not recursive and path.parent != root:
+                if root == HISTORY_DIR and path.is_relative_to(HISTORY_DIR / "snapshots"):
+                    continue
+                raise RuntimeError("Workspace ownership requires review")
+            logical = desktop_vault.logical_path(path)
+            if logical in seen:
+                raise RuntimeError("Workspace ownership requires review")
+            seen.add(logical)
+            result.append(logical)
+        return result
+
+    try:
+        for root in (UPLOAD_DIR, OUTPUTS_DIR, HISTORY_DIR / "snapshots"):
+            paths = checked_files(root, recursive=root != UPLOAD_DIR)
+            for path in paths:
+                if path.name.endswith(".meta.json"):
+                    continue
+                metadata = json.loads(desktop_vault.read_text(path.with_name(path.name + ".meta.json")))
+                if not owner_known(metadata):
+                    raise RuntimeError("Workspace ownership requires review")
+            for path in paths:
+                if path.name.endswith(".meta.json") and not owner_known(json.loads(desktop_vault.read_text(path))):
+                    raise RuntimeError("Workspace ownership requires review")
+        for root in (RECIPES_DIR, HISTORY_DIR, INSPECTIONS_DIR):
+            for path in checked_files(root, recursive=False):
+                if not path.name.endswith(".json"):
+                    raise RuntimeError("Workspace ownership requires review")
+                record = read_inspection(path) if root == INSPECTIONS_DIR else _read_record(path)
+                if not owner_known(record):
+                    raise RuntimeError("Workspace ownership requires review")
+                if root == HISTORY_DIR and record.get("type") == "join":
+                    for field in ("left_path", "right_path"):
+                        source = record.get(field)
+                        if not isinstance(source, str) or not source:
+                            raise RuntimeError("Join source ownership requires review")
+                        try:
+                            _require_owned_file(source, {"id": record["owner"]["user_id"]})
+                        except HTTPException as error:
+                            raise RuntimeError("Join source ownership requires review") from error
+    except (OSError, ValueError, TypeError, desktop_vault.DesktopVaultError) as error:
+        raise RuntimeError("Workspace ownership requires review") from error
+
+
+def _check_desktop_deletion_auxiliary_ownership(user_id: str):
+    def identified(value):
+        return isinstance(value, str) and bool(value.strip())
+
+    try:
+        sessions = _sessions_dir()
+        if sessions.is_symlink() or JOBS_DIR.is_symlink() or PRIVACY_DIR.is_symlink():
+            raise RuntimeError("Local account records require review")
+        for path in sessions.glob("session_*.json"):
+            if path.is_symlink():
+                raise RuntimeError("Local account records require review")
+            session = _read_session_file(path)
+            if not isinstance(session, dict) or not identified(session.get("user_id")):
+                raise RuntimeError("Local account records require review")
+        for path in _job_files():
+            if path.is_symlink():
+                raise RuntimeError("Local account records require review")
+            job = _read_job(path)
+            if not isinstance(job, dict) or job.get("type") not in {"export_consents", "delete_consents"}:
+                raise RuntimeError("Local account records require review")
+            target, requester = job.get("user_id"), job.get("requester_user_id")
+            if not identified(target) or not identified(requester):
+                raise RuntimeError("Local account records require review")
+            if user_id in (target, requester) and target != requester:
+                raise RuntimeError("Shared local account records require review")
+        optouts_path = PRIVACY_DIR / "opt_outs.json"
+        if optouts_path.is_symlink():
+            raise RuntimeError("Local account records require review")
+        if optouts_path.exists():
+            optouts = json.loads(optouts_path.read_text(encoding="utf-8"))
+            if not isinstance(optouts, list) or any(
+                not isinstance(item, dict)
+                or not (identified(item.get("user_id")) or identified(item.get("email")))
+                for item in optouts
+            ):
+                raise RuntimeError("Local account records require review")
+    except (OSError, ValueError, TypeError, desktop_vault.DesktopVaultError) as error:
+        raise RuntimeError("Local account records require review") from error
+
+
+_TEST_DELETION_URL = "https://zthtkoekvxplppxanwiu.supabase.co"
+_TEST_DELETION_MARKER = Path("data") / ".test-deletion-pending"
+_TEST_DELETION_READY = False
+
+
+def _require_test_deletion(public_key: Optional[str]):
+    if (
+        not _TEST_DELETION_READY
+        or os.name != "nt"
+        or not _is_local_desktop_mode()
+        or not os.environ.get("FALCONBROOM_DESKTOP_SECRET")
+        or os.environ.get("FALCONBROOM_TEST_ACCOUNT_DELETION") != "1"
+        or not desktop_vault.is_initialized()
+    ):
+        raise HTTPException(status_code=503, detail="Test account deletion is not enabled")
+    _validate_test_publishable_key(public_key)
+
+
+def _validate_test_publishable_key(public_key: Optional[str]) -> str:
+    if not isinstance(public_key, str) or not public_key or len(public_key) > 2048:
+        raise HTTPException(status_code=400, detail="Test project publishable key is required")
+    if not public_key.startswith("sb_publishable_"):
+        try:
+            claims = jwt.decode(public_key, options={"verify_signature": False})
+        except jwt.PyJWTError as error:
+            raise HTTPException(status_code=400, detail="A publishable key is required") from error
+        if claims.get("role") != "anon":
+            raise HTTPException(status_code=400, detail="A publishable key is required")
+    return public_key
+
+
+def _desktop_test_ownership_enabled():
+    return (
+        _is_local_desktop_mode()
+        and bool(os.environ.get("FALCONBROOM_DESKTOP_SECRET"))
+        and os.environ.get("FALCONBROOM_TEST_ACCOUNT_DELETION") == "1"
+        and desktop_vault.is_initialized()
+    )
+
+
+async def _desktop_test_verified_user(request: Request):
+    authorization = request.headers.get("authorization", "")
+    if not authorization:
+        return None
+    match = re.fullmatch(r"Bearer ([^\s]+)", authorization, re.IGNORECASE)
+    if not match:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    public_key = _validate_test_publishable_key(request.headers.get("X-FalconBroom-Test-Publishable-Key"))
+    identity = await _test_deletion_http("/auth/v1/user", public_key, match.group(1))
+    user_id = identity.get("id")
+    if not isinstance(user_id, str) or not _is_uuid(user_id):
+        raise HTTPException(status_code=401, detail="Invalid test account")
+    return {"id": str(UUID(user_id))}
+
+
+async def _test_deletion_http(path: str, public_key: str, token: Optional[str] = None, body=None):
+    headers = {"apikey": public_key}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+            if body is None:
+                response = await client.get(_TEST_DELETION_URL + path, headers=headers)
+            else:
+                response = await client.post(_TEST_DELETION_URL + path, headers=headers, json=body)
+    except httpx.HTTPError as error:
+        logger.warning("Test deletion service request failed: %s", type(error).__name__)
+        raise HTTPException(status_code=503, detail="Test deletion service is unavailable") from error
+    if response.status_code in (401, 403):
+        raise HTTPException(status_code=401, detail="Account authentication or re-verification failed")
+    if response.status_code != 200:
+        logger.warning("Test deletion service returned HTTP %s", response.status_code)
+        raise HTTPException(status_code=503, detail="Test deletion service is unavailable or requires review")
+    try:
+        result = response.json()
+    except ValueError as error:
+        raise HTTPException(status_code=503, detail="Invalid test deletion service response") from error
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=503, detail="Invalid test deletion service response")
+    return result
+
+
+def _test_deletion_record_path(user_id: str):
+    try:
+        canonical = str(UUID(user_id))
+    except (ValueError, TypeError, AttributeError) as error:
+        raise HTTPException(status_code=401, detail="Invalid test account") from error
+    return Path("data") / "test_account_deletions" / f"{canonical}.json"
+
+
+def _save_test_deletion_record(path: Path, record: dict):
+    if path.parent.is_symlink() or path.parent.resolve().parent != Path("data").resolve():
+        raise RuntimeError("Deletion recovery directory is redirected")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    desktop_vault.write_encrypted_bytes(path, json.dumps(record, ensure_ascii=False).encode("utf-8"))
+
+
+def _write_test_deletion_marker(user_id: str):
+    temp = _TEST_DELETION_MARKER.with_name(f".test-deletion-{uuid4().hex}.tmp")
+    try:
+        with temp.open("x", encoding="utf-8") as file:
+            file.write(user_id)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp, _TEST_DELETION_MARKER)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+async def _start_test_desktop_deletion(spec: DeleteAccountRequest, request: Request):
+    _require_test_deletion(spec.test_anon_key)
+    if spec.test_anon_key is None:
+        raise HTTPException(status_code=400, detail="Test project publishable key is required")
+    if spec.confirm_text.strip() != "DELETE MY ACCOUNT":
+        raise HTTPException(status_code=400, detail="Confirmation text mismatch")
+    authorization = request.headers.get("authorization", "")
+    match = re.fullmatch(r"Bearer ([^\s]+)", authorization, re.IGNORECASE)
+    if not match:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    token = match.group(1)
+    public_key = spec.test_anon_key
+    identity = await _test_deletion_http("/auth/v1/user", public_key, token)
+    user_id = identity.get("id")
+    email = identity.get("email")
+    if not isinstance(user_id, str) or not _is_uuid(user_id) or not isinstance(email, str) or not email:
+        raise HTTPException(status_code=401, detail="Invalid test account")
+    user_id = str(UUID(user_id))
+    if not isinstance(spec.test_user_id, str) or not _is_uuid(spec.test_user_id) or str(UUID(spec.test_user_id)) != user_id:
+        raise HTTPException(status_code=409, detail="Test account identity changed; sign in again")
+    if _TEST_DELETION_MARKER.is_symlink():
+        raise HTTPException(status_code=409, detail="Local deletion state requires review")
+    if _TEST_DELETION_MARKER.exists() and _TEST_DELETION_MARKER.read_text(encoding="utf-8") != user_id:
+        raise HTTPException(status_code=409, detail="Another desktop deletion is pending")
+    record_path = _test_deletion_record_path(user_id)
+    if desktop_vault.exists(record_path):
+        try:
+            record = json.loads(desktop_vault.read_text(record_path))
+            if record.get("user_id") != user_id or not re.fullmatch(r"[0-9a-f]{64}", record.get("recovery_token", "")):
+                raise ValueError("Invalid deletion recovery record")
+        except (OSError, ValueError, AttributeError, desktop_vault.DesktopVaultError) as error:
+            raise HTTPException(status_code=409, detail="Deletion recovery record requires review") from error
+    else:
+        record = {"user_id": user_id, "recovery_token": secrets.token_hex(32), "local_status": "pending"}
+        _save_test_deletion_record(record_path, record)
+
+    start = await _test_deletion_http("/functions/v1/delete-account", public_key, token, {
+        "action": "start", "password": spec.password, "confirm_text": "DELETE MY ACCOUNT",
+        "recovery_token": record["recovery_token"],
+    })
+    status = start.get("status")
+    if status in {"shared_data_review_required", "storage_review_required", "recovery_review_required"}:
+        return {"ok": False, "status": status, "local_status": record["local_status"]}
+    job_id = start.get("job_id")
+    if start.get("user_id") != user_id or not isinstance(job_id, str) or not _is_uuid(job_id):
+        raise HTTPException(status_code=503, detail="Invalid test deletion service response")
+    if status not in {"awaiting_local", "ready", "processing", "needs_review", "completed"}:
+        raise HTTPException(status_code=503, detail="Invalid test deletion service status")
+    record["job_id"] = str(UUID(job_id))
+    _save_test_deletion_record(record_path, record)
+    if status != "awaiting_local":
+        if record.get("local_status") != "completed":
+            raise HTTPException(status_code=409, detail="Local deletion state requires review")
+        return {"ok": True, "status": status, "local_status": "completed", "job_id": record["job_id"], "user_id": user_id}
+
+    if record.get("local_status") == "completed" and not _TEST_DELETION_MARKER.exists():
+        raise HTTPException(status_code=409, detail="Local deletion state requires review")
+    if record.get("local_status") != "completed":
+        try:
+            _check_desktop_deletion_ownership()
+            _check_desktop_deletion_auxiliary_ownership(user_id)
+        except RuntimeError as error:
+            logger.warning("Desktop deletion paused because ownership could not be verified")
+            return {"ok": False, "status": "local_review_required", "local_status": "pending", "job_id": record["job_id"]}
+        _write_test_deletion_marker(user_id)
+        try:
+            _delete_local_user_data(user_id, email)
+            (_users_dir() / f"{user_id}.json").unlink(missing_ok=True)
+            record["local_status"] = "completed"
+            _save_test_deletion_record(record_path, record)
+        except (OSError, ValueError, RuntimeError) as error:
+            logger.exception("Desktop test account cleanup failed")
+            raise HTTPException(status_code=503, detail="Local cleanup incomplete; retry deletion") from error
+    ack = await _test_deletion_http("/functions/v1/delete-account", public_key, token, {
+        "action": "local_complete", "password": spec.password, "confirm_text": "DELETE MY ACCOUNT",
+        "recovery_token": record["recovery_token"], "job_id": record["job_id"],
+    })
+    if ack.get("status") != "accepted" or ack.get("job_id") != record["job_id"]:
+        raise HTTPException(status_code=503, detail="Invalid test deletion acknowledgement")
+    return {"ok": True, "status": "ready", "local_status": "completed", "job_id": record["job_id"], "user_id": user_id}
+
+
+@app.post("/desktop/test-deletions")
+async def test_desktop_deletion_status(payload: dict):
+    public_key = payload.get("test_anon_key")
+    _require_test_deletion(public_key)
+    root = Path("data") / "test_account_deletions"
+    if root.is_symlink() or _TEST_DELETION_MARKER.is_symlink():
+        raise HTTPException(status_code=409, detail="Deletion recovery state requires review")
+    records = []
+    for path in desktop_vault.logical_files(root):
+        if not path.name.endswith(".json"):
+            continue
+        try:
+            record = json.loads(desktop_vault.read_text(path))
+            user_id = str(UUID(record["user_id"]))
+            token = record["recovery_token"]
+            job_id = record.get("job_id")
+            if path != _test_deletion_record_path(user_id) or not re.fullmatch(r"[0-9a-f]{64}", token):
+                raise ValueError("Invalid deletion recovery record")
+            if not job_id:
+                records.append({"user_id": user_id, "status": "start_unconfirmed", "local_status": record.get("local_status")})
+                continue
+            if not isinstance(job_id, str) or not _is_uuid(job_id):
+                raise ValueError("Invalid deletion job")
+        except (OSError, ValueError, KeyError, TypeError, desktop_vault.DesktopVaultError) as error:
+            logger.exception("Unable to read desktop deletion recovery record")
+            raise HTTPException(status_code=409, detail="Deletion recovery state requires review") from error
+        result = await _test_deletion_http("/functions/v1/delete-account", public_key, body={
+            "action": "status", "recovery_token": token, "job_id": job_id,
+        })
+        status = result.get("status")
+        if result.get("job_id") != job_id or status not in {
+            "awaiting_local", "ready", "processing", "needs_review", "completed",
+        }:
+            raise HTTPException(status_code=503, detail="Invalid test deletion status response")
+        if status == "completed" and record.get("local_status") == "completed" and _TEST_DELETION_MARKER.exists():
+            if _TEST_DELETION_MARKER.read_text(encoding="utf-8") == user_id:
+                _TEST_DELETION_MARKER.unlink()
+        records.append({"job_id": job_id, "user_id": user_id, "status": status, "local_status": record.get("local_status")})
+    return {"deletions": records, "local_pending": _TEST_DELETION_MARKER.exists()}
+
+
 def _delete_local_user_data(user_id: str, user_email: Optional[str] = None):
     failures = []
 
@@ -5997,14 +6871,19 @@ def _delete_local_user_data(user_id: str, user_email: Optional[str] = None):
                 remove(metadata_path, root)
 
     consent_dir = Path("data") / "consents"
-    if consent_dir.exists():
-        for path in consent_dir.glob("consent_*.json"):
-            record = read_record(path)
-            if isinstance(record, dict) and record.get("user_id") == user_id:
-                remove(path, consent_dir)
-
-    for path in JOBS_DIR.glob("job_*.json"):
+    for path in _consent_record_files(consent_dir):
+        if not path.match("consent_*.json"):
+            continue
         record = read_record(path)
+        if isinstance(record, dict) and record.get("user_id") == user_id:
+            remove(path, consent_dir)
+
+    for path in _job_files():
+        try:
+            record = _read_job(path)
+        except (OSError, ValueError, RuntimeError) as error:
+            failures.append(f"{path.name}: unreadable job ({error.__class__.__name__})")
+            continue
         if not isinstance(record, dict) or record.get("type") not in {
             "export_consents",
             "delete_consents",
@@ -6014,6 +6893,17 @@ def _delete_local_user_data(user_id: str, user_email: Optional[str] = None):
             continue
         export_path = (record.get("result") or {}).get("export_path")
         if isinstance(export_path, str) and export_path:
+            if desktop_vault.is_initialized() and (
+                desktop_vault.exists(Path(export_path)) or Path(export_path).is_symlink()
+                or desktop_vault.encrypted_path(Path(export_path)).is_symlink()
+            ):
+                try:
+                    if Path(export_path).resolve().parent != (consent_dir / "exports").resolve():
+                        raise ValueError("Invalid consent export path")
+                    _read_consent_record(Path(export_path))
+                except (OSError, ValueError, RuntimeError) as error:
+                    failures.append(f"{Path(export_path).name}: unreadable consent export ({error.__class__.__name__})")
+                    continue
             if not remove(Path(export_path), consent_dir / "exports"):
                 continue
         remove(path, JOBS_DIR)
@@ -6314,8 +7204,9 @@ async def _process_propagation_file(path: Path):
                 try:
                     # example: delete spreadsheet file by id from Drive
                     creds = Credentials.from_service_account_file(creds_json, scopes=["https://www.googleapis.com/auth/drive"])
-                    drive = build('drive', 'v3', credentials=creds)
-                    drive.files().delete(fileId=sid).execute()
+                    with remote_services.network_access("google_drive"):
+                        drive = build('drive', 'v3', credentials=creds)
+                        drive.files().delete(fileId=sid).execute()
                     results['actions'].append({'service': 'google_sheets', 'id': sid, 'status': 'deleted'})
                 except Exception as e:
                     results['actions'].append({'service': 'google_sheets', 'id': sid, 'status': 'error', 'error': str(e)})
@@ -6329,8 +7220,9 @@ async def _process_propagation_file(path: Path):
                     continue
                 try:
                     creds = Credentials.from_service_account_file(creds_json, scopes=["https://www.googleapis.com/auth/drive"])
-                    drive = build('drive', 'v3', credentials=creds)
-                    drive.files().delete(fileId=did).execute()
+                    with remote_services.network_access("google_drive"):
+                        drive = build('drive', 'v3', credentials=creds)
+                        drive.files().delete(fileId=did).execute()
                     results['actions'].append({'service': 'google_drive', 'id': did, 'status': 'deleted'})
                 except Exception as e:
                     results['actions'].append({'service': 'google_drive', 'id': did, 'status': 'error', 'error': str(e)})
@@ -6420,6 +7312,31 @@ async def _startup_event():
 
 def _collect_audit_logs():
     """Collect all audit.log JSON-lines from data subdirectories into a list of records."""
+    if _is_local_desktop_mode() and desktop_vault.is_desktop_enabled():
+        _require_desktop_consent_storage()
+        out = [
+            {"source": entry["source"], "record": entry, "integrity": "verified-desktop-chain"}
+            for entry in desktop_audit.read_all()
+        ]
+        root = Path("data")
+        if root.exists():
+            for sub in root.iterdir():
+                if sub.is_symlink():
+                    raise desktop_vault.DesktopVaultError("Audit directory is redirected")
+                if not sub.is_dir():
+                    continue
+                audit_file = sub / "audit.log"
+                encrypted = desktop_vault.encrypted_path(audit_file)
+                if audit_file.is_symlink() or encrypted.is_symlink() or (audit_file.exists() and encrypted.exists()):
+                    raise desktop_vault.DesktopVaultError("Legacy audit copies require review")
+                if desktop_vault.exists(audit_file):
+                    for line in desktop_vault.read_text(audit_file).splitlines():
+                        try:
+                            record = json.loads(line)
+                            out.append({"source": str(audit_file), "record": record, "integrity": "legacy-unverified"})
+                        except ValueError:
+                            out.append({"source": str(audit_file), "raw": line, "integrity": "legacy-unverified"})
+        return out
     out = []
     try:
         data_root = Path("data")
@@ -6468,14 +7385,15 @@ def _sync_urlopen_post(url: str, data: bytes, headers: dict = None, timeout: int
     if headers:
         for k, v in (headers.items() if isinstance(headers, dict) else []):
             req.add_header(k, v)
-    with urlopen(req, timeout=timeout) as resp:
-        status = getattr(resp, 'status', None)
-        if status is None:
-            try:
-                status = resp.getcode()
-            except Exception:
-                status = 200
-        return status
+    with remote_services.network_access("audit_export"):
+        with urlopen(req, timeout=timeout) as resp:
+            status = getattr(resp, 'status', None)
+            if status is None:
+                try:
+                    status = resp.getcode()
+                except Exception:
+                    status = 200
+            return status
 
 
 def _validate_essential_config():
@@ -6537,7 +7455,7 @@ def _ensure_consents():
     """
     try:
         cons = Path('data') / 'consents'
-        if not cons.exists() or not any(cons.glob('consent_*.json')):
+        if not any(path.match('consent_*.json') for path in _consent_record_files(cons)):
             if os.environ.get('ENV') == 'production':
                 raise Exception('No consent templates found in data/consents for production')
             else:
@@ -6652,9 +7570,11 @@ async def _audit_export_worker():
     while True:
         try:
             # Offload blocking export work to a thread so the event loop is not blocked
-            await asyncio.to_thread(_export_audit_once)
+            result = await asyncio.to_thread(_export_audit_once)
+            if result.get("error"):
+                logger.error("Audit export failed: %s", result["error"])
         except Exception:
-            pass
+            logger.exception("Audit export worker failed")
         await asyncio.sleep(interval)
 
 
@@ -7405,8 +8325,18 @@ async def ws_shared(websocket: WebSocket):
 
 
 @app.get("/me")
-def me(request: Request):
+async def me(request: Request):
     try:
+        if os.environ.get("FALCONBROOM_DESKTOP_SECRET") and _TEST_DELETION_MARKER.exists():
+            _require_test_deletion(request.headers.get("X-FalconBroom-Test-Publishable-Key"))
+            if _TEST_DELETION_MARKER.is_symlink():
+                raise HTTPException(status_code=409, detail="Local deletion state requires review")
+            user = await _desktop_test_verified_user(request)
+            if not user:
+                raise HTTPException(status_code=401, detail="Authentication required")
+            if _TEST_DELETION_MARKER.read_text(encoding="utf-8") != user["id"]:
+                raise HTTPException(status_code=409, detail="Another desktop deletion is pending")
+            return {"id": user["id"], "username": user["id"]}
         user = _require_auth(request)
         # don't expose password data
         safe = {k: v for k, v in user.items() if k not in ("pw_hash", "pw_salt")}
@@ -8071,6 +9001,10 @@ def account_export(request: Request):
 @app.post("/account/delete")
 async def account_delete(spec: DeleteAccountRequest, request: Request):
     try:
+        if os.environ.get("FALCONBROOM_DESKTOP_SECRET") and spec.test_anon_key:
+            return await _start_test_desktop_deletion(spec, request)
+        if os.environ.get("FALCONBROOM_DESKTOP_SECRET") and _TEST_DELETION_MARKER.exists():
+            raise HTTPException(status_code=423, detail="A test account deletion is pending")
         user = _require_auth(request)
         if spec.confirm_text.strip() != "DELETE MY ACCOUNT":
             raise HTTPException(status_code=400, detail="Confirmation text mismatch; type exactly: DELETE MY ACCOUNT")

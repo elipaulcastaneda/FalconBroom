@@ -72,18 +72,19 @@ def main(argv=None):
     from fbroom.desktop_request_gate import desktop_startup_gate
     from fbroom import main as fb
 
-    if local_backend:
+    if local_backend and os.environ.get("FALCONBROOM_CONTROL_ONLY") != "1":
         with desktop_startup_gate():
             desktop_vault.initialize(os.path.join(os.getcwd(), "data"))
-            desktop_vault.cleanup_abandoned_scratch()
-            desktop_vault.migrate_plaintext_files(
-                (fb.UPLOAD_DIR, fb.OUTPUTS_DIR, fb.RECIPES_DIR, fb.HISTORY_DIR)
-            )
-            legacy_output = Path.cwd() / "output_from_text.csv"
-            if legacy_output.is_file() or legacy_output.is_symlink():
-                desktop_vault.migrate_plaintext_file(
-                    legacy_output, fb.OUTPUTS_DIR / "output_from_text_legacy.csv"
+            if not (Path("data") / ".test-deletion-pending").exists():
+                desktop_vault.cleanup_abandoned_scratch()
+                desktop_vault.migrate_plaintext_files(
+                    (fb.UPLOAD_DIR, fb.OUTPUTS_DIR, fb.RECIPES_DIR, fb.HISTORY_DIR)
                 )
+                legacy_output = Path.cwd() / "output_from_text.csv"
+                if legacy_output.is_file() or legacy_output.is_symlink():
+                    desktop_vault.migrate_plaintext_file(
+                        legacy_output, fb.OUTPUTS_DIR / "output_from_text_legacy.csv"
+                    )
 
     uvicorn.run(fb.app, host=args.host, port=args.port, log_level="warning", lifespan="off")
 

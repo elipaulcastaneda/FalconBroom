@@ -95,12 +95,18 @@ def test_desktop_supabase_deletion_fails_before_deleting_local_data(monkeypatch,
     assert not Path("data/account_deletions").exists()
 
 
-def test_real_sidecar_requires_session_secret(tmp_path):
+@pytest.mark.parametrize("control_only", [False, True])
+def test_real_sidecar_requires_session_secret(tmp_path, control_only):
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     env = os.environ.copy()
     env["FALCONBROOM_DESKTOP_SECRET"] = "b" * 64
+    env["FALCONBROOM_CONTROL_ONLY"] = "1" if control_only else "0"
+    if control_only:
+        original = tmp_path / "data" / "uploads" / "existing.csv"
+        original.parent.mkdir(parents=True)
+        original.write_text("column\nvalue\n", encoding="utf-8")
     process = subprocess.Popen(
         [sys.executable, "-m", "fbroom.sidecar", "--port", str(port), "--data-dir", str(tmp_path)],
         env=env,
@@ -123,6 +129,8 @@ def test_real_sidecar_requires_session_secret(tmp_path):
                 pytest.fail("Desktop sidecar did not become ready")
             assert response.status_code == 200
             assert client.get(url).status_code == 401
+            if control_only:
+                assert original.read_text(encoding="utf-8") == "column\nvalue\n"
     finally:
         process.terminate()
         process.wait(timeout=10)

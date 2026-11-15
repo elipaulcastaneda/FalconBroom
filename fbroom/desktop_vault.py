@@ -5,10 +5,10 @@ import contextvars
 import ctypes
 import hashlib
 import io
+import logging
 import os
 import shutil
 import struct
-import tempfile
 import threading
 import time
 import uuid
@@ -16,6 +16,8 @@ from pathlib import Path
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 _MAGIC = b"FBVAULT2"
 _KEY_MAGIC = b"FBKEY1\0"
@@ -29,6 +31,7 @@ _workspace: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
     "falconbroom_desktop_vault_workspace", default=None
 )
 _scratch_lock = threading.RLock()
+logger = logging.getLogger(__name__)
 
 
 class DesktopVaultError(RuntimeError):
@@ -107,7 +110,7 @@ def initialize(root: Path | str) -> None:
         if key_path.exists():
             key = _load_master_key(key_path)
         else:
-            if any(root.rglob("*.fbenc")):
+            if any(root.rglob("*.fbenc")) or (root / ".vault" / "audit.sqlite3").exists():
                 raise DesktopVaultError(
                     "Encrypted FalconBroom data exists but its protected key is missing"
                 )
@@ -143,11 +146,64 @@ def is_initialized() -> bool:
     return _root is not None and _master_key is not None
 
 
+def audit_keys() -> tuple[bytes, bytes, bytes]:
+    _, master_key = _require_initialized()
+    derived = HKDF(
+        algorithm=hashes.SHA256(), length=96, salt=None,
+        info=b"FalconBroom desktop audit v1",
+    ).derive(master_key)
+    return derived[:32], derived[32:64], derived[64:]
+
+
 def current_workspace() -> Path:
     workspace = _workspace.get()
     if workspace is None:
         raise DesktopVaultError("No desktop plaintext workspace is active")
     return workspace
+
+
+def _is_managed_output(path: Path) -> bool:
+    path = Path(path)
+    if not is_initialized():
+        return False
+    root, _ = _require_initialized()
+    absolute = Path(os.path.abspath(path))
+    managed_roots = [root / name for name in ("outputs", "uploads")]
+    managed = next((base for base in managed_roots if absolute.is_relative_to(base)), None)
+    if managed is None:
+        return False
+    if path.is_symlink() or encrypted_path(path).is_symlink():
+        raise DesktopVaultError("Refusing to write a redirected output")
+    if managed.is_symlink() or not path.resolve().is_relative_to(managed):
+        raise DesktopVaultError("Refusing to write outside managed output storage")
+    return True
+
+
+def stage_managed_output(path: Path) -> Path:
+    """Keep plaintext for managed outputs inside the request workspace."""
+    path = Path(path)
+    if not _is_managed_output(path):
+        return path
+    folder = current_workspace() / uuid.uuid4().hex
+    folder.mkdir()
+    return folder / path.name
+
+
+def publish_staged_output(staged: Path, destination: Path) -> None:
+    staged, destination = Path(staged), Path(destination)
+    if staged == destination:
+        return
+    seal_file(staged, destination)
+    destination.unlink(missing_ok=True)
+
+
+def copy_to_managed_output(source: Path, destination: Path) -> None:
+    source, destination = Path(source), Path(destination)
+    if not _is_managed_output(destination):
+        shutil.copyfile(source, destination)
+    else:
+        seal_file(source, destination, remove_source=False)
+        destination.unlink(missing_ok=True)
 
 
 def encrypted_path(path: Path) -> Path:
@@ -286,7 +342,7 @@ def _read_exact(file, count: int) -> bytes:
     return data
 
 
-def _decrypt_stream(file, output, master_key: bytes) -> None:
+def _iter_decrypted(file, master_key: bytes):
     header = _read_exact(file, _HEADER_SIZE)
     if not header.startswith(_MAGIC):
         if header.startswith(b"FBVAULT1"):
@@ -332,8 +388,36 @@ def _decrypt_stream(file, output, master_key: bytes) -> None:
             if file.read(1):
                 raise DesktopVaultError("Encrypted file has data after its end marker")
             return
-        output.write(plain)
+        yield plain
         chunk_index += 1
+
+
+def _decrypt_stream(file, output, master_key: bytes) -> None:
+    for chunk in _iter_decrypted(file, master_key):
+        output.write(chunk)
+
+
+def verified_download_snapshot(path: Path):
+    """Authenticate an encrypted snapshot before returning a streaming response."""
+    encrypted = encrypted_path(path)
+    root, key = _require_initialized()
+    if not encrypted.is_file() or encrypted.is_symlink() or not encrypted.resolve().is_relative_to(root):
+        raise DesktopVaultError("Invalid encrypted download source")
+    scratch, lock = create_scratch()
+    try:
+        snapshot = scratch / "download.fbenc"
+        shutil.copyfile(encrypted, snapshot)
+        stream = snapshot.open("rb")
+        try:
+            length = sum(len(chunk) for chunk in _iter_decrypted(stream, key))
+            stream.seek(0)
+        except BaseException:
+            stream.close()
+            raise
+        return stream, key, length, scratch, lock
+    except BaseException:
+        release_scratch(scratch, lock)
+        raise
 
 
 def seal_file(path: Path, destination: Path | None = None, remove_source: bool = True) -> Path:
@@ -384,6 +468,21 @@ def materialize_to(path: Path, destination: Path) -> Path:
     except ValueError as error:
         raise DesktopVaultError("Encrypted source is outside app data") from error
     return _decrypt_to(encrypted, Path(destination))
+
+
+def copy_plaintext_to(path: Path, output) -> None:
+    """Stream an asset to a caller-provided writer without a plaintext file."""
+    path = Path(path)
+    encrypted = encrypted_path(path)
+    if encrypted.is_file():
+        root, key = _require_initialized()
+        if not encrypted.resolve().is_relative_to(root):
+            raise DesktopVaultError("Encrypted source is outside app data")
+        with encrypted.open("rb") as source:
+            _decrypt_stream(source, output, key)
+    else:
+        with path.open("rb") as source:
+            shutil.copyfileobj(source, output, _CHUNK_SIZE)
 
 
 def materialize(path: Path) -> Path:
@@ -442,11 +541,65 @@ def _scratch_gate():
             msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
 
 
+def _create_private_scratch(temp_root: Path) -> Path:
+    from ctypes import wintypes
+
+    class SecurityAttributes(ctypes.Structure):
+        _fields_ = [
+            ("length", wintypes.DWORD),
+            ("descriptor", ctypes.c_void_p),
+            ("inherit_handle", wintypes.BOOL),
+        ]
+
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    kernel.CreateDirectoryW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(SecurityAttributes)]
+    kernel.CreateDirectoryW.restype = wintypes.BOOL
+    kernel.GetVolumePathNameW.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    kernel.GetVolumePathNameW.restype = wintypes.BOOL
+    kernel.GetVolumeInformationW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD), wintypes.LPWSTR, wintypes.DWORD,
+    ]
+    kernel.GetVolumeInformationW.restype = wintypes.BOOL
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+    volume = ctypes.create_unicode_buffer(32768)
+    flags = wintypes.DWORD()
+    if not kernel.GetVolumePathNameW(str(temp_root.resolve()), volume, len(volume)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not kernel.GetVolumeInformationW(volume.value, None, 0, None, None, ctypes.byref(flags), None, 0):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not flags.value & 0x00000008:
+        raise DesktopVaultError("Temporary storage does not support Windows access controls")
+    descriptor = ctypes.c_void_p()
+    if not advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)", 1, ctypes.byref(descriptor), None
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        attributes = SecurityAttributes(ctypes.sizeof(SecurityAttributes), descriptor, False)
+        for _ in range(10):
+            folder = temp_root / f"fb-v2-{uuid.uuid4().hex}"
+            if kernel.CreateDirectoryW(str(folder), ctypes.byref(attributes)):
+                return folder
+            error = ctypes.get_last_error()
+            if error != 183:
+                raise ctypes.WinError(error)
+        raise DesktopVaultError("Could not create a unique temporary workspace")
+    finally:
+        kernel.LocalFree(descriptor)
+
+
 def create_scratch():
     import msvcrt
 
     with _scratch_gate() as temp_root:
-        folder = Path(tempfile.mkdtemp(prefix="fb-v2-", dir=temp_root))
+        folder = _create_private_scratch(temp_root)
         try:
             lock_file = (folder / ".lock").open("x+b")
             try:
@@ -484,10 +637,19 @@ def _remove_scratch(folder: Path, lock_file) -> None:
 
 
 def release_scratch(folder: Path, lock_file) -> None:
-    with _scratch_gate() as temp_root:
-        if folder.parent != temp_root or not folder.name.startswith("fb-v2-") or folder.is_symlink():
-            raise DesktopVaultError("Invalid temporary workspace")
-        _remove_scratch(folder, lock_file)
+    try:
+        with _scratch_gate() as temp_root:
+            if folder.parent != temp_root or not folder.name.startswith("fb-v2-") or folder.is_symlink():
+                raise DesktopVaultError("Invalid temporary workspace")
+            _remove_scratch(folder, lock_file)
+    except (OSError, DesktopVaultError):
+        logger.exception("Could not remove a desktop temporary workspace; retry cleanup on startup")
+        if not lock_file.closed:
+            try:
+                lock_file.close()
+            except OSError:
+                logger.exception("Could not release the temporary workspace lock")
+        raise
 
 
 def cleanup_abandoned_scratch() -> int:

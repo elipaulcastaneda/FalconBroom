@@ -16,10 +16,12 @@ from fbroom.desktop_request_gate import DesktopRequestGate, _WindowsFileGate
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="Desktop request gate uses Windows file locks")
 
 
-def test_cleanup_waits_for_stream_and_new_requests_wait_for_cleanup(tmp_path, monkeypatch):
+@pytest.mark.parametrize("route", ["/account/delete", "/join-export", "/desktop/protect-consents", "/desktop/protect-consent-jobs", "/desktop/protect-audit"])
+def test_exclusive_operation_waits_for_stream_and_new_requests(tmp_path, monkeypatch, route):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("FALCONBROOM_DESKTOP_SECRET", "a" * 64)
     monkeypatch.setenv("FALCONBROOM_LOCAL_MODE", "1")
+    monkeypatch.setenv("FALCONBROOM_TEST_ACCOUNT_DELETION", "1")
     stream_started = threading.Event()
     stream_release = threading.Event()
     cleanup_started = threading.Event()
@@ -34,7 +36,7 @@ def test_cleanup_waits_for_stream_and_new_requests_wait_for_cleanup(tmp_path, mo
             await asyncio.to_thread(stream_release.wait)
             await send({"type": "http.response.body", "body": b"last"})
         else:
-            if scope["path"] == "/account/delete":
+            if scope["path"] == route:
                 cleanup_started.set()
                 await asyncio.to_thread(cleanup_release.wait)
             else:
@@ -47,7 +49,7 @@ def test_cleanup_waits_for_stream_and_new_requests_wait_for_cleanup(tmp_path, mo
         try:
             streaming = executor.submit(client.get, "/stream")
             assert stream_started.wait(3)
-            cleanup = executor.submit(client.post, "/account/delete")
+            cleanup = executor.submit(client.post, route)
             assert not cleanup_started.wait(0.3)
             stream_release.set()
             assert streaming.result(timeout=3).content == b"firstlast"

@@ -15,7 +15,7 @@ from typing import Any
 
 from .engine import _read_table
 from .standardize import _layouts_for, _split_zone
-from .desktop_workspace_encryption import secure_temp_directory
+from . import desktop_vault
 
 _QUOTED = re.compile(r"'([^']+)'")
 _EMAIL_RE = r"[^\s@]+@[^\s@]+\.[^\s@]+"
@@ -219,7 +219,8 @@ def _effect(col: str, values: list, steps: list[dict[str, Any]]) -> tuple[int, i
     if _cleaner is None:
         _cleaner = Cleaner()
     values = values[:_SIMULATE_ROWS]
-    with tempfile.TemporaryDirectory(dir=secure_temp_directory()) as folder:
+    scratch = str(desktop_vault.current_workspace()) if desktop_vault.is_initialized() else None
+    with tempfile.TemporaryDirectory(dir=scratch) as folder:
         path = os.path.join(folder, "column.csv")
         with open(path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)

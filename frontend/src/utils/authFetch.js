@@ -1,9 +1,12 @@
 import { BACKEND } from '../config'
-import supabase from '../supabaseClient'
+import supabase, { isDeletionTestEnabled, testDeletionPublishableKey } from '../supabaseClient'
 import tokenStore from '../tokenStore'
 
 export default async function authFetch(url, opts = {}) {
   if (!opts.headers) opts.headers = {}
+  if (isDeletionTestEnabled && (url === `${BACKEND}/inspect` || url === `${BACKEND}/upload` || url === `${BACKEND}/desktop/upload-stream` || url === `${BACKEND}/me`)) {
+    opts.headers['X-FalconBroom-Test-Publishable-Key'] = testDeletionPublishableKey
+  }
   // Ensure cookies are sent for server refresh flow
   if (!opts.credentials) opts.credentials = 'include'
 

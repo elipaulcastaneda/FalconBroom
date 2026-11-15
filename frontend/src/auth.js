@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import supabase from './supabaseClient'
+import supabase, { isDeletionTestProject } from './supabaseClient'
 import authFetch from './utils/authFetch'
 import { BACKEND } from './config'
 
@@ -12,6 +12,13 @@ export function useAccountUser(){
     try{
       const res = await authFetch(`${BACKEND}/me`, { method: 'GET' })
       if (!res.ok) {
+        if (isDeletionTestProject) {
+          const { data, error } = await supabase.auth.getUser()
+          if (!error && data.user) {
+            setAccountUser({ id: data.user.id, email: data.user.email, username: data.user.email, created_at: data.user.created_at })
+            return
+          }
+        }
         setAccountUser(null)
         setLoading(false)
         return

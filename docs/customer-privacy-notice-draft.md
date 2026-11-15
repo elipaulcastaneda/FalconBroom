@@ -1,6 +1,6 @@
 # FalconBroom Privacy Notice (Draft)
 
-Last updated: November 11, 2026
+Last updated: November 13, 2026
 
 This draft is provided for review and has not been finalized.
 
@@ -25,9 +25,10 @@ Windows, the installed app uses its operating-system application data
 directory. You choose where to save exported or downloaded files.
 
 If your app is configured to use a remote backend, files you upload are sent to
-that backend for processing and may be stored on its server. A remote backend
-configured with HTTP does not encrypt that connection. Check the backend URL
-and your organization's configuration before uploading files.
+that backend for processing and may be stored on its server. Versions with
+remote-service settings require HTTPS for a configured remote backend; older
+versions may permit unencrypted HTTP. Check the backend URL and your
+organization's configuration before uploading files.
 
 ### What information does FalconBroom collect?
 
@@ -63,10 +64,13 @@ Tell us the email address associated with your account and what you are
 requesting. Do not send your password or sensitive file contents. We may ask
 you to verify your identity.
 
-For Supabase accounts, account deletion through the desktop app is not yet
-available. Contact us to request assistance; do not assume that using the
-account-deletion control has deleted your account. Some desktop records are
-not associated with an account and may remain on the device.
+Automated Supabase account and cloud-data deletion is coming soon; it is not
+available in this beta, and no release date is promised. Email us and we will
+promptly process your Supabase account and cloud-data deletion request manually,
+as soon as we reasonably can and within any period the law requires. We may need to verify your identity and
+review shared or otherwise ambiguous data before acting. A request does not
+itself delete your account. Some desktop records are not associated with an
+account and may remain on the device.
 
 The separately confirmed **Clear local workspace** control removes FalconBroom's
 local uploads, outputs, recipes, inspections, history and snapshots for all
@@ -80,8 +84,7 @@ FalconBroom-managed locations, third-party copies such as files exported to
 Google Drive, service audit records retained for security or operational
 purposes, or provider backups subject to their retention processes. Shared team
 data needed by other members is not deleted as part of one member's request.
-Contact us if you need help with those copies or a deletion job that needs
-attention.
+Contact us if you need help with those copies.
 
 ## How We Use Information
 
@@ -107,6 +110,22 @@ and service terms. See
 Google Analytics is disabled in this desktop release. Previous versions may
 have saved an analytics preference or cookies; disabling analytics does not
 necessarily remove those older cookies.
+
+The desktop app window also uses a Content Security Policy that limits its
+connections. In the standard configuration it permits the local FalconBroom
+backend and Supabase. Versions with remote-service settings can also permit the
+configured HTTPS remote backend when its use is allowed. This policy restricts
+the interface only; it does not itself limit what the backend does.
+
+Versions with remote-service settings let you turn individual optional
+integrations and the remote backend on or off. Existing behavior is preserved
+by default. Supabase sign-in remains online. If an integration is disabled,
+the app blocks use of a configured remote backend because it cannot enforce
+those choices on that server. Restart to switch backends; work already accepted
+by a remote server may continue. HTTP lookup and audit-export URLs can target
+arbitrary services independently of the other integration settings. These
+controls do not prevent independently started workers, cloud-sync software,
+or other applications from transmitting files.
 
 Some integrations or remote-backend configurations may send information,
 including file contents, instructions, or credentials as needed for the
@@ -179,10 +198,47 @@ workspace before upgrading; if plaintext and encrypted copies conflict, the
 app stops rather than replacing either copy. Earlier installers do not
 necessarily include these protections.
 
-Other outputs, consent and audit data, temporary files, backups and exports may
+For managed Source and Joins CSV outputs, the updated desktop app uses a
+bounded in-memory buffer when possible. Larger CSVs and other supported output
+formats use lock-protected temporary workspaces before vault encryption.
+Rollback, patch and Parquet outputs also use these workspaces. These workspaces
+are not themselves encrypted and cleanup is not secure erasure.
+The local desktop app avoids multipart disk spooling for its own uploads;
+conversion can still require plaintext files. It can read smaller encrypted
+tables in memory and normally streams ordinary downloads from an authenticated
+encrypted snapshot without another plaintext staging file. Range downloads
+still use plaintext staging. New workspaces have Windows access controls
+restricting access to their owner and SYSTEM; they require a filesystem that
+supports these controls. Older workspaces may not have those restrictions.
+
+New local Windows desktop consent receipts, consent job metadata and managed
+consent-job exports are encrypted in the desktop vault. Older receipts and job
+records remain plaintext unless you separately confirm their protection in
+Settings. Consent history can be downloaded as plaintext JSON or an encrypted
+ZIP. ZIP filenames and sizes are visible; files become plaintext when extracted.
+
+New local desktop audit entries are encrypted and minimize identifying details.
+Their integrity chain detects changes or truncation relative to its stored head,
+but cannot detect deletion or rollback of the entire store without an external
+trusted checkpoint. Older audit files remain plaintext unless you separately
+confirm their protection in Settings; encrypting them does not establish their
+historical integrity. Back up first and close older app versions and workers
+before migration. Configured audit exports, other logs and older exports may
+still contain plaintext.
+
+Other outputs, older consent records, audit data, temporary files, backups and exports may
 contain plaintext. File names and some operating-system or storage metadata
 may also remain visible. Processing can create plaintext temporary files or
 write plaintext before encrypting it, and deleted files are not securely erased.
+With the local Windows desktop backend, Source and Joins also offer optional
+password-protected encrypted ZIP downloads. We recommend this option for
+financial, healthcare and personal information after the app's safeguards are
+assessed; during beta, continue to use synthetic or non-sensitive data. Use a
+long, randomly generated passphrase and retain it safely: it cannot be recovered.
+ZIP member names and sizes remain visible, and extracted files are not protected
+by the archive. A compatible extraction tool such as 7-Zip may be needed.
+Ordinary downloads remain unencrypted by FalconBroom, and encrypted downloads
+are unavailable when using a remote backend.
 Abandoned lock-protected workspaces are removed on startup, but active
 workspaces, older untracked temporary files and other remnants may remain.
 There is no recovery password for the Windows profile-bound key. Protect the

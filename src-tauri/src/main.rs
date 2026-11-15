@@ -11,6 +11,66 @@ struct BackendChild(Arc<Mutex<Option<Child>>>);
 
 struct BackendPort(u16);
 struct BackendSecret(String);
+struct BackendMode {
+    base: String,
+    remote: bool,
+    interaction: Arc<Mutex<bool>>,
+}
+
+const REMOTE_SERVICES: [&str; 8] = [
+    "remote_backend", "google_drive", "geocoding", "exchangerate_host",
+    "openexchangerates", "http_lookup", "audit_export", "smtp",
+];
+
+fn read_remote_policy(path: &std::path::Path) -> Result<Value, String> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Value::Object(REMOTE_SERVICES.iter().map(|name| (name.to_string(), Value::Bool(true))).collect()));
+        }
+        Err(e) => return Err(format!("Cannot read remote-service preferences: {e}")),
+    };
+    let policy: Value = serde_json::from_str(&text)
+        .map_err(|e| format!("Invalid remote-service preferences: {e}"))?;
+    let object = policy.as_object().ok_or("Invalid remote-service preferences")?;
+    if object.len() != REMOTE_SERVICES.len()
+        || REMOTE_SERVICES.iter().any(|name| !object.get(*name).is_some_and(Value::is_boolean))
+    {
+        return Err("Invalid remote-service preferences".into());
+    }
+    Ok(policy)
+}
+
+#[tauri::command]
+async fn set_remote_services(
+    policy: Value,
+    expected: Value,
+    port: tauri::State<'_, BackendPort>,
+    secret: tauri::State<'_, BackendSecret>,
+    mode: tauri::State<'_, BackendMode>,
+) -> Result<Value, String> {
+    let port = port.0;
+    let secret = secret.0.clone();
+    let interaction = mode.interaction.clone();
+    let remote = mode.remote;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut paused = interaction.lock().map_err(|_| "Remote request coordination failed")?;
+        let client = reqwest::blocking::Client::builder().build().map_err(|e| e.to_string())?;
+        let response = client.post(format!("http://127.0.0.1:{port}/desktop/remote-services"))
+            .header("X-FalconBroom-Desktop-Token", &secret)
+            .json(&serde_json::json!({"policy": policy, "expected": expected}))
+            .send().map_err(|e| format!("Cannot save remote-service preferences: {e}"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = response.text().map_err(|e| format!("Cannot read preferences error: {e}"))?;
+            return Err(format!("Cannot save remote-service preferences ({status}): {detail}"));
+        }
+        if remote {
+            *paused = REMOTE_SERVICES.iter().any(|name| policy.get(*name).and_then(Value::as_bool) != Some(true));
+        }
+        response.json().map_err(|e| format!("Invalid preferences response: {e}"))
+    }).await.map_err(|e| format!("Remote-service settings task failed: {e}"))?
+}
 
 impl BackendChild {
     fn empty() -> Self {
@@ -95,7 +155,7 @@ fn find_bundled_backend() -> Option<PathBuf> {
     if p.exists() { Some(p) } else { None }
 }
 
-fn spawn_backend(port: u16, data_dir: &std::path::Path, secret: &str) -> Result<Child, String> {
+fn spawn_backend(port: u16, data_dir: &std::path::Path, secret: &str, control_only: bool) -> Result<Child, String> {
     let parent_pid = std::process::id().to_string();
     let port_s = port.to_string();
 
@@ -118,6 +178,8 @@ fn spawn_backend(port: u16, data_dir: &std::path::Path, secret: &str) -> Result<
     };
 
     cmd.env("FALCONBROOM_DESKTOP_SECRET", secret);
+    cmd.env("FALCONBROOM_REMOTE_POLICY_FILE", data_dir.join("data").join("remote-services.json"));
+    cmd.env("FALCONBROOM_CONTROL_ONLY", if control_only { "1" } else { "0" });
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)]
     {
@@ -129,7 +191,11 @@ fn spawn_backend(port: u16, data_dir: &std::path::Path, secret: &str) -> Result<
 
 // Command exposed to frontend: opens native file dialog and posts the selected path to the backend /profile endpoint.
 #[tauri::command]
-fn pick_file_and_profile(port: tauri::State<'_, BackendPort>, secret: tauri::State<'_, BackendSecret>) -> Result<Value, String> {
+fn pick_file_and_profile(port: tauri::State<'_, BackendPort>, secret: tauri::State<'_, BackendSecret>, mode: tauri::State<'_, BackendMode>) -> Result<Value, String> {
+    let paused = mode.interaction.lock().map_err(|_| "Remote request coordination failed")?;
+    if *paused {
+        return Err("Remote backend is disabled. Restart the app to use the local backend.".into());
+    }
     let path = rfd::FileDialog::new()
         .add_filter("CSV", &["csv"])
         .pick_file();
@@ -140,12 +206,24 @@ fn pick_file_and_profile(port: tauri::State<'_, BackendPort>, secret: tauri::Sta
     };
 
     // Call backend /profile. Prefer remote backend URL if provided via env var.
-    let client = reqwest::blocking::Client::new();
-    let env_base = std::env::var("FALCONBROOM_BACKEND_URL");
-    let base = env_base.clone().unwrap_or_else(|_| format!("http://127.0.0.1:{}", port.0));
+    let client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build().map_err(|e| e.to_string())?;
+    let _lease = if mode.remote {
+        let response = client.get(format!("http://127.0.0.1:{}/desktop/remote-lease", port.0))
+            .header("X-FalconBroom-Desktop-Token", &secret.0)
+            .send().map_err(|e| format!("Cannot coordinate remote request: {e}"))?;
+        if !response.status().is_success() {
+            return Err(format!("Remote backend is unavailable: {}", response.status()));
+        }
+        Some(response)
+    } else {
+        None
+    };
+    let base = &mode.base;
     let url = format!("{}/profile", base.trim_end_matches('/'));
 
-    let resp = if env_base.is_ok() {
+    let resp = if mode.remote {
         // Remote backend: upload the file contents as multipart/form-data
         let p = std::path::PathBuf::from(&path);
         let filename = p
@@ -232,34 +310,69 @@ fn frontend_log(payload: String) -> Result<bool, String> {
 }
 
 fn main() {
-    // If `FALCONBROOM_BACKEND_URL` is set we assume a remote backend and skip spawning a local one.
-    let env_base = std::env::var("FALCONBROOM_BACKEND_URL").ok();
-    let port = if env_base.is_some() { 0 } else { free_port().unwrap_or(3009) };
-    let base = env_base.clone().unwrap_or_else(|| format!("http://127.0.0.1:{}", port));
+    let mut context = tauri::generate_context!();
+    let data_dir = dirs::data_dir().expect("Application data directory is unavailable")
+        .join(&context.config().identifier);
+    let policy = read_remote_policy(&data_dir.join("data").join("remote-services.json"))
+        .expect("Cannot load remote-service preferences");
+    let configured = std::env::var("FALCONBROOM_BACKEND_URL").ok().filter(|s| !s.trim().is_empty());
+    let mut warning = None;
+    let remote = if let Some(value) = configured {
+        if REMOTE_SERVICES.iter().any(|name| policy.get(*name).and_then(Value::as_bool) != Some(true)) {
+            warning = Some("The configured remote backend is blocked because a remote service is disabled.");
+            None
+        } else {
+            match reqwest::Url::parse(&value) {
+                Ok(url) if url.scheme() == "https" && url.username().is_empty()
+                    && url.password().is_none() && url.host_str().is_some()
+                    && url.fragment().is_none() && url.query().is_none() => {
+                    let origin = url.origin().ascii_serialization();
+                    let already_allowed = match &context.config().app.security.csp {
+                        Some(tauri::utils::config::Csp::DirectiveMap(directives)) => directives.get("connect-src")
+                            .map(|sources| Vec::<String>::from(sources.clone()).contains(&origin))
+                            .unwrap_or(false),
+                        _ => false,
+                    };
+                    if already_allowed {
+                        warning = Some("The remote backend must use a different origin from the sign-in service.");
+                        None
+                    } else {
+                        Some(url)
+                    }
+                },
+                _ => {
+                    warning = Some("The configured remote backend is invalid; HTTPS is required.");
+                    None
+                }
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(url) = &remote {
+        if let Some(tauri::utils::config::Csp::DirectiveMap(ref mut directives)) = context.config_mut().app.security.csp {
+            directives.entry("connect-src".to_string()).or_default().push(url.origin().ascii_serialization());
+        } else {
+            panic!("Remote backend requires an explicit content security policy");
+        }
+    }
+    let port = free_port().expect("Cannot select a local backend port");
+    let local_base = format!("http://127.0.0.1:{}", port);
+    let base = remote.as_ref().map(|url| url.as_str().trim_end_matches('/').to_string())
+        .unwrap_or_else(|| local_base.clone());
     let mut random = [0u8; 32];
     getrandom::getrandom(&mut random).expect("Could not generate desktop session secret");
     let secret: String = random.iter().map(|b| format!("{:02x}", b)).collect();
 
     // Set the backend URL before any page script runs.
-    let base_escaped = base.replace("'", "\\'");
-    let init_js = if env_base.is_none() {
-        format!(r#"(function(){{
-            const base = new URL({base});
-            const secret = {secret};
-            window.__FALCONBROOM_BACKEND_URL = base.href.replace(/\/$/, '');
-            const original = window.fetch.bind(window);
-            window.fetch = function(input, init) {{
-                const request = new Request(input, init);
-                if (new URL(request.url).origin !== base.origin) return original(input, init);
-                const headers = new Headers(request.headers);
-                headers.set('X-FalconBroom-Desktop-Token', secret);
-                return original(new Request(request, {{headers, redirect: 'error'}}));
-            }};
-        }})();"#, base = serde_json::to_string(&base).unwrap(), secret = serde_json::to_string(&secret).unwrap())
-    } else {
-        format!("window.__FALCONBROOM_BACKEND_URL = '{}';", base_escaped)
-    };
-    let start_page = if env_base.is_some() { "index.html" } else { "loading.html" };
+    let init_js = format!("((base, local, secret, remote, warning) => {{\n{}\n}})({base}, {local}, {secret}, {remote}, {warning});",
+        include_str!("remote_init.js"),
+        base = serde_json::to_string(&base).unwrap(),
+        local = serde_json::to_string(&local_base).unwrap(),
+        secret = serde_json::to_string(&secret).unwrap(),
+        remote = remote.is_some(),
+        warning = serde_json::to_string(&warning).unwrap());
+    let start_page = "loading.html";
 
     let backend_child = BackendChild::empty();
     let exit_handle = BackendChild(backend_child.0.clone());
@@ -268,15 +381,12 @@ fn main() {
         .manage(backend_child)
         .manage(BackendPort(port))
         .manage(BackendSecret(secret.clone()))
-        .invoke_handler(tauri::generate_handler![pick_file_and_profile, secure_store_get, secure_store_set, secure_store_delete])
+        .manage(BackendMode { base: base.clone(), remote: remote.is_some(), interaction: Arc::new(Mutex::new(false)) })
+        .invoke_handler(tauri::generate_handler![pick_file_and_profile, set_remote_services, secure_store_get, secure_store_set, secure_store_delete])
         .setup(move |app| {
-            if env_base.is_none() {
-                // Data lives in the OS app-data directory, not next to the executable.
-                let data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::env::temp_dir().join("FalconBroom"));
-                match spawn_backend(port, &data_dir, &secret) {
-                    Ok(c) => app.state::<BackendChild>().set(c),
-                    Err(e) => eprintln!("Warning: could not start backend: {}", e),
-                }
+            match spawn_backend(port, &data_dir, &secret, remote.is_some()) {
+                Ok(c) => app.state::<BackendChild>().set(c),
+                Err(e) => return Err(format!("Could not start backend: {e}").into()),
             }
 
             // Create or reuse the main window and attach a webview that runs
@@ -314,7 +424,7 @@ fn main() {
             Ok(())
         });
 
-    let app = builder.build(tauri::generate_context!()).expect("error while building tauri application");
+    let app = builder.build(context).expect("error while building tauri application");
 
     app.run(move |_app_handle, event| {
         if let tauri::RunEvent::Exit = event {

@@ -11,7 +11,14 @@ from starlette.responses import JSONResponse
 
 logger = logging.getLogger(__name__)
 
-_CLEANUP_PATHS = {"/account/delete", "/dsar/delete", "/desktop/clear-workspace"}
+_CLEANUP_PATHS = {"/account/delete", "/dsar/delete", "/desktop/clear-workspace", "/desktop/test-deletions", "/desktop/remote-services", "/desktop/protect-consents", "/desktop/protect-consent-jobs", "/desktop/protect-audit"}
+_DELETION_ALLOWED_PATHS = {"/health", "/account/delete", "/desktop/test-deletions"}
+
+
+def _gate_path():
+    policy_path = os.environ.get("FALCONBROOM_REMOTE_POLICY_FILE")
+    root = Path(policy_path).parent if policy_path else Path("data")
+    return root / ".desktop-request-gate"
 
 
 class _Overlapped(ctypes.Structure):
@@ -60,6 +67,20 @@ class _WindowsFileGate:
                 raise TimeoutError("Desktop cleanup is waiting for another operation")
             await asyncio.sleep(0.05)
 
+    def lock_sync(self, offset: int, exclusive: bool, deadline: float):
+        flags = 1 | (2 if exclusive else 0)
+        while True:
+            overlapped = _Overlapped(offset=offset)
+            if self._kernel.LockFileEx(self._handle, flags, 0, 1, 0, ctypes.byref(overlapped)):
+                self._held.append(offset)
+                return
+            error = ctypes.get_last_error()
+            if error != 33:
+                raise ctypes.WinError(error)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Desktop operation is waiting for another operation")
+            time.sleep(0.05)
+
     def unlock(self, offset: int):
         overlapped = _Overlapped(offset=offset)
         if not self._kernel.UnlockFileEx(self._handle, 0, 1, 0, ctypes.byref(overlapped)):
@@ -84,7 +105,7 @@ async def _enter_gate(gate: _WindowsFileGate, exclusive: bool, timeout: float):
 
 @contextlib.contextmanager
 def desktop_startup_gate():
-    gate = _WindowsFileGate(Path("data") / ".desktop-request-gate")
+    gate = _WindowsFileGate(_gate_path())
     try:
         asyncio.run(_enter_gate(gate, False, 30))
         yield
@@ -107,10 +128,16 @@ class DesktopRequestGate:
             await self.app(scope, receive, send)
             return
 
-        exclusive = scope["method"] == "POST" and scope["path"] in _CLEANUP_PATHS
+        exclusive = scope["method"] == "POST" and (
+            scope["path"] in _CLEANUP_PATHS
+            or (
+                scope["path"] == "/join-export"
+                and os.environ.get("FALCONBROOM_TEST_ACCOUNT_DELETION") == "1"
+            )
+        )
         gate = None
         try:
-            gate = _WindowsFileGate(Path("data") / ".desktop-request-gate")
+            gate = _WindowsFileGate(_gate_path())
             await _enter_gate(gate, exclusive, self.timeout)
         except TimeoutError:
             if gate:
@@ -134,6 +161,16 @@ class DesktopRequestGate:
             raise
 
         try:
+            if (
+                scope["path"] not in _DELETION_ALLOWED_PATHS
+                and not (scope["path"] == "/me" and scope["method"] in {"GET", "OPTIONS"})
+                and (Path("data") / ".test-deletion-pending").exists()
+            ):
+                await JSONResponse(
+                    {"detail": "A test account deletion is pending. Check its status or retry cleanup."},
+                    status_code=423,
+                )(scope, receive, send)
+                return
             await self.app(scope, receive, send)
         finally:
             gate.close()

@@ -28,7 +28,7 @@ function respond(status, body) {
   })
 }
 
-async function readBody(request) {
+export async function readBody(request) {
   if (!request.body) throw new Error('Missing request body')
   const reader = request.body.getReader()
   const parts = []

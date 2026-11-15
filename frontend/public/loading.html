@@ -20,7 +20,7 @@
   <div id="msg">Starting FalconBroom&hellip;</div>
   <script>
     (function () {
-      var base = (window.__FALCONBROOM_BACKEND_URL || 'http://127.0.0.1:3009').replace(/\/$/, '');
+      var base = (window.__FALCONBROOM_CONTROL_URL || window.__FALCONBROOM_BACKEND_URL || 'http://127.0.0.1:3009').replace(/\/$/, '');
       var deadline = Date.now() + 120000;
       function tick() {
         fetch(base + '/health').then(function (r) {
