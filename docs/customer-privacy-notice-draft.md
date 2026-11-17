@@ -1,6 +1,6 @@
 # FalconBroom Privacy Notice (Draft)
 
-Last updated: November 13, 2026
+Last updated: November 17, 2026
 
 This draft is provided for review and has not been finalized.
 
@@ -72,11 +72,22 @@ review shared or otherwise ambiguous data before acting. A request does not
 itself delete your account. Some desktop records are not associated with an
 account and may remain on the device.
 
+In this source revision, the local desktop backend verifies the account online
+and separates new uploads, recipes, outputs, inspections, runs, snapshots,
+checkpoints, drafts and upload-history entries by account and trusted project
+on this device. Workflow data stays on the device; Supabase verifies identity.
+Existing shared workspace and browser records are not automatically assigned
+or imported. Older installers do not include this change.
+Software or another person with access to the same Windows user profile and
+its vault keys may still access local data; separate Windows profiles provide
+a stronger device boundary.
+
 The separately confirmed **Clear local workspace** control removes FalconBroom's
 local uploads, outputs, recipes, inspections, history and snapshots for all
-accounts on that device, along with abandoned lock-protected workspaces. It
+accounts in the current desktop profile, along with abandoned lock-protected workspaces. It
 does not remove active workspaces, older untracked temporary files, accounts,
-consent records, exports saved elsewhere, backups, or copies on other devices.
+other preserved profiles, consent records, exports saved elsewhere, backups,
+or copies on other devices.
 Deletion is not secure erasure.
 
 This process cannot remove copies you downloaded, data stored outside
@@ -192,11 +203,10 @@ in Settings. Losing access to that Windows profile can make protected records
 unreadable; other software running as that user may be able to access them.
 The updated Windows desktop app encrypts managed uploads, normalized uploads,
 their conversion metadata, recipes, history, snapshots and outputs from
-supported processing routes. It migrates existing files in those managed
-folders and the legacy text-generated default output on startup. Back up your
-workspace before upgrading; if plaintext and encrypted copies conflict, the
-app stops rather than replacing either copy. Earlier installers do not
-necessarily include these protections.
+supported processing routes. In the account-isolated source revision, existing
+shared files and the legacy text-generated default output are not migrated or
+assigned on startup. Back up your workspace before upgrading. Earlier installers
+do not necessarily include these protections.
 
 For managed Source and Joins CSV outputs, the updated desktop app uses a
 bounded in-memory buffer when possible. Larger CSVs and other supported output
@@ -241,8 +251,28 @@ Ordinary downloads remain unencrypted by FalconBroom, and encrypted downloads
 are unavailable when using a remote backend.
 Abandoned lock-protected workspaces are removed on startup, but active
 workspaces, older untracked temporary files and other remnants may remain.
-There is no recovery password for the Windows profile-bound key. Protect the
-device and any exported files.
+In this source revision, Settings can export a passphrase-encrypted recovery
+file for the current desktop vault. Save it outside FalconBroom app data and
+keep a long, randomly generated passphrase separately. The recovery file
+contains the vault key, not the data; back up the encrypted files separately.
+The app stores a Windows-protected record of the export location and checksums
+locally to check the recovery export before app-data deletion.
+Some records protected directly by Windows may still require the original
+Windows profile. If the key is missing or cannot be unlocked, startup offers a
+confirmed fresh profile that preserves the existing profile, or import of a
+matching previously exported recovery file. A file cannot be exported after its
+key has been lost. Settings lets you select a preserved profile; close older
+app versions and workers and restart after switching. Restoring a recovery key
+requires matching encrypted records or audit data and does not verify every
+file's contents.
+
+The updated uninstaller warns that deleting app data removes files and keys,
+and requires a verifiable recovery export for each profile with a usable vault
+key. Deletion is blocked if a key is missing, an export cannot be verified, or
+app data is redirected or inaccessible. It cannot verify that you retained the
+passphrase or a data backup. Older uninstallers do not have this protection.
+Close all app versions and workers before uninstalling, and do not reopen them
+until uninstall completes.
 The app's security and storage configuration can differ when a remote
 backend is used. Do not upload sensitive data during the beta unless you have
 independently assessed the configuration and risks.

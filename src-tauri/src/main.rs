@@ -155,7 +155,7 @@ fn find_bundled_backend() -> Option<PathBuf> {
     if p.exists() { Some(p) } else { None }
 }
 
-fn spawn_backend(port: u16, data_dir: &std::path::Path, secret: &str, control_only: bool) -> Result<Child, String> {
+fn spawn_backend(port: u16, data_dir: &std::path::Path, secret: &str, control_only: bool, account_project: &str) -> Result<Child, String> {
     let parent_pid = std::process::id().to_string();
     let port_s = port.to_string();
 
@@ -178,6 +178,9 @@ fn spawn_backend(port: u16, data_dir: &std::path::Path, secret: &str, control_on
     };
 
     cmd.env("FALCONBROOM_DESKTOP_SECRET", secret);
+    cmd.env("FALCONBROOM_REQUIRE_VERIFIED_ACCOUNT", "1");
+    cmd.env("FALCONBROOM_DESKTOP_ACCOUNT_ISOLATION", "1");
+    cmd.env("FALCONBROOM_DESKTOP_ACCOUNT_URL", account_project);
     cmd.env("FALCONBROOM_REMOTE_POLICY_FILE", data_dir.join("data").join("remote-services.json"));
     cmd.env("FALCONBROOM_CONTROL_ONLY", if control_only { "1" } else { "0" });
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -191,7 +194,14 @@ fn spawn_backend(port: u16, data_dir: &std::path::Path, secret: &str, control_on
 
 // Command exposed to frontend: opens native file dialog and posts the selected path to the backend /profile endpoint.
 #[tauri::command]
-fn pick_file_and_profile(port: tauri::State<'_, BackendPort>, secret: tauri::State<'_, BackendSecret>, mode: tauri::State<'_, BackendMode>) -> Result<Value, String> {
+fn pick_file_and_profile(
+    port: tauri::State<'_, BackendPort>,
+    secret: tauri::State<'_, BackendSecret>,
+    mode: tauri::State<'_, BackendMode>,
+    account_token: Option<String>,
+    account_key: Option<String>,
+    expected_account: Option<String>,
+) -> Result<Value, String> {
     let paused = mode.interaction.lock().map_err(|_| "Remote request coordination failed")?;
     if *paused {
         return Err("Remote backend is disabled. Restart the app to use the local backend.".into());
@@ -243,16 +253,34 @@ fn pick_file_and_profile(port: tauri::State<'_, BackendPort>, secret: tauri::Sta
             .send()
             .map_err(|e| format!("Failed to call remote backend: {}", e))?
     } else {
-        // Local backend: send the path in JSON (existing behavior)
-        let body = serde_json::json!({"path": path});
+        let token = account_token.filter(|value| !value.is_empty()).ok_or("Account authentication is required")?;
+        let key = account_key.filter(|value| !value.is_empty()).ok_or("Account service configuration is required")?;
+        let account = expected_account.filter(|value| !value.is_empty()).ok_or("Account identity is required")?;
+        let file_path = std::path::Path::new(&path);
+        let filename = file_path.file_name().and_then(|value| value.to_str()).ok_or("Invalid selected filename")?;
+        let encoded_name: String = filename.as_bytes().iter().map(|byte| {
+            if byte.is_ascii_alphanumeric() || matches!(*byte, b'-' | b'_' | b'.' | b'~') {
+                (*byte as char).to_string()
+            } else {
+                format!("%{:02X}", byte)
+            }
+        }).collect();
+        let file = std::fs::File::open(file_path).map_err(|e| format!("Failed to read selected file: {}", e))?;
         client
-            .post(url)
+            .post(format!("{}/desktop/upload-stream", base.trim_end_matches('/')))
             .header("X-FalconBroom-Desktop-Token", &secret.0)
-            .json(&body)
+            .header("X-FalconBroom-Account-Publishable-Key", key)
+            .header("X-FalconBroom-Expected-Account", account)
+            .header("X-FalconBroom-Filename", encoded_name)
+            .bearer_auth(token)
+            .body(reqwest::blocking::Body::new(file))
             .send()
             .map_err(|e| format!("Failed to call backend: {}", e))?
     };
 
+    if !resp.status().is_success() {
+        return Err(format!("Backend request failed: {}", resp.status()));
+    }
     let j: Value = resp
         .json()
         .map_err(|e| format!("Failed to parse backend response: {}", e))?;
@@ -260,6 +288,16 @@ fn pick_file_and_profile(port: tauri::State<'_, BackendPort>, secret: tauri::Sta
 }
 
 // Secure store commands for frontend tokenStore.js
+#[tauri::command]
+fn choose_recovery_export_path() -> Result<Option<String>, String> {
+    let path = rfd::FileDialog::new()
+        .set_file_name("falconbroom-recovery.fbrecovery")
+        .add_filter("FalconBroom recovery file", &["fbrecovery"])
+        .save_file();
+    path.map(|p| p.into_os_string().into_string().map_err(|_| "Invalid recovery file path".to_string()))
+        .transpose()
+}
+
 #[tauri::command]
 fn secure_store_get(key: String) -> Result<Option<String>, String> {
     // use keyring crate to retrieve a stored secret
@@ -311,6 +349,28 @@ fn frontend_log(payload: String) -> Result<bool, String> {
 
 fn main() {
     let mut context = tauri::generate_context!();
+    let account_projects: Vec<String> = match &context.config().app.security.csp {
+        Some(tauri::utils::config::Csp::DirectiveMap(directives)) => directives.get("connect-src")
+            .map(|sources| Vec::<String>::from(sources.clone()))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|source| {
+                let url = reqwest::Url::parse(&source).ok()?;
+                let host = url.host_str()?;
+                if url.scheme() != "https" || !host.ends_with(".supabase.co")
+                    || url.username() != "" || url.password().is_some()
+                    || url.port().is_some() || url.path() != "/"
+                    || url.query().is_some() || url.fragment().is_some()
+                {
+                    return None;
+                }
+                Some(url.origin().ascii_serialization())
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    assert_eq!(account_projects.len(), 1, "Exactly one trusted Supabase project must be configured");
+    let account_project = account_projects[0].clone();
     let data_dir = dirs::data_dir().expect("Application data directory is unavailable")
         .join(&context.config().identifier);
     let policy = read_remote_policy(&data_dir.join("data").join("remote-services.json"))
@@ -382,9 +442,9 @@ fn main() {
         .manage(BackendPort(port))
         .manage(BackendSecret(secret.clone()))
         .manage(BackendMode { base: base.clone(), remote: remote.is_some(), interaction: Arc::new(Mutex::new(false)) })
-        .invoke_handler(tauri::generate_handler![pick_file_and_profile, set_remote_services, secure_store_get, secure_store_set, secure_store_delete])
+        .invoke_handler(tauri::generate_handler![pick_file_and_profile, set_remote_services, choose_recovery_export_path, secure_store_get, secure_store_set, secure_store_delete])
         .setup(move |app| {
-            match spawn_backend(port, &data_dir, &secret, remote.is_some()) {
+            match spawn_backend(port, &data_dir, &secret, remote.is_some(), &account_project) {
                 Ok(c) => app.state::<BackendChild>().set(c),
                 Err(e) => return Err(format!("Could not start backend: {e}").into()),
             }

@@ -1,8 +1,8 @@
 import React, { useEffect, useState } from 'react'
 import { BACKEND } from './config'
-import authFetch from './utils/authFetch'
+import authFetchBase from './utils/authFetch'
 
-export default function PrivacyAdmin({ addToast }) {
+export default function PrivacyAdmin({ addToast, authFetch = authFetchBase }) {
   const [inventory, setInventory] = useState([])
   const [dpias, setDpias] = useState([])
   const [loading, setLoading] = useState(false)

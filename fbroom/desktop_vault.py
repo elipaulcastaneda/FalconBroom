@@ -38,6 +38,14 @@ class DesktopVaultError(RuntimeError):
     pass
 
 
+class DesktopVaultMissingKey(DesktopVaultError):
+    pass
+
+
+class DesktopVaultUnlockError(DesktopVaultError):
+    pass
+
+
 def _load_master_key(key_path: Path) -> bytes:
     try:
         wrapped = key_path.read_bytes()
@@ -48,7 +56,7 @@ def _load_master_key(key_path: Path) -> bytes:
             raise ValueError("Invalid master key length")
         return key
     except (OSError, ValueError, DesktopVaultError) as error:
-        raise DesktopVaultError(
+        raise DesktopVaultUnlockError(
             "Could not unlock FalconBroom's desktop data key; encrypted data was left unchanged"
         ) from error
 
@@ -111,7 +119,7 @@ def initialize(root: Path | str) -> None:
             key = _load_master_key(key_path)
         else:
             if any(root.rglob("*.fbenc")) or (root / ".vault" / "audit.sqlite3").exists():
-                raise DesktopVaultError(
+                raise DesktopVaultMissingKey(
                     "Encrypted FalconBroom data exists but its protected key is missing"
                 )
             key = os.urandom(32)

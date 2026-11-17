@@ -860,6 +860,7 @@ def _external_lookup(df, params=None):
     params: {'mode':'http'|'sqlite','template': 'https://...{col}...', 'map':{'json_key':'out_col'}}
     """
     params = params or {}
+    from .desktop_workspace import current_account
     mode = params.get('mode', 'http')
     if mode == 'http':
         remote_services.require("http_lookup")
@@ -885,7 +886,8 @@ def _external_lookup(df, params=None):
         for row in _iter_dtype_preserving_records(pd_df):
             try:
                 url = template.format(**{k: row.get(k, '') for k in pd_df.columns})
-                cache_key = ('http', url)
+                account = current_account()
+                cache_key = ('http', account, url) if account is not None else ('http', url)
                 now = int(time.time())
                 entry = _EXTERNAL_LOOKUP_CACHE.get(cache_key)
                 if entry and now - entry[1] < int(params.get('cache_ttl', 3600)):
@@ -910,7 +912,11 @@ def _external_lookup(df, params=None):
         db = params.get('db')
         qtemplate = params.get('query')
         import sqlite3
-        conn = sqlite3.connect(db)
+        if current_account() is not None:
+            db = desktop_vault.materialize(Path(db)).resolve().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(db, uri=True)
+        else:
+            conn = sqlite3.connect(db)
         results = {out: [] for out in mapping.values()} if mapping else {}
         for row in _iter_dtype_preserving_records(pd_df):
             try:
@@ -4150,7 +4156,8 @@ class Cleaner:
         """Delete snapshot files older than `retention_days` from data/history/snapshots.
         Returns a summary dict with counts.
         """
-        snaps_dir = Path("data") / "history" / "snapshots"
+        from .desktop_workspace import snapshot_directory, workspace_directory
+        snaps_dir = snapshot_directory(workspace_directory(Path("data") / "history"))
         if not snaps_dir.exists():
             return {"deleted": 0, "remaining": 0}
         now = datetime.now(timezone.utc)
@@ -4586,7 +4593,8 @@ class Cleaner:
                 src_p = Path(src).resolve()
                 if source.exists:
                     readable_source = Path(source.materialized_path or source.path)
-                    snaps_dir = Path("data") / "history" / "snapshots"
+                    from .desktop_workspace import snapshot_directory, workspace_directory
+                    snaps_dir = snapshot_directory(workspace_directory(Path("data") / "history"))
                     snaps_dir.mkdir(parents=True, exist_ok=True)
                     # compute a short hash of the source for uniqueness
                     h = hashlib.sha256()

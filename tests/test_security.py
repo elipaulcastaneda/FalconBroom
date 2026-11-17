@@ -160,6 +160,22 @@ def test_shared_upload_websocket_is_disabled():
             pass
 
 
+def test_desktop_isolation_disables_unscoped_team_websocket(monkeypatch):
+    monkeypatch.setenv("FALCONBROOM_LOCAL_MODE", "1")
+    monkeypatch.setenv("FALCONBROOM_DESKTOP_ACCOUNT_ISOLATION", "1")
+    monkeypatch.setattr(fb, "TEAM_FEATURES_ENABLED", True)
+    monkeypatch.setattr(fb, "_get_user_from_token", lambda token: {"id": "test-user"})
+    client = TestClient(fb.app)
+
+    with pytest.raises(WebSocketDisconnect) as error:
+        with client.websocket_connect("/ws/shared?token=valid-test-token"):
+            pass
+    assert error.value.code == 1008
+    with pytest.raises(fb.HTTPException) as error:
+        fb._require_team_features()
+    assert error.value.status_code == 404
+
+
 def test_me_hides_legacy_team_fields(monkeypatch):
     monkeypatch.setattr(
         fb,

@@ -8,6 +8,7 @@ import os
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 
@@ -45,7 +46,28 @@ def main(argv=None):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--parent-pid", type=int, default=None)
+    parser.add_argument("--verify-uninstall-recovery", action="store_true")
+    parser.add_argument("--uninstaller-pid", type=int)
     args = parser.parse_args(argv)
+
+    if args.verify_uninstall_recovery:
+        from fbroom import desktop_recovery, desktop_vault
+        from fbroom.desktop_request_gate import desktop_exclusive_gate, mark_uninstall_in_progress, uninstall_in_progress
+        local = os.environ.get("LOCALAPPDATA")
+        if not args.data_dir or not Path(args.data_dir).is_absolute() or not local or os.name != "nt":
+            parser.error("Uninstall recovery verification requires Windows app-data paths")
+        base = Path(args.data_dir)
+        os.environ["FALCONBROOM_REMOTE_POLICY_FILE"] = str(base / "data" / "remote-services.json")
+        try:
+            with desktop_exclusive_gate():
+                if uninstall_in_progress():
+                    return 1
+                desktop_recovery.verify_uninstall_exports(base, Path(local) / "com.falconbroom.ui")
+                if args.uninstaller_pid:
+                    mark_uninstall_in_progress(args.uninstaller_pid)
+        except (desktop_vault.DesktopVaultError, OSError, TimeoutError):
+            return 1
+        return 0
 
     secret = os.environ.get("FALCONBROOM_DESKTOP_SECRET", "")
     if len(secret) != 64 or any(c not in "0123456789abcdef" for c in secret):
@@ -60,34 +82,51 @@ def main(argv=None):
     os.environ["ENV"] = "development" if local_backend else "production"
 
     if args.data_dir:
-        # The backend stores everything under ./data, so run from the app data dir.
         os.makedirs(args.data_dir, exist_ok=True)
         os.chdir(args.data_dir)
+    profile_base = Path.cwd().resolve()
+    os.environ.setdefault("FALCONBROOM_REMOTE_POLICY_FILE", str(profile_base / "data" / "remote-services.json"))
+    os.environ["FALCONBROOM_DESKTOP_PROFILE_BASE"] = str(profile_base)
 
     if args.parent_pid:
         threading.Thread(target=_exit_when_parent_dies, args=(args.parent_pid,), daemon=True).start()
 
     import uvicorn
     from fbroom import desktop_vault
-    from fbroom.desktop_request_gate import desktop_startup_gate
-    from fbroom import main as fb
+    from fbroom.desktop_request_gate import desktop_startup_gate, uninstall_in_progress
+    from fbroom.desktop_profiles import profile_directory, selected_profile
 
-    if local_backend and os.environ.get("FALCONBROOM_CONTROL_ONLY") != "1":
-        with desktop_startup_gate():
-            desktop_vault.initialize(os.path.join(os.getcwd(), "data"))
-            if not (Path("data") / ".test-deletion-pending").exists():
-                desktop_vault.cleanup_abandoned_scratch()
-                desktop_vault.migrate_plaintext_files(
-                    (fb.UPLOAD_DIR, fb.OUTPUTS_DIR, fb.RECIPES_DIR, fb.HISTORY_DIR)
-                )
-                legacy_output = Path.cwd() / "output_from_text.csv"
-                if legacy_output.is_file() or legacy_output.is_symlink():
-                    desktop_vault.migrate_plaintext_file(
-                        legacy_output, fb.OUTPUTS_DIR / "output_from_text_legacy.csv"
-                    )
+    with desktop_startup_gate() if os.name == "nt" else nullcontext():
+        if os.name == "nt" and uninstall_in_progress():
+            raise RuntimeError("FalconBroom app-data deletion is in progress")
+        profile = selected_profile(profile_base)
+        os.chdir(profile_directory(profile_base, profile))
+        os.environ["FALCONBROOM_DESKTOP_PROFILE"] = profile
+        from fbroom import main as fb
+        if local_backend and os.environ.get("FALCONBROOM_CONTROL_ONLY") != "1":
+            try:
+                desktop_vault.initialize(os.path.join(os.getcwd(), "data"))
+                if not (Path("data") / ".test-deletion-pending").exists():
+                    desktop_vault.cleanup_abandoned_scratch()
+                    if os.environ.get("FALCONBROOM_DESKTOP_ACCOUNT_ISOLATION") != "1":
+                        desktop_vault.migrate_plaintext_files(
+                            (fb.UPLOAD_DIR, fb.OUTPUTS_DIR, fb.RECIPES_DIR, fb.HISTORY_DIR)
+                        )
+                        legacy_output = Path.cwd() / "output_from_text.csv"
+                        if legacy_output.is_file() or legacy_output.is_symlink():
+                            desktop_vault.migrate_plaintext_file(
+                                legacy_output, fb.OUTPUTS_DIR / "output_from_text_legacy.csv"
+                            )
+            except desktop_vault.DesktopVaultMissingKey:
+                fb.logger.error("Desktop vault key is missing; existing encrypted data was left unchanged")
+                fb.app.state.desktop_vault_missing_key = True
+            except desktop_vault.DesktopVaultUnlockError:
+                fb.logger.error("Desktop vault key cannot be unlocked; existing encrypted data was left unchanged")
+                fb.app.state.desktop_vault_missing_key = True
+                fb.app.state.desktop_vault_unlock_error = True
 
     uvicorn.run(fb.app, host=args.host, port=args.port, log_level="warning", lifespan="off")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

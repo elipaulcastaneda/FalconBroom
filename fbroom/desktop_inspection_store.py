@@ -55,6 +55,8 @@ def _protected_desktop() -> bool:
 
 def read_inspection(path: Path):
     with _lock:
+        if path.is_symlink():
+            raise InspectionProtectionError("Inspection record is redirected")
         raw = path.read_bytes()
         if raw.startswith(_MAGIC):
             raw = _dpapi(raw[len(_MAGIC):], decrypt=True)

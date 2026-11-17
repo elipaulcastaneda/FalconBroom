@@ -13,18 +13,50 @@
     @keyframes spin { to { transform: rotate(360deg); } }
     #msg { opacity: 0.85; text-align: center; max-width: 420px; line-height: 1.5; }
     .error .spinner { display: none; }
+    #recovery { max-width: 520px; padding: 16px; }
+    #recovery label { display: block; margin: 10px 0; }
+    #recovery input, #recovery select, #recovery button { font: inherit; }
+    #recovery-status { color: #fbbf24; }
   </style>
 </head>
 <body>
   <div class="spinner"></div>
   <div id="msg">Starting FalconBroom&hellip;</div>
+  <div id="recovery" hidden>
+    <p>Deleting app data during uninstall removes local files and any remaining keys. Keep app data unless you intend to delete it.</p>
+    <p>Recommended: start a separate empty profile. The existing profile stays in place. Close all older FalconBroom versions and workers first.</p>
+    <label>Type START FRESH <input id="fresh-confirm" autocomplete="off" /></label>
+    <button id="fresh">Start fresh and preserve existing data</button>
+    <p>Alternatively, restore a previously exported recovery file for this profile. An unreadable key file is kept as a backup. A recovery file must have been exported before the key was lost.</p>
+    <label>Recovery file <input id="recovery-file" type="file" accept=".fbrecovery" /></label>
+    <label>Recovery passphrase <input id="recovery-passphrase" type="password" autocomplete="off" /></label>
+    <button id="restore">Restore recovery key</button>
+    <p>To return to another preserved profile, select it below. Restart FalconBroom after changing profiles.</p>
+    <label>Profile <select id="profile"></select></label>
+    <label>Type OPEN PROFILE <input id="profile-confirm" autocomplete="off" /></label>
+    <button id="select-profile">Open selected profile</button>
+    <p id="recovery-status" role="status"></p>
+  </div>
   <script>
     (function () {
       var base = (window.__FALCONBROOM_CONTROL_URL || window.__FALCONBROOM_BACKEND_URL || 'http://127.0.0.1:3009').replace(/\/$/, '');
       var deadline = Date.now() + 120000;
       function tick() {
         fetch(base + '/health').then(function (r) {
-          if (r.ok) { location.replace('index.html'); } else { retry(); }
+          if (r.ok) { location.replace('index.html'); return; }
+          if (r.status === 503) {
+            return r.json().then(function (body) {
+              if (body && (body.code === 'vault_key_missing' || body.code === 'vault_key_unavailable')) {
+                document.body.className = 'error';
+                document.getElementById('msg').textContent =
+                  body.code === 'vault_key_missing'
+                    ? 'FalconBroom found encrypted local data but its Windows-protected key is missing. Existing encrypted files were left unchanged.'
+                    : 'FalconBroom cannot unlock its Windows-protected key. Existing encrypted files were left unchanged.';
+                showRecovery();
+              } else { retry(); }
+            }).catch(retry);
+          }
+          retry();
         }).catch(retry);
       }
       function retry() {
@@ -35,6 +67,68 @@
           return;
         }
         setTimeout(tick, 500);
+      }
+      function showRecovery() {
+        var element = function (id) { return document.getElementById(id); };
+        var status = element('recovery-status');
+        element('recovery').hidden = false;
+        function post(path, body) {
+          return fetch(base + path, {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+          }).then(function (response) {
+            return response.json().then(function (result) {
+              if (!response.ok) throw new Error(result.detail || 'Operation failed');
+              element('recovery').hidden = true;
+              element('msg').textContent = 'Close all FalconBroom windows and restart to continue. Existing profiles were preserved.';
+            });
+          }).catch(function (error) { status.textContent = error.message || 'Operation failed'; });
+        }
+        element('fresh').addEventListener('click', function () {
+          status.textContent = '';
+          if (element('fresh-confirm').value !== 'START FRESH') {
+            status.textContent = 'Type START FRESH to confirm.';
+            return;
+          }
+          post('/desktop/vault/fresh', {confirmation: element('fresh-confirm').value});
+        });
+        element('restore').addEventListener('click', function () {
+          status.textContent = '';
+          var file = element('recovery-file').files[0];
+          var passphrase = element('recovery-passphrase').value;
+          if (!file || file.size !== 84 || passphrase.length < 20) {
+            status.textContent = 'Select a recovery file and enter its passphrase.';
+            return;
+          }
+          file.arrayBuffer().then(function (buffer) {
+            var bytes = new Uint8Array(buffer);
+            return post('/desktop/vault/restore', {
+              recovery_file: btoa(String.fromCharCode.apply(null, bytes)), passphrase: passphrase
+            });
+          }).catch(function () { status.textContent = 'Could not read the recovery file.'; })
+            .finally(function () { element('recovery-passphrase').value = ''; });
+        });
+        element('select-profile').addEventListener('click', function () {
+          if (element('profile-confirm').value !== 'OPEN PROFILE') {
+            status.textContent = 'Type OPEN PROFILE to confirm.';
+            return;
+          }
+          post('/desktop/vault/select', {
+            profile: element('profile').value, confirmation: element('profile-confirm').value
+          });
+        });
+        fetch(base + '/desktop/vault/profiles').then(function (response) {
+          if (!response.ok) throw new Error('Could not load profiles');
+          return response.json();
+        }).then(function (result) {
+          result.profiles.forEach(function (profile) {
+            var option = document.createElement('option');
+            option.value = profile;
+            option.textContent = profile === 'legacy' ? 'Original profile' : 'Fresh profile ' + profile.slice(0, 8);
+            if (profile === result.current) option.textContent += ' (current)';
+            element('profile').appendChild(option);
+          });
+          element('profile').value = result.current;
+        }).catch(function () { status.textContent = 'Could not load saved profiles; fresh start and recovery are still available.'; });
       }
       tick();
     })();

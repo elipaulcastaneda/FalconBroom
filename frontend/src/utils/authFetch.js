@@ -1,9 +1,13 @@
 import { BACKEND } from '../config'
-import supabase, { isDeletionTestEnabled, testDeletionPublishableKey } from '../supabaseClient'
+import supabase, { desktopAccountPublishableKey, isDeletionTestEnabled, testDeletionPublishableKey } from '../supabaseClient'
 import tokenStore from '../tokenStore'
 
 export default async function authFetch(url, opts = {}) {
   if (!opts.headers) opts.headers = {}
+  if (desktopAccountPublishableKey && !window.__FALCONBROOM_REMOTE_ACTIVE &&
+      (url.startsWith(`${BACKEND}/`) || (window.__FALCONBROOM_CONTROL_URL && url.startsWith(`${window.__FALCONBROOM_CONTROL_URL}/`)))) {
+    opts.headers['X-FalconBroom-Account-Publishable-Key'] = desktopAccountPublishableKey
+  }
   if (isDeletionTestEnabled && (url === `${BACKEND}/inspect` || url === `${BACKEND}/upload` || url === `${BACKEND}/desktop/upload-stream` || url === `${BACKEND}/me`)) {
     opts.headers['X-FalconBroom-Test-Publishable-Key'] = testDeletionPublishableKey
   }

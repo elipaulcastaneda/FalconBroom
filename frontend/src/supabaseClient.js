@@ -7,6 +7,7 @@ const SUPABASE_URL = clean(import.meta.env.VITE_SUPABASE_URL)
 const SUPABASE_ANON_KEY = clean(import.meta.env.VITE_SUPABASE_ANON_KEY)
 
 export const supabaseConfigured = /^https?:\/\//.test(SUPABASE_URL) && !!SUPABASE_ANON_KEY
+export const desktopAccountPublishableKey = isDesktop ? SUPABASE_ANON_KEY : null
 export const isDeletionTestProject = isDesktop && SUPABASE_URL.replace(/\/$/, '') === 'https://zthtkoekvxplppxanwiu.supabase.co'
 export const isDeletionTestEnabled = isDeletionTestProject && import.meta.env.VITE_FALCONBROOM_TEST_ACCOUNT_DELETION === '1'
 export const testDeletionPublishableKey = isDeletionTestProject ? SUPABASE_ANON_KEY : null

@@ -1,5 +1,6 @@
 import React from "react"
 import { createRoot } from "react-dom/client"
+import { watchDesktopAccount } from "./desktopAccountSwitch.mjs"
 import "./styles.css"
 
 const rootEl = document.getElementById("root")
@@ -51,12 +52,21 @@ window.addEventListener("error", (e) => {
   if (!rootEl.hasChildNodes()) showStartupError(e.error || e.message)
 })
 
+function DesktopAccountBoundary({ App, supabase, isDesktop }) {
+  const [accountId, setAccountId] = React.useState(null)
+  React.useEffect(() => {
+    if (!isDesktop) return
+    return watchDesktopAccount(supabase.auth, setAccountId)
+  }, [isDesktop, supabase])
+  return <App key={isDesktop ? accountId || "signed-out" : "web"} />
+}
+
 // App is imported dynamically so an error while loading its modules is shown instead of a blank window.
-import("./App")
-  .then(({ default: App }) => {
+Promise.all([import("./App"), import("./supabaseClient"), import("./credentialStorage")])
+  .then(([{ default: App }, { default: supabase }, { isDesktop }]) => {
     createRoot(rootEl).render(
       <ErrorBoundary>
-        <App />
+        <DesktopAccountBoundary App={App} supabase={supabase} isDesktop={isDesktop} />
       </ErrorBoundary>,
     )
   })

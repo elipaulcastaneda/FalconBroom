@@ -210,6 +210,70 @@ def test_source_upload_streams_large_payload_and_reports_exact_size(tmp_path, mo
     assert uploaded_path.read_bytes() == payload
 
 
+@pytest.mark.parametrize("stored", [
+    [],
+    [{"text": "Original upload suggestion", "json_steps": [{"action": "cast", "column": "amount"}]}],
+])
+def test_metadata_preserves_saved_plain_language_suggestions(tmp_path, monkeypatch, stored):
+    import json
+    import fbroom.main as main_module
+
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    monkeypatch.setattr(main_module, "UPLOAD_DIR", upload_dir)
+    client = TestClient(app)
+    upload = client.post(
+        "/upload",
+        files={"file": ("source.csv", b"amount\n1\n2\n", "text/csv")},
+    )
+    assert upload.status_code == 200, upload.text
+    path = upload.json()["normalized_path"]
+    metadata_path = Path(path).with_suffix(".json")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["plain_language_suggestions"] = stored
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    monkeypatch.setattr(
+        main_module, "generate_plain_language_suggestions",
+        lambda metadata: [{"text": "Different regenerated suggestion"}],
+    )
+
+    response = client.post("/metadata", json={"path": path})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["metadata"]["plain_language_suggestions"] == stored
+
+
+@pytest.mark.parametrize("stored", [None, "invalid"])
+def test_metadata_generates_suggestions_for_legacy_or_invalid_snapshot(tmp_path, monkeypatch, stored):
+    import json
+    import fbroom.main as main_module
+
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    monkeypatch.setattr(main_module, "UPLOAD_DIR", upload_dir)
+    client = TestClient(app)
+    upload = client.post(
+        "/upload",
+        files={"file": ("source.csv", b"amount\n1\n2\n", "text/csv")},
+    )
+    assert upload.status_code == 200, upload.text
+    path = upload.json()["normalized_path"]
+    metadata_path = Path(path).with_suffix(".json")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if stored is None:
+        metadata.pop("plain_language_suggestions", None)
+    else:
+        metadata["plain_language_suggestions"] = stored
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    generated = [{"text": "Regenerated legacy suggestion"}]
+    monkeypatch.setattr(main_module, "generate_plain_language_suggestions", lambda metadata: generated)
+
+    response = client.post("/metadata", json={"path": path})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["metadata"]["plain_language_suggestions"] == generated
+
+
 def test_source_upload_and_metadata_refresh_with_integer_keys_retains_suggestions(tmp_path, monkeypatch):
     import fbroom.main as main_module
 

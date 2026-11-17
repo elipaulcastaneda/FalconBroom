@@ -1,6 +1,6 @@
 import React, {useMemo, useRef, useState, useEffect} from "react"
 import { BACKEND } from './config'
-import authFetch from './utils/authFetch'
+import authFetchBase from './utils/authFetch'
 import PrivacyAdmin from './PrivacyAdmin'
 import SignIn from './components/SignIn'
 import SignOut from './components/SignOut'
@@ -10,6 +10,8 @@ import tokenStore from './tokenStore'
 import { readAnalyticsConsent, saveAnalyticsConsent, shouldLoadAnalytics } from './analyticsConsent.mjs'
 import { fetchEncryptedZip } from './encryptedDownload.mjs'
 import { uploadRequest } from './uploadRequest.mjs'
+import { createDesktopWorkflowStore } from './desktopWorkflowStore.mjs'
+import { bindAccountFetch } from './accountBoundFetch.mjs'
 import { isDesktop } from './credentialStorage'
 import { isDeletionTestProject, isDeletionTestEnabled, testDeletionPublishableKey } from './supabaseClient'
 import { checkCoordinatedTestDeletion, hasPendingBrowserDeletion, startCoordinatedTestDeletion, testWorkflowKey, writeCoordinatedWorkflowData } from './testDeletionBrowserReview.mjs'
@@ -39,9 +41,9 @@ function EncryptedExportOptions({ enabled, setEnabled, password, setPassword, co
   </div>
 }
 
-async function downloadEncrypted(payload, password) {
+async function downloadEncrypted(payload, password, request) {
   if (!isDesktop || window.__FALCONBROOM_REMOTE_ACTIVE) throw new Error('Encrypted downloads require the local desktop backend.')
-  const blob = await fetchEncryptedZip(window.__FALCONBROOM_CONTROL_URL, payload, password, authFetch)
+  const blob = await fetchEncryptedZip(window.__FALCONBROOM_CONTROL_URL, payload, password, request)
   const url = URL.createObjectURL(blob)
   try {
     const link = document.createElement('a')
@@ -63,12 +65,12 @@ function PathBasename(p){
   }catch(e){ return p }
 }
 
-function DownloadLink({ url, label, onError }){
+function DownloadLink({ url, label, onError, request }){
   async function handleClick(e){
     e && e.preventDefault && e.preventDefault()
     // Fetch through the app session and trigger a blob download.
     try{
-      const res = await authFetch(url, { credentials: 'include' })
+      const res = await request(url, { credentials: 'include' })
       if (!res.ok) throw new Error('Download failed')
       const blob = await res.blob()
       // try to parse filename from content-disposition
@@ -107,6 +109,7 @@ function DownloadLink({ url, label, onError }){
   // end DownloadLink
 // Team collaboration is disabled while FalconBroom is limited to individual accounts.
 const TEAM_ENABLED = false
+const accountWorkflowEnabled = isDesktop && !window.__FALCONBROOM_REMOTE_ACTIVE && !isDeletionTestEnabled
 const REMOTE_SERVICE_OPTIONS = [
   ['remote_backend', 'Remote processing backend', 'Allows a configured HTTPS backend to process files remotely.'],
   ['google_drive', 'Google Drive and Sheets', 'Allows Google Drive imports and supported Google data operations.'],
@@ -166,6 +169,7 @@ function formatCount(value) {
 
 function loadUploadHistory(owner) {
   try {
+    if (accountWorkflowEnabled) return []
     if (isDeletionTestEnabled && !owner) return []
     const raw = window.localStorage.getItem(isDeletionTestEnabled ? testWorkflowKey(owner, 'history') : "falconbroom-upload-history")
     if (!raw) return []
@@ -180,6 +184,7 @@ function loadUploadHistory(owner) {
 
 function loadUploadDrafts(owner) {
   try {
+    if (accountWorkflowEnabled) return {}
     if (isDeletionTestEnabled && !owner) return {}
     const parsed = JSON.parse(window.localStorage.getItem(isDeletionTestEnabled ? testWorkflowKey(owner, 'drafts') : "falconbroom-upload-drafts") || "{}")
     if (isDeletionTestEnabled && (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))) throw new Error('Invalid test workflow drafts')
@@ -192,6 +197,7 @@ function loadUploadDrafts(owner) {
 
 function loadWorkflowCheckpoints(userId, owner) {
   try {
+    if (accountWorkflowEnabled) return []
     if (isDeletionTestEnabled && !owner) return []
     const key = isDeletionTestEnabled ? testWorkflowKey(owner, 'checkpoints') : `falconbroom-workflow-checkpoints:${userId || "local"}`
     const parsed = JSON.parse(window.localStorage.getItem(key) || "[]")
@@ -451,8 +457,16 @@ export default function App() {
   const [showPrivacyNotice, setShowPrivacyNotice] = useState(false)
   const [refreshingAuth, setRefreshingAuth] = useState(false)
   const [accountUser, setAccountUser] = useState(null)
+  const authFetch = React.useMemo(
+    () => bindAccountFetch(authFetchBase, isDesktop && !window.__FALCONBROOM_REMOTE_ACTIVE ? accountUser?.id : null),
+    [accountUser?.id],
+  )
   const [workflowOwner, setWorkflowOwner] = useState(null)
   const workflowAccount = useRef(null)
+  const desktopWorkflowStore = useRef(null)
+  const [workflowStorageError, setWorkflowStorageError] = useState('')
+  const [workflowLoadAttempt, setWorkflowLoadAttempt] = useState(0)
+  const [interruptedWorkflowSave, setInterruptedWorkflowSave] = useState(false)
   workflowAccount.current = typeof accountUser?.id === 'string' ? accountUser.id.toLowerCase() : null
   const [testDeletions, setTestDeletions] = useState([])
   const [browserRecoveryError, setBrowserRecoveryError] = useState('')
@@ -462,6 +476,13 @@ export default function App() {
   })
   const workflowSaveWarning = useRef(false)
   const { accountUser: remoteAccountUser, loading: accountLoading, reload: reloadAccount } = useAccountUser()
+
+  useEffect(() => {
+    if (window.__FALCONBROOM_INTERRUPTED_WORKFLOW_SAVE) {
+      setInterruptedWorkflowSave(true)
+      window.__FALCONBROOM_INTERRUPTED_WORKFLOW_SAVE = false
+    }
+  }, [])
 
   useEffect(() => {
     if (!isDeletionTestEnabled || !workflowAccount.current || workflowOwner) return
@@ -476,6 +497,37 @@ export default function App() {
       addToast('Workflow data is unavailable because the test account identity is invalid.', 'warn', 9000)
     }
   }, [accountUser, workflowOwner])
+
+  useEffect(() => {
+    if (!accountWorkflowEnabled || !workflowAccount.current) return
+    const owner = workflowAccount.current
+    let active = true
+    setWorkflowOwner(null)
+    setWorkflowStorageError('')
+    const store = createDesktopWorkflowStore(owner, BACKEND, authFetch, error => {
+      if (active) {
+        console.error('Account workflow save failed', error)
+        setWorkflowStorageError('Workflow saves are paused. Copy any unsaved changes and restart the app before continuing.')
+      }
+    })
+    desktopWorkflowStore.current = store
+    store.load().then(() => {
+      if (!active || workflowAccount.current !== owner) return
+      setUploadHistory(store.get('history'))
+      setWorkflowCheckpoints(store.get('checkpoints'))
+      setWorkflowOwner(owner)
+    }).catch(error => {
+      if (active) {
+        console.error('Account workflow load failed', error)
+        setWorkflowStorageError('Could not load encrypted account workflow data. Check your connection and retry.')
+      }
+    })
+    return () => {
+      active = false
+      if (store.close()) window.__FALCONBROOM_INTERRUPTED_WORKFLOW_SAVE = true
+      if (desktopWorkflowStore.current === store) desktopWorkflowStore.current = null
+    }
+  }, [accountUser?.id, workflowLoadAttempt])
 
   // sync remote-loaded account into local state so existing code can call setAccountUser
   useEffect(() => {
@@ -650,6 +702,61 @@ export default function App() {
   const [remoteServicesError, setRemoteServicesError] = useState('')
   const [remoteServicesSaving, setRemoteServicesSaving] = useState(false)
   const [remoteServicesSaved, setRemoteServicesSaved] = useState(false)
+  const [vaultProfiles, setVaultProfiles] = useState(null)
+  const [vaultProfile, setVaultProfile] = useState('')
+  const [vaultProfileConfirmation, setVaultProfileConfirmation] = useState('')
+  const [recoveryPassphrase, setRecoveryPassphrase] = useState('')
+  const [recoveryConfirmation, setRecoveryConfirmation] = useState('')
+  const [recoveryBusy, setRecoveryBusy] = useState(false)
+  const [recoveryStatus, setRecoveryStatus] = useState('')
+  async function loadVaultProfiles() {
+    try {
+      const response = await fetch(`${window.__FALCONBROOM_CONTROL_URL}/desktop/vault/profiles`)
+      if (!response.ok) throw new Error(`Could not load profiles (${response.status})`)
+      const result = await response.json()
+      setVaultProfiles(result)
+      setVaultProfile(result.current)
+    } catch (error) {
+      setRecoveryStatus(String(error.message || error))
+    }
+  }
+  async function exportVaultRecovery() {
+    setRecoveryBusy(true)
+    setRecoveryStatus('')
+    try {
+      const destination = await window.__TAURI_INTERNALS__.invoke('choose_recovery_export_path')
+      if (!destination) return
+      const response = await fetch(`${window.__FALCONBROOM_CONTROL_URL}/desktop/vault/export`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({destination, passphrase: recoveryPassphrase}),
+      })
+      if (!response.ok) throw new Error((await response.json()).detail || 'Recovery export failed')
+      setRecoveryStatus(`Recovery file saved to ${destination}. Keep it and the passphrase separate from your encrypted-data backup.`)
+      setRecoveryPassphrase('')
+      setRecoveryConfirmation('')
+    } catch (error) {
+      setRecoveryStatus(String(error.message || error))
+    } finally {
+      setRecoveryBusy(false)
+    }
+  }
+  async function openVaultProfile() {
+    setRecoveryBusy(true)
+    setRecoveryStatus('')
+    try {
+      const response = await fetch(`${window.__FALCONBROOM_CONTROL_URL}/desktop/vault/select`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({profile: vaultProfile, confirmation: vaultProfileConfirmation}),
+      })
+      if (!response.ok) throw new Error((await response.json()).detail || 'Could not select profile')
+      setRecoveryStatus('Profile selected. Close all FalconBroom windows and restart to open it.')
+    } catch (error) {
+      setRecoveryStatus(String(error.message || error))
+      setRecoveryBusy(false)
+    }
+  }
   async function loadRemoteServices() {
     try {
       const response = await fetch(`${window.__FALCONBROOM_CONTROL_URL}/desktop/remote-services`)
@@ -663,7 +770,10 @@ export default function App() {
     }
   }
   useEffect(() => {
-    if (isDesktop && activeTab === 'settings') loadRemoteServices()
+    if (isDesktop && activeTab === 'settings') {
+      loadRemoteServices()
+      if (!window.__FALCONBROOM_REMOTE_ACTIVE) loadVaultProfiles()
+    }
   }, [activeTab])
   async function saveRemoteServices() {
     setRemoteServicesSaving(true)
@@ -703,6 +813,50 @@ export default function App() {
       }).catch(report)
     } catch (error) {
       report(error)
+    }
+  }
+
+  function readWorkflowData(kind) {
+    if (accountWorkflowEnabled) {
+      if (!desktopWorkflowStore.current || workflowOwner !== workflowAccount.current) {
+        throw new Error('Account workflow storage is unavailable')
+      }
+      return desktopWorkflowStore.current.get(kind)
+    }
+    if (kind === 'checkpoints') return loadWorkflowCheckpoints(userId, workflowOwner)
+    if (kind === 'drafts') return loadUploadDrafts(workflowOwner)
+    return loadUploadHistory(workflowOwner)
+  }
+
+  function updateWorkflowData(kind, change) {
+    const updateDisplay = next => {
+      if (kind === 'checkpoints') setWorkflowCheckpoints(next)
+      if (kind === 'history') setUploadHistory(next)
+    }
+    if (accountWorkflowEnabled) {
+      try {
+        if (!desktopWorkflowStore.current || workflowOwner !== workflowAccount.current) {
+          throw new Error('Account workflow storage is unavailable')
+        }
+        updateDisplay(desktopWorkflowStore.current.update(kind, change))
+      } catch (error) {
+        console.error('Account workflow save failed', error)
+        setWorkflowStorageError('Workflow saves are paused. Copy any unsaved changes and restart the app before continuing.')
+      }
+      return
+    }
+    try {
+      return writeWorkflowData(() => {
+        const next = change(readWorkflowData(kind))
+        const key = isDeletionTestEnabled ? testWorkflowKey(workflowOwner, kind)
+          : kind === 'checkpoints' ? `falconbroom-workflow-checkpoints:${userId || "local"}`
+            : kind === 'drafts' ? 'falconbroom-upload-drafts' : 'falconbroom-upload-history'
+        window.localStorage.setItem(key, JSON.stringify(next))
+        updateDisplay(next)
+      })
+    } catch (error) {
+      console.error('Workflow save failed', error)
+      addToast('Workflow data could not be saved.', 'warn', 9000)
     }
   }
 
@@ -751,11 +905,9 @@ export default function App() {
       ? (snapshot.path || "untitled")
       : `${snapshot.leftPath || "no-left"}::${snapshot.rightPath || "no-right"}`
     const id = `${kind}:${identity}`
-    writeWorkflowData(() => {
-      const storageKey = isDeletionTestEnabled ? testWorkflowKey(workflowOwner, 'checkpoints') : `falconbroom-workflow-checkpoints:${userId || "local"}`
-      const checkpoints = loadWorkflowCheckpoints(userId, workflowOwner)
+    updateWorkflowData('checkpoints', checkpoints => {
       const existing = checkpoints.find((item) => item.id === id)
-      const timeline = existing?.timeline || []
+      const timeline = [...(existing?.timeline || [])]
       if (actionLabel) {
         timeline.push({ id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, label: actionLabel, at: new Date().toISOString() })
       }
@@ -766,35 +918,21 @@ export default function App() {
         state: snapshot,
         timeline: timeline.slice(-30),
       }
-      const next = [checkpoint, ...checkpoints.filter((item) => item.id !== id)]
+      return [checkpoint, ...checkpoints.filter((item) => item.id !== id)]
         .sort((a, b) => String(b.updated_at || "").localeCompare(String(a.updated_at || "")))
         .slice(0, 12)
-      try {
-        window.localStorage.setItem(storageKey, JSON.stringify(next))
-        setWorkflowCheckpoints(next)
-      } catch (e) {
-        console.warn("Workflow checkpoint could not be saved", e)
-      }
     })
   }
 
   function appendWorkflowCheckpointEvent(id, label) {
-    writeWorkflowData(() => {
-      const checkpoints = loadWorkflowCheckpoints(userId, workflowOwner)
-      const next = checkpoints.map((item) => item.id === id
+    updateWorkflowData('checkpoints', checkpoints =>
+      checkpoints.map((item) => item.id === id
         ? {
             ...item,
             updated_at: new Date().toISOString(),
             timeline: [...(item.timeline || []), { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, label, at: new Date().toISOString() }].slice(-30),
           }
-        : item)
-      try {
-        window.localStorage.setItem(isDeletionTestEnabled ? testWorkflowKey(workflowOwner, 'checkpoints') : `falconbroom-workflow-checkpoints:${userId || "local"}`, JSON.stringify(next))
-        setWorkflowCheckpoints(next)
-      } catch (e) {
-        console.warn("Workflow timeline event could not be saved", e)
-      }
-    })
+        : item))
   }
 
   function recordWorkflowAction(kind, label) {
@@ -853,15 +991,7 @@ export default function App() {
   }
 
   function deleteWorkflowCheckpoint(id) {
-    writeWorkflowData(() => {
-      const next = loadWorkflowCheckpoints(userId, workflowOwner).filter((item) => item.id !== id)
-      try {
-        window.localStorage.setItem(isDeletionTestEnabled ? testWorkflowKey(workflowOwner, 'checkpoints') : `falconbroom-workflow-checkpoints:${userId || "local"}`, JSON.stringify(next))
-        setWorkflowCheckpoints(next)
-      } catch (e) {
-        console.warn("Workflow checkpoint could not be deleted", e)
-      }
-    })
+    updateWorkflowData('checkpoints', checkpoints => checkpoints.filter(item => item.id !== id))
   }
 
   function renderWorkflowCheckpointPanel(kind) {
@@ -976,8 +1106,7 @@ export default function App() {
 
   function persistUploadHistory(nextHistory) {
     const trimmed = nextHistory.slice(0, 8)
-    setUploadHistory(trimmed)
-    writeWorkflowData(() => window.localStorage.setItem(isDeletionTestEnabled ? testWorkflowKey(workflowOwner, 'history') : "falconbroom-upload-history", JSON.stringify(trimmed)))
+    updateWorkflowData('history', () => trimmed)
   }
 
   // Admin metrics dashboard: parses Prometheus metrics and shows key values
@@ -1902,7 +2031,7 @@ export default function App() {
   async function doDsarVerify() {
     try {
       if (!dsarToken) { addToast('Enter verification token', 'error'); return }
-      const res = await fetch(`${BACKEND}/dsar/verify`, { method: 'POST', headers: { 'Content-Type':'application/json' }, body: JSON.stringify({ token: dsarToken }) })
+      const res = await authFetch(`${BACKEND}/dsar/verify`, { method: 'POST', headers: { 'Content-Type':'application/json' }, body: JSON.stringify({ token: dsarToken }) })
       if (!res.ok) { const t = await res.text(); addToast('Verify failed: ' + t, 'error'); return }
       const j = await res.json()
       addToast('DSAR verified: ' + j.dsar_id, 'success')
@@ -2115,20 +2244,12 @@ export default function App() {
   }
 
   React.useEffect(() => {
-    fetchUploads()
-  }, [])
+    if (!isDesktop || window.__FALCONBROOM_REMOTE_ACTIVE || workflowOwner) fetchUploads()
+  }, [workflowOwner])
 
   React.useEffect(() => {
     if (activeTab !== "uploads" || !showCustomRevisions || !path) return
-    writeWorkflowData(() => {
-      try {
-        const drafts = loadUploadDrafts(workflowOwner)
-        drafts[path] = { instruction, recipeText }
-        window.localStorage.setItem(isDeletionTestEnabled ? testWorkflowKey(workflowOwner, 'drafts') : "falconbroom-upload-drafts", JSON.stringify(drafts))
-      } catch (error) {
-        if (isDeletionTestEnabled) throw error
-      }
-    })
+    updateWorkflowData('drafts', drafts => ({ ...drafts, [path]: { instruction, recipeText } }))
   }, [activeTab, showCustomRevisions, path, instruction, recipeText])
 
   React.useEffect(() => {
@@ -2530,7 +2651,7 @@ export default function App() {
     const sameFileWorkspace = path === item.path
     const draft = sameFileWorkspace
       ? { instruction, recipeText }
-      : loadUploadDrafts(workflowOwner)[item.path]
+      : readWorkflowData('drafts')[item.path]
     setPath(item.path)
     if (!preserveRecipe) {
       setInstruction(draft?.instruction || "")
@@ -2979,7 +3100,7 @@ export default function App() {
       setApplyRes((prev)=> ({...(prev||{}), last_export: j.export_path}))
       if (joinEncrypted) {
         if (!j.export_path) throw new Error('The join output path is missing')
-        await downloadEncrypted({path: j.export_path}, joinPassword)
+        await downloadEncrypted({path: j.export_path}, joinPassword, authFetch)
         addToast('Encrypted ZIP download started', 'success')
         return
       }
@@ -3067,7 +3188,7 @@ export default function App() {
         }
       } catch (e) {}
 
-      const res = await fetch(url, {
+      const res = await authFetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(recipe),
@@ -3526,7 +3647,7 @@ export default function App() {
         return
       }
       if (sourceEncrypted) {
-        await downloadEncrypted({path: out}, sourcePassword)
+        await downloadEncrypted({path: out}, sourcePassword, authFetch)
         addToast('Encrypted ZIP download started', 'success')
         return
       }
@@ -3623,9 +3744,8 @@ export default function App() {
     // If we don't have a delete token, request one automatically.
     if (!downloadToken) {
       try {
-        const token = await tokenStore.getAccess()
         const backendBase = (BACKEND === '/api' ? 'http://127.0.0.1:3009' : BACKEND)
-        const r = await fetch(`${backendBase}/admin/history/request_delete_token`, { method: 'POST', headers: { 'Authorization': token ? `Bearer ${token}` : '' } })
+        const r = await authFetch(`${backendBase}/admin/history/request_delete_token`, { method: 'POST' })
         if (!r.ok) {
           const t = await r.text()
           addToast('Request delete token failed: ' + t, 'error')
@@ -3768,7 +3888,7 @@ export default function App() {
       })
       const csv = [header, ...csvRows].join('\n')
       if (sourceEncrypted) {
-        await downloadEncrypted({preview_csv: csv}, sourcePassword)
+        await downloadEncrypted({preview_csv: csv}, sourcePassword, authFetch)
         recordWorkflowAction("source", "Encrypted preview downloaded")
         addToast('Encrypted ZIP download started', 'success')
         return
@@ -3978,7 +4098,7 @@ export default function App() {
                               <div>Started: {r.started_at}</div>
                               {r.finished_at && <div>Finished: {r.finished_at}</div>}
                               {r.output_path && (
-                                <div>Output: <small>{r.output_path}</small> <DownloadLink url={`${BACKEND}/download?path=${encodeURIComponent(r.output_path)}`} label="Download" /></div>
+                                <div>Output: <small>{r.output_path}</small> <DownloadLink request={authFetch} url={`${BACKEND}/download?path=${encodeURIComponent(r.output_path)}`} label="Download" /></div>
                               )}
                               {r.warnings && <div style={{color:'#f59e0b'}}>Warnings: {JSON.stringify(r.warnings)}</div>}
                             </div>
@@ -4006,7 +4126,7 @@ export default function App() {
                             <div>Started: {r.started_at}</div>
                             {r.finished_at && <div>Finished: {r.finished_at}</div>}
                             {r.output_path && (
-                              <div>Output: <small>{r.output_path}</small> <DownloadLink url={`${BACKEND}/download?path=${encodeURIComponent(r.output_path)}`} label="Download" /></div>
+                              <div>Output: <small>{r.output_path}</small> <DownloadLink request={authFetch} url={`${BACKEND}/download?path=${encodeURIComponent(r.output_path)}`} label="Download" /></div>
                             )}
                             {r.warnings && <div style={{color:'#f59e0b'}}>Warnings: {JSON.stringify(r.warnings)}</div>}
                           </div>
@@ -4305,7 +4425,7 @@ export default function App() {
             </div>
             <EncryptedExportOptions enabled={joinEncrypted} setEnabled={setJoinEncrypted} password={joinPassword} setPassword={setJoinPassword} confirmation={joinPasswordConfirmation} setConfirmation={setJoinPasswordConfirmation} />
             {applyRes && applyRes.last_export ? (
-              <div style={{marginTop:8}}>Unencrypted download: <DownloadLink url={`${BACKEND}/download?path=${encodeURIComponent(applyRes.last_export)}`} label={applyRes.last_export} /></div>
+              <div style={{marginTop:8}}>Unencrypted download: <DownloadLink request={authFetch} url={`${BACKEND}/download?path=${encodeURIComponent(applyRes.last_export)}`} label={applyRes.last_export} /></div>
             ) : null}
           </Card>
         </div>
@@ -4344,14 +4464,14 @@ export default function App() {
                           {item.warnings && item.warnings.length > 0 && <small style={{display:'inline-block',marginRight:12,color:'var(--muted)'}}>Warnings: {item.warnings.length}</small>}
                                       {item.path && (
                                         <small style={{display:'inline-block',marginRight:12}}>
-                                          <DownloadLink url={`${BACKEND}/download?path=${encodeURIComponent(item.path)}`} label={'Download CSV'} />
+                                          <DownloadLink request={authFetch} url={`${BACKEND}/download?path=${encodeURIComponent(item.path)}`} label={'Download CSV'} />
                                         </small>
                                       )}
                           {item.metadata_paths && item.metadata_paths.length > 0 && (
                             <small style={{display:'block',marginTop:6}}>
                               {item.metadata_paths.map((mp) => (
                                 <span key={mp} style={{display:'inline-block',marginRight:8}}>
-                                  <DownloadLink url={`${BACKEND}/download?path=${encodeURIComponent(mp)}`} label={'Recipe JSON'} />
+                                  <DownloadLink request={authFetch} url={`${BACKEND}/download?path=${encodeURIComponent(mp)}`} label={'Recipe JSON'} />
                                 </span>
                               ))}
                             </small>
@@ -4360,7 +4480,7 @@ export default function App() {
                             <small style={{display:'block',marginTop:6,color:'var(--muted)'}}>
                               Related: {item.related_files.map((rf, idx) => (
                                 <span key={rf} style={{marginRight:8}}>
-                                  <DownloadLink url={`${BACKEND}/download?path=${encodeURIComponent(rf)}`} label={PathBasename(rf) || rf} />
+                                  <DownloadLink request={authFetch} url={`${BACKEND}/download?path=${encodeURIComponent(rf)}`} label={PathBasename(rf) || rf} />
                                 </span>
                               ))}
                             </small>
@@ -4625,6 +4745,22 @@ export default function App() {
           </Card>
           <Card eyebrow="Account" title="Settings" subtitle="Manage your account and privacy preferences">
             <div style={{display:'grid',gridTemplateColumns:'1fr',gap:12}}>
+              {isDesktop && !window.__FALCONBROOM_REMOTE_ACTIVE && <div>
+                <h4>Desktop vault recovery</h4>
+                <p>Save an encrypted recovery key outside FalconBroom app data. Use a long, randomly generated passphrase and keep it separately. The key file is not a backup of your data; back up the encrypted files too. Inspection records may also depend on this Windows profile.</p>
+                <label>Recovery passphrase <input type="password" autoComplete="new-password" value={recoveryPassphrase} onChange={event => setRecoveryPassphrase(event.target.value)} /></label>
+                <label>Repeat passphrase <input type="password" autoComplete="new-password" value={recoveryConfirmation} onChange={event => setRecoveryConfirmation(event.target.value)} /></label>
+                <button disabled={recoveryBusy || recoveryPassphrase.length < 20 || recoveryPassphrase !== recoveryConfirmation} onClick={exportVaultRecovery}>Export encrypted recovery key</button>
+                <p>Export a separate recovery key for each profile before deleting app data. Close older app versions and workers before switching profiles. Your account data remains separated within each profile.</p>
+                {vaultProfiles && <div>
+                  <label>Profile <select value={vaultProfile} onChange={event => setVaultProfile(event.target.value)}>
+                    {vaultProfiles.profiles.map(profile => <option key={profile} value={profile}>{profile === 'legacy' ? 'Original profile' : `Fresh profile ${profile.slice(0, 8)}`}{profile === vaultProfiles.current ? ' (current)' : ''}</option>)}
+                  </select></label>
+                  <label>Type OPEN PROFILE to switch <input value={vaultProfileConfirmation} onChange={event => setVaultProfileConfirmation(event.target.value)} /></label>
+                  <button disabled={recoveryBusy || vaultProfile === vaultProfiles.current || vaultProfileConfirmation !== 'OPEN PROFILE'} onClick={openVaultProfile}>Open selected profile</button>
+                </div>}
+                {recoveryStatus && <p role="status">{recoveryStatus}</p>}
+              </div>}
               {isDesktop && <div>
                 <h4>Optional remote services</h4>
                 <p>These preferences apply to this desktop profile. Supabase sign-in still uses the internet. Cloud-synced folders, independently started workers, and other applications are not controlled here.</p>
@@ -4691,7 +4827,7 @@ export default function App() {
               </div>
               {isDesktop && <div>
                 <h4>Protect existing inspection records</h4>
-                <p>New inspections use Windows user-bound protection. Uploads, recipes, history, snapshots and outputs from supported processing routes are encrypted, and existing files in those folders migrate on startup. Older consent and audit records, other logs, outputs, backups and exports may remain plaintext. Processing creates plaintext temporary files; abandoned protected workspaces are cleaned on startup, but older untracked files and other remnants may remain. These protections do not stop software running as your Windows user, and losing access to this Windows profile can make protected data unreadable. Back up your workspace before upgrading or migrating older inspections.</p>
+                <p>New inspections use Windows user-bound protection. Uploads, recipes, history, snapshots and outputs from supported processing routes are encrypted. Existing shared workspace files are not automatically migrated or assigned to an account. Older consent and audit records, other logs, outputs, backups and exports may remain plaintext. Processing creates plaintext temporary files; abandoned protected workspaces are cleaned on startup, but older untracked files and other remnants may remain. These protections do not stop software running as your Windows user, and losing access to this Windows profile can make protected data unreadable. Back up your workspace before upgrading or migrating older inspections.</p>
                 <label style={{display:'flex',flexDirection:'column',gap:6}}>
                   <span>After backing up, type exactly: PROTECT INSPECTIONS</span>
                   <input value={inspectionProtectionConfirmation} onChange={(e) => setInspectionProtectionConfirmation(e.target.value)} />
@@ -4935,7 +5071,7 @@ export default function App() {
                     <button onClick={() => setShowPrivacyAdmin(s => !s)}>{showPrivacyAdmin ? 'Hide' : 'Manage'} privacy inventory & DPIAs</button>
                   </div>
                 )}
-                {showPrivacyAdmin && (accountUser && (accountUser.role === 'admin' || accountUser.is_admin)) && <PrivacyAdmin addToast={addToast} />}
+                {showPrivacyAdmin && (accountUser && (accountUser.role === 'admin' || accountUser.is_admin)) && <PrivacyAdmin addToast={addToast} authFetch={authFetch} />}
 
                 {accountUser && (accountUser.role === 'admin' || accountUser.is_admin) && (
                   <div style={{marginTop:18}}>
@@ -4953,7 +5089,7 @@ export default function App() {
                               {adminExports.length===0 ? <div className="empty-state">No exports</div> : adminExports.map(e=> (
                                 <div key={e.path} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'4px 0'}}>
                                   <div style={{fontSize:12}}>{e.name}</div>
-                                  <div><DownloadLink url={`${BACKEND}/admin/audit/download?path=${encodeURIComponent(e.path)}`} label="Download" onError={error => addToast('Download failed: ' + error.message, 'error')} /></div>
+                                  <div><DownloadLink request={authFetch} url={`${BACKEND}/admin/audit/download?path=${encodeURIComponent(e.path)}`} label="Download" onError={error => addToast('Download failed: ' + error.message, 'error')} /></div>
                                 </div>
                               ))}
                             </div>
@@ -4966,7 +5102,7 @@ export default function App() {
                                   <div style={{fontSize:12}} onClick={()=>setSelectedLog(l.path)}>{l.dir}/{l.name}</div>
                                   <div style={{display:'flex',gap:6}}>
                                     <button onClick={()=>{ setSelectedLog(l.path); verifyChain(l.path); }}>Verify</button>
-                                    <DownloadLink url={`${BACKEND}/admin/audit/download?path=${encodeURIComponent(l.path)}`} label="Download" onError={error => addToast('Download failed: ' + error.message, 'error')} />
+                                    <DownloadLink request={authFetch} url={`${BACKEND}/admin/audit/download?path=${encodeURIComponent(l.path)}`} label="Download" onError={error => addToast('Download failed: ' + error.message, 'error')} />
                                   </div>
                                 </div>
                               ))}
@@ -5144,6 +5280,7 @@ export default function App() {
   if (!accountUser) {
     return (
       <div className={`auth-page ${themeClass}`} data-theme={theme}>
+        {interruptedWorkflowSave && <p role="alert">An account change interrupted a workflow save. Recent changes may not have been saved.</p>}
         {isDeletionTestEnabled && browserDeletionPending && <div className="card">
           <p>Test account deletion recovery is pending. Workflow saves remain paused.</p>
           {browserRecoveryError && <p>Recovery check failed: {browserRecoveryError}</p>}
@@ -5160,8 +5297,19 @@ export default function App() {
     </div>
   }
 
+  if (accountWorkflowEnabled && (!workflowOwner || workflowOwner !== workflowAccount.current)) {
+    return <div className={`auth-page ${themeClass}`} data-theme={theme}>
+      {interruptedWorkflowSave && <p role="alert">An account change interrupted a workflow save. Recent changes may not have been saved.</p>}
+      <p>{workflowStorageError || 'Loading encrypted account workflow data...'}</p>
+      {workflowStorageError && <button onClick={() => setWorkflowLoadAttempt(n => n + 1)}>Retry</button>}
+      <button onClick={doLogout}>Sign out</button>
+    </div>
+  }
+
   return (
     <div className={`app-shell ${themeClass}`} data-theme={theme}>
+      {interruptedWorkflowSave && <div role="alert">An account change interrupted a workflow save. Recent changes may not have been saved.</div>}
+      {accountWorkflowEnabled && workflowStorageError && <div role="alert">{workflowStorageError}</div>}
       <header className="app-header">
         <div className="logo-wrap">
           <img src="/logo.svg" alt="FalconBroom logo" className="app-logo" />

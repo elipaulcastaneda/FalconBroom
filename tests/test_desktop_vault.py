@@ -13,7 +13,26 @@ import pyzipper
 
 from fastapi.testclient import TestClient
 
-from fbroom import desktop_vault, main as fb
+from fbroom import desktop_recovery, desktop_vault, main as fb
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
+def test_owned_recipe_source_supports_encrypted_desktop_upload(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    uploads = root / "uploads"
+    uploads.mkdir(parents=True)
+    monkeypatch.setattr(desktop_vault, "_root", None)
+    monkeypatch.setattr(desktop_vault, "_master_key", None)
+    monkeypatch.setattr(fb, "UPLOAD_DIR", uploads)
+    desktop_vault.initialize(root)
+    source = uploads / "source.csv"
+    desktop_vault.write_encrypted_bytes(source, b"column\nvalue\n")
+    fb._write_file_owner(source, {"id": "account-a"})
+
+    fb._require_owned_recipe_source(str(source), {"id": "account-a"})
+    with pytest.raises(fb.HTTPException) as error:
+        fb._require_owned_recipe_source(str(source), {"id": "account-b"})
+    assert error.value.status_code == 404
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
@@ -414,7 +433,7 @@ def test_missing_key_does_not_replace_encrypted_data(tmp_path, monkeypatch):
         lambda data, decrypt: (_ for _ in ()).throw(AssertionError("must not replace key")),
     )
 
-    with pytest.raises(desktop_vault.DesktopVaultError, match="key is missing"):
+    with pytest.raises(desktop_vault.DesktopVaultMissingKey, match="key is missing"):
         desktop_vault.initialize(root)
 
 
@@ -426,9 +445,183 @@ def test_corrupt_key_is_not_replaced(tmp_path, monkeypatch):
     desktop_vault.initialize(root)
     key_path = root / ".vault" / "master.dpapi"
     key_path.write_bytes(b"corrupt")
-    with pytest.raises(desktop_vault.DesktopVaultError, match="Could not unlock"):
+    with pytest.raises(desktop_vault.DesktopVaultError, match="Could not unlock") as error:
         desktop_vault.initialize(root)
+    assert not isinstance(error.value, desktop_vault.DesktopVaultMissingKey)
     assert key_path.read_bytes() == b"corrupt"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
+def test_recovery_restores_only_the_matching_missing_key(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    monkeypatch.setattr(desktop_vault, "_root", None)
+    monkeypatch.setattr(desktop_vault, "_master_key", None)
+    desktop_vault.initialize(root)
+    desktop_vault.write_encrypted_bytes(root / "private.csv", b"private data")
+    encrypted = root / "private.csv.fbenc"
+    original = encrypted.read_bytes()
+    key_path = root / ".vault" / "master.dpapi"
+    bundle = desktop_recovery.create_recovery_file("a long recovery passphrase 123")
+    assert b"private data" not in bundle
+    key_path.unlink()
+
+    with pytest.raises(desktop_vault.DesktopVaultError, match="incorrect"):
+        desktop_recovery.restore_key(root, bundle, "a different recovery passphrase")
+    assert not key_path.exists()
+    tampered = bundle[:-1] + bytes([bundle[-1] ^ 1])
+    with pytest.raises(desktop_vault.DesktopVaultError, match="incorrect"):
+        desktop_recovery.restore_key(root, tampered, "a long recovery passphrase 123")
+    assert not key_path.exists()
+
+    desktop_recovery.restore_key(root, bundle, "a long recovery passphrase 123")
+    desktop_vault.initialize(root)
+    assert desktop_vault.read_bytes(root / "private.csv") == b"private data"
+    assert encrypted.read_bytes() == original
+    with pytest.raises(desktop_vault.DesktopVaultError, match="will not be replaced"):
+        desktop_recovery.restore_key(root, bundle, "a long recovery passphrase 123")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
+def test_recovery_rejects_wrong_vault_and_missing_evidence(tmp_path, monkeypatch):
+    monkeypatch.setattr(desktop_vault, "_root", None)
+    monkeypatch.setattr(desktop_vault, "_master_key", None)
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    desktop_vault.initialize(first)
+    bundle = desktop_recovery.create_recovery_file("a long recovery passphrase 123")
+    desktop_vault.initialize(second)
+    desktop_vault.write_encrypted_bytes(second / "private.csv", b"another vault")
+    key_path = second / ".vault" / "master.dpapi"
+    key_path.unlink()
+    with pytest.raises(desktop_vault.DesktopVaultError, match="does not match"):
+        desktop_recovery.restore_key(second, bundle, "a long recovery passphrase 123")
+    assert not key_path.exists()
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(desktop_vault.DesktopVaultError, match="No encrypted vault records"):
+        desktop_recovery.restore_key(empty, bundle, "a long recovery passphrase 123")
+    assert not (empty / ".vault" / "master.dpapi").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
+def test_recovery_authenticates_all_encrypted_records(tmp_path, monkeypatch):
+    monkeypatch.setattr(desktop_vault, "_root", None)
+    monkeypatch.setattr(desktop_vault, "_master_key", None)
+    root = tmp_path / "data"
+    desktop_vault.initialize(root)
+    desktop_vault.write_encrypted_bytes(root / "valid", b"one")
+    bundle = desktop_recovery.create_recovery_file("a long recovery passphrase 123")
+    desktop_vault.write_encrypted_bytes(root / "invalid", b"two")
+    bad = root / "invalid.fbenc"
+    content = bytearray(bad.read_bytes())
+    content[desktop_vault._HEADER_SIZE - 1] ^= 1
+    bad.write_bytes(content)
+    key_path = root / ".vault" / "master.dpapi"
+    key_path.unlink()
+    with pytest.raises(desktop_vault.DesktopVaultError, match="does not match"):
+        desktop_recovery.restore_key(root, bundle, "a long recovery passphrase 123")
+    assert not key_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
+def test_recovery_preserves_unreadable_key_before_replacement(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    monkeypatch.setattr(desktop_vault, "_root", None)
+    monkeypatch.setattr(desktop_vault, "_master_key", None)
+    desktop_vault.initialize(root)
+    desktop_vault.write_encrypted_bytes(root / "private", b"private")
+    bundle = desktop_recovery.create_recovery_file("a long recovery passphrase 123")
+    key_path = root / ".vault" / "master.dpapi"
+    key_path.write_bytes(b"unreadable original")
+    with pytest.raises(desktop_vault.DesktopVaultError):
+        desktop_recovery.restore_key(root, bundle, "incorrect recovery passphrase")
+    assert key_path.read_bytes() == b"unreadable original"
+    desktop_recovery.restore_key(root, bundle, "a long recovery passphrase 123")
+    backups = list(key_path.parent.glob("master.dpapi.unreadable-*"))
+    assert len(backups) == 1 and backups[0].read_bytes() == b"unreadable original"
+    desktop_vault.initialize(root)
+    assert desktop_vault.read_bytes(root / "private") == b"private"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
+def test_recovery_export_must_exist_and_match_current_key(tmp_path, monkeypatch):
+    base = tmp_path / "app"
+    local = tmp_path / "local"
+    root = base / "data"
+    monkeypatch.setattr(desktop_vault, "_root", None)
+    monkeypatch.setattr(desktop_vault, "_master_key", None)
+    desktop_vault.initialize(root)
+    destination = tmp_path / "recovery.fbrecovery"
+    with pytest.raises(desktop_vault.DesktopVaultError):
+        desktop_recovery.verify_uninstall_exports(base, local)
+    with pytest.raises(desktop_vault.DesktopVaultError, match="outside"):
+        desktop_recovery.export_recovery_file(base / "inside.fbrecovery", "a long recovery passphrase 123", (base, local))
+    desktop_recovery.export_recovery_file(destination, "a long recovery passphrase 123", (base, local))
+    desktop_recovery.verify_uninstall_exports(base, local)
+    original = destination.read_bytes()
+    destination.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
+    with pytest.raises(desktop_vault.DesktopVaultError, match="cannot be verified"):
+        desktop_recovery.verify_uninstall_exports(base, local)
+    destination.write_bytes(original)
+    destination.unlink()
+    with pytest.raises(desktop_vault.DesktopVaultError, match="cannot be verified"):
+        desktop_recovery.verify_uninstall_exports(base, local)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
+def test_uninstall_requires_exports_for_all_preserved_profiles(tmp_path, monkeypatch):
+    from fbroom import desktop_profiles
+
+    base = tmp_path / "app"
+    local = tmp_path / "local"
+    base.mkdir()
+    monkeypatch.setattr(desktop_vault, "_root", None)
+    monkeypatch.setattr(desktop_vault, "_master_key", None)
+    desktop_vault.initialize(base / "data")
+    desktop_recovery.export_recovery_file(tmp_path / "original.fbrecovery", "a long recovery passphrase 123", (base, local))
+    profile = desktop_profiles.create_fresh_profile(base, "legacy")
+    desktop_vault.initialize(base / "desktop-profiles" / profile / "data")
+    with pytest.raises(desktop_vault.DesktopVaultError, match="cannot be verified"):
+        desktop_recovery.verify_uninstall_exports(base, local)
+    desktop_recovery.export_recovery_file(tmp_path / "fresh.fbrecovery", "a long recovery passphrase 123", (base, local))
+    desktop_recovery.verify_uninstall_exports(base, local)
+    desktop_profiles.select_profile(base, profile, "legacy")
+    assert desktop_profiles.selected_profile(base) == "legacy"
+    with pytest.raises(desktop_vault.DesktopVaultError, match="changed"):
+        desktop_profiles.select_profile(base, profile, "legacy")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
+def test_uninstall_rejects_redirected_app_data(tmp_path, monkeypatch):
+    base = tmp_path / "app"
+    local = tmp_path / "local"
+    base.mkdir()
+    local.mkdir()
+    redirected = local / "link"
+    redirected.write_text("synthetic", encoding="utf-8")
+    is_redirected = desktop_recovery._redirected
+    monkeypatch.setattr(desktop_recovery, "_redirected", lambda path: path == redirected or is_redirected(path))
+    with pytest.raises(desktop_vault.DesktopVaultError, match="redirected"):
+        desktop_recovery.verify_uninstall_exports(base, local)
+    assert redirected.read_text(encoding="utf-8") == "synthetic"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
+def test_recovery_authenticates_an_audit_only_vault(tmp_path, monkeypatch):
+    from fbroom import desktop_audit
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(desktop_vault, "_root", None)
+    monkeypatch.setattr(desktop_vault, "_master_key", None)
+    root = tmp_path / "data"
+    desktop_vault.initialize(root)
+    desktop_audit.append("synthetic", "test", {}, "2026-01-01")
+    bundle = desktop_recovery.create_recovery_file("a long recovery passphrase 123")
+    key_path = root / ".vault" / "master.dpapi"
+    key_path.unlink()
+    desktop_recovery.restore_key(root, bundle, "a long recovery passphrase 123")
+    desktop_vault.initialize(root)
+    assert desktop_audit.read_all()[0]["event"] == "test"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Desktop vault key protection uses Windows DPAPI")
@@ -643,9 +836,12 @@ def test_desktop_upload_source_inspection_and_join_remain_usable(tmp_path, monke
     inspection = client.post("/inspect", headers=headers, json={"path": str(left_path)})
     assert profile.status_code == 200, profile.text
     assert inspection.status_code == 200, inspection.text
-    metadata = client.post("/metadata", headers=headers, json={"path": str(left_path)})
+    with monkeypatch.context() as patch:
+        patch.setattr(fb, "generate_plain_language_suggestions", lambda metadata: [{"text": "replacement"}])
+        metadata = client.post("/metadata", headers=headers, json={"path": str(left_path)})
     assert metadata.status_code == 200, metadata.text
     assert metadata.json()["metadata"]["row_count"] == left.json()["row_count"]
+    assert metadata.json()["metadata"]["plain_language_suggestions"] == left.json()["plain_language_suggestions"]
 
     legacy_recipe = recipe_dir / "legacy.json"
     legacy_history = history_dir / "run_legacy.json"

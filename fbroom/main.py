@@ -16,7 +16,7 @@ import os
 from celery import Celery
 import threading
 import time
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from starlette.background import BackgroundTask
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -32,7 +32,10 @@ if __name__ == '__main__' and __package__ is None:
 from .connectors import resolve_source
 from . import desktop_vault
 from . import desktop_audit
+from . import desktop_profiles, desktop_recovery
 from . import desktop_remote_services as remote_services
+from .desktop_workspace import WorkspaceDirectory, account_workspace, current_account, snapshot_directory
+from .desktop_account_identity import verify_account as verify_desktop_account
 from .desktop_request_gate import DesktopRequestGate, desktop_startup_gate
 from .desktop_inspection_store import migrate_inspections, read_inspection, write_inspection
 from .engine import (
@@ -109,6 +112,8 @@ else:
 
 app = FastAPI(title="FalconBroom Prototype API")
 app.state.ready = False
+app.state.desktop_vault_missing_key = False
+app.state.desktop_vault_unlock_error = False
 # cache last generated recipe per source_path for preview fallback
 app.state.generated_recipes_cache = {}
 
@@ -432,6 +437,16 @@ async def _secure_headers_middleware(request: Request, call_next):
         supplied = request.headers.get("X-FalconBroom-Desktop-Token", "")
         if not hmac.compare_digest(supplied.encode("utf-8"), desktop_secret.encode("utf-8")):
             return Response(status_code=401, content="Desktop session required")
+    if (
+        app.state.desktop_vault_missing_key
+        and request.method != "OPTIONS"
+        and not (
+            request.url.path == "/health"
+            or (request.method == "GET" and request.url.path == "/desktop/vault/profiles")
+            or (request.method == "POST" and request.url.path in {"/desktop/vault/fresh", "/desktop/vault/restore", "/desktop/vault/select"})
+        )
+    ):
+        return JSONResponse({"detail": "Desktop vault key is missing"}, status_code=503)
     # Enforce TLS in production
     if os.environ.get('ENV') == 'production':
         try:
@@ -439,7 +454,49 @@ async def _secure_headers_middleware(request: Request, call_next):
                 return Response(status_code=400, content="HTTPS required")
         except Exception:
             pass
-    if desktop_vault.is_initialized():
+    exempt = (
+        request.method == "OPTIONS"
+        or request.url.path in {
+            "/health", "/ready", "/me", "/signup", "/login", "/refresh",
+            "/_client_log", "/desktop/remote-services", "/desktop/remote-lease",
+            "/desktop/vault/fresh", "/desktop/vault/restore", "/desktop/vault/export",
+            "/desktop/vault/profiles", "/desktop/vault/select",
+        }
+        or request.url.path.startswith("/desktop/account-workflow/")
+    )
+    scoped = (
+        not exempt
+        and _is_local_desktop_mode()
+        and bool(desktop_secret)
+        and os.environ.get("FALCONBROOM_DESKTOP_ACCOUNT_ISOLATION") == "1"
+    )
+    if scoped:
+        if not desktop_vault.is_initialized():
+            return JSONResponse({"detail": "Desktop account workspace is unavailable"}, status_code=503)
+        project = os.environ.get("FALCONBROOM_DESKTOP_ACCOUNT_URL", "")
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+                user = await verify_desktop_account(
+                    client,
+                    project,
+                    request.headers.get("X-FalconBroom-Account-Publishable-Key", ""),
+                    request.headers.get("authorization", ""),
+                )
+            if request.headers.get("X-FalconBroom-Expected-Account", "") != user["id"]:
+                raise HTTPException(status_code=409, detail="Desktop account changed; retry the operation")
+        except HTTPException as error:
+            return JSONResponse({"detail": error.detail}, status_code=error.status_code)
+        request.state.desktop_verified_user = user
+        with account_workspace(project, user["id"]):
+            try:
+                for root in (UPLOAD_DIR, OUTPUTS_DIR, RECIPES_DIR, HISTORY_DIR, INSPECTIONS_DIR):
+                    root.resolve()
+            except (OSError, ValueError):
+                logger.exception("Desktop account workspace is unavailable")
+                return JSONResponse({"detail": "Desktop account workspace is unavailable"}, status_code=503)
+            with desktop_vault.request_workspace():
+                resp = await call_next(request)
+    elif desktop_vault.is_initialized():
         with desktop_vault.request_workspace():
             resp = await call_next(request)
     else:
@@ -479,6 +536,11 @@ OUTPUTS_DIR = Path("data") / "outputs"
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 INSPECTIONS_DIR = Path("data") / "inspections"
 INSPECTIONS_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR = WorkspaceDirectory(UPLOAD_DIR)
+RECIPES_DIR = WorkspaceDirectory(RECIPES_DIR)
+HISTORY_DIR = WorkspaceDirectory(HISTORY_DIR)
+OUTPUTS_DIR = WorkspaceDirectory(OUTPUTS_DIR)
+INSPECTIONS_DIR = WorkspaceDirectory(INSPECTIONS_DIR)
 JOBS_DIR = Path("data") / "jobs"
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 PRIVACY_DIR = Path("data") / "privacy"
@@ -486,12 +548,18 @@ PRIVACY_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _record_files(root: Path, pattern: str = "*.json"):
+    if current_account() is not None:
+        for path in root.iterdir():
+            if path.is_symlink():
+                raise HTTPException(status_code=409, detail="Desktop account records are redirected")
     if desktop_vault.is_initialized():
         return [path for path in desktop_vault.logical_files(root) if path.match(pattern)]
     return list(root.glob(pattern))
 
 
 def _read_record(path: Path):
+    if current_account() is not None and (path.is_symlink() or desktop_vault.encrypted_path(path).is_symlink()):
+        raise HTTPException(status_code=409, detail="Desktop account record is redirected")
     return json.loads(desktop_vault.read_text(path))
 
 
@@ -578,6 +646,8 @@ def _outputs_watcher(poll_interval: float = 5.0):
     """Background thread that polls OUTPUTS_DIR for new join-like files and ingests them into HISTORY_DIR.
     Runs in a daemon thread started at app startup.
     """
+    if os.environ.get("FALCONBROOM_DESKTOP_ACCOUNT_ISOLATION") == "1":
+        return
     try:
         seen = set()
         # initialize seen set from existing outputs
@@ -811,7 +881,102 @@ class SnapshotRollbackSpec(BaseModel):
 
 @app.get("/health")
 def health():
+    if app.state.desktop_vault_missing_key:
+        code = "vault_key_unavailable" if app.state.desktop_vault_unlock_error else "vault_key_missing"
+        return JSONResponse({"status": "error", "code": code}, status_code=503)
     return {"status": "ok"}
+
+
+@app.post("/desktop/vault/fresh")
+def start_fresh_desktop_vault(payload: dict):
+    if not app.state.desktop_vault_missing_key or not _is_local_desktop_mode() or not desktop_vault.is_desktop_enabled():
+        raise HTTPException(status_code=409, detail="A fresh start is not available")
+    if payload != {"confirmation": "START FRESH"}:
+        raise HTTPException(status_code=400, detail="Confirm the fresh start")
+    base = os.environ.get("FALCONBROOM_DESKTOP_PROFILE_BASE")
+    profile = os.environ.get("FALCONBROOM_DESKTOP_PROFILE")
+    if not base or not profile:
+        raise HTTPException(status_code=503, detail="Desktop profile coordination is unavailable")
+    try:
+        desktop_profiles.create_fresh_profile(Path(base), profile)
+    except (desktop_vault.DesktopVaultError, OSError) as error:
+        logger.exception("Could not create a fresh desktop profile")
+        raise HTTPException(status_code=409, detail="Could not create a fresh profile; existing data was preserved") from error
+    return {"status": "restart_required"}
+
+
+@app.get("/desktop/vault/profiles")
+def get_desktop_vault_profiles():
+    if not _is_local_desktop_mode() or not desktop_vault.is_desktop_enabled():
+        raise HTTPException(status_code=404, detail="Not available")
+    base = os.environ.get("FALCONBROOM_DESKTOP_PROFILE_BASE")
+    current = os.environ.get("FALCONBROOM_DESKTOP_PROFILE")
+    if not base or not current:
+        raise HTTPException(status_code=503, detail="Desktop profile coordination is unavailable")
+    try:
+        return {"current": current, "profiles": desktop_profiles.list_profiles(Path(base))}
+    except (desktop_vault.DesktopVaultError, OSError) as error:
+        logger.exception("Could not list desktop profiles")
+        raise HTTPException(status_code=503, detail="Could not list desktop profiles") from error
+
+
+@app.post("/desktop/vault/select")
+def select_desktop_vault_profile(payload: dict):
+    if not _is_local_desktop_mode() or not desktop_vault.is_desktop_enabled():
+        raise HTTPException(status_code=404, detail="Not available")
+    if set(payload) != {"profile", "confirmation"} or payload["confirmation"] != "OPEN PROFILE" or not isinstance(payload["profile"], str):
+        raise HTTPException(status_code=400, detail="Confirm the profile selection")
+    base = os.environ.get("FALCONBROOM_DESKTOP_PROFILE_BASE")
+    current = os.environ.get("FALCONBROOM_DESKTOP_PROFILE")
+    if not base or not current:
+        raise HTTPException(status_code=503, detail="Desktop profile coordination is unavailable")
+    try:
+        desktop_profiles.select_profile(Path(base), current, payload["profile"])
+    except (desktop_vault.DesktopVaultError, OSError) as error:
+        logger.exception("Could not select desktop profile")
+        raise HTTPException(status_code=409, detail="Could not select profile; existing data was preserved") from error
+    return {"status": "restart_required"}
+
+
+@app.post("/desktop/vault/export")
+def export_desktop_vault(payload: dict):
+    if not _is_local_desktop_mode() or not desktop_vault.is_desktop_enabled() or not desktop_vault.is_initialized():
+        raise HTTPException(status_code=404, detail="Not available")
+    if set(payload) != {"destination", "passphrase"} or not isinstance(payload["destination"], str):
+        raise HTTPException(status_code=400, detail="Invalid recovery export request")
+    base = os.environ.get("FALCONBROOM_DESKTOP_PROFILE_BASE")
+    local = os.environ.get("LOCALAPPDATA")
+    if not base or not local:
+        raise HTTPException(status_code=503, detail="Desktop recovery coordination is unavailable")
+    try:
+        desktop_recovery.export_recovery_file(
+            Path(payload["destination"]), payload["passphrase"],
+            (Path(base), Path(local) / "com.falconbroom.ui"),
+        )
+    except desktop_vault.DesktopVaultError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    except (OSError, ValueError) as error:
+        logger.exception("Could not save desktop recovery file")
+        raise HTTPException(status_code=500, detail="Could not save recovery file; choose another destination") from error
+    return {"status": "saved"}
+
+
+@app.post("/desktop/vault/restore")
+def restore_desktop_vault(payload: dict):
+    if not app.state.desktop_vault_missing_key or not _is_local_desktop_mode() or not desktop_vault.is_desktop_enabled():
+        raise HTTPException(status_code=409, detail="Vault recovery is not available")
+    import base64
+    import binascii
+    if set(payload) != {"recovery_file", "passphrase"} or not isinstance(payload["recovery_file"], str):
+        raise HTTPException(status_code=400, detail="Invalid recovery request")
+    if len(payload["recovery_file"]) > 256:
+        raise HTTPException(status_code=400, detail="Invalid recovery file")
+    try:
+        bundle = base64.b64decode(payload["recovery_file"], validate=True)
+        desktop_recovery.restore_key(Path.cwd() / "data", bundle, payload["passphrase"])
+    except (binascii.Error, ValueError, desktop_vault.DesktopVaultError, OSError) as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {"status": "restart_required"}
 
 
 @app.get("/ready")
@@ -1238,11 +1403,9 @@ def metadata(spec: SourceSpec, request: Request):
         except Exception:
             pass
 
-        # generate plain-language suggestions using ingest helper
-        try:
+        # Preserve the upload-time suggestions; older metadata may not have them.
+        if not isinstance(metadata.get('plain_language_suggestions'), list):
             metadata['plain_language_suggestions'] = generate_plain_language_suggestions(metadata)
-        except Exception:
-            metadata.setdefault('plain_language_suggestions', [])
 
         return {"metadata": metadata}
     except HTTPException:
@@ -2049,6 +2212,9 @@ def _recipe_path(rid: str) -> Path:
 def _require_owned_recipe_source(source_path: str, user: dict):
     if not user or not user.get("id"):
         raise HTTPException(status_code=401, detail="Authentication required")
+    if desktop_vault.is_initialized():
+        _require_owned_file(source_path, user)
+        return
     upload_root = UPLOAD_DIR.resolve()
     try:
         resolved = Path(source_path).resolve(strict=True)
@@ -2069,6 +2235,11 @@ def _require_owned_recipe_source(source_path: str, user: dict):
 
 
 def _file_access_user(request: Request):
+    verified = getattr(request.state, "desktop_verified_user", None) if request is not None else None
+    if verified is not None:
+        return verified
+    if _is_local_desktop_mode() and os.environ.get("FALCONBROOM_DESKTOP_ACCOUNT_ISOLATION") == "1":
+        raise HTTPException(status_code=401, detail="Verified desktop account required")
     if _is_local_desktop_mode() and os.environ.get("ENV", "").strip().lower() != "production":
         return None
     user = _require_auth(request)
@@ -2089,6 +2260,8 @@ def _require_owned_file(path: str, user: Optional[dict], roots=None):
         ):
             raise ValueError("Invalid file path")
         metadata_path = resolved.with_name(f"{resolved.name}.meta.json")
+        if metadata_path.is_symlink() or desktop_vault.encrypted_path(metadata_path).is_symlink():
+            raise ValueError("Invalid metadata path")
         metadata = json.loads(desktop_vault.read_text(metadata_path))
         if not isinstance(metadata, dict) or not isinstance(metadata.get("owner"), dict):
             raise ValueError("Invalid metadata")
@@ -2191,7 +2364,7 @@ def _write_snapshot_owner(result, user: Optional[dict]):
     if not isinstance(snapshot, dict) or not snapshot.get("path"):
         return
     path = Path(snapshot["path"]).resolve()
-    if not path.is_relative_to((HISTORY_DIR / "snapshots").resolve()):
+    if not path.is_relative_to(snapshot_directory(HISTORY_DIR).resolve()):
         raise HTTPException(status_code=500, detail="Invalid snapshot path")
     if not desktop_vault.exists(path):
         raise HTTPException(status_code=500, detail="Snapshot not found")
@@ -2230,8 +2403,13 @@ def _require_recipe_sources_owned(recipe, user: Optional[dict]):
     steps = recipe.get("cleaning_steps") if isinstance(recipe, dict) else getattr(recipe, "cleaning_steps", None)
     for step in steps or []:
         params = step.get("params") if isinstance(step, dict) else getattr(step, "params", None)
+        action = step.get("action") if isinstance(step, dict) else getattr(step, "action", None)
         if not isinstance(params, dict):
             continue
+        if current_account() is not None and action in ("external_lookup", "lookup_join") and params.get("mode") == "sqlite":
+            if not isinstance(params.get("db"), str) or not params["db"]:
+                raise HTTPException(status_code=400, detail="A managed SQLite database is required")
+            _require_owned_file(params["db"], user, (UPLOAD_DIR, OUTPUTS_DIR))
         for key in ("right", "right_path"):
             if params.get(key):
                 _require_owned_file(str(params[key]), user)
@@ -2716,7 +2894,7 @@ def run_recipe(rid: str, request: Request, export_format: str = "csv"):
 @app.post("/history/snapshots/cleanup")
 def cleanup_snapshots(spec: SnapshotCleanupSpec, request: Request):
     try:
-        if _file_access_user(request):
+        if _file_access_user(request) and current_account() is None:
             raise HTTPException(status_code=403, detail="Remote snapshot cleanup is not supported")
         res = cleaner.cleanup_snapshots(spec.days)
         return {"cleanup": res}
@@ -2729,26 +2907,36 @@ def cleanup_snapshots(spec: SnapshotCleanupSpec, request: Request):
 @app.post("/history/snapshots/rollback")
 def rollback_snapshot(spec: SnapshotRollbackSpec, request: Request):
     try:
-        if _file_access_user(request):
+        user = _file_access_user(request)
+        if user and current_account() is None:
             raise HTTPException(status_code=403, detail="Remote snapshot rollback is not supported")
         snap = Path(spec.snapshot_path)
         # allow both absolute and snapshots dir-relative paths
-        snaps_dir = Path("data") / "history" / "snapshots"
+        snaps_dir = snapshot_directory(HISTORY_DIR)
         if not desktop_vault.exists(snap):
             candidate = snaps_dir / spec.snapshot_path
             if desktop_vault.exists(candidate):
                 snap = candidate
         if not desktop_vault.exists(snap):
             raise HTTPException(status_code=404, detail=f"Snapshot not found: {spec.snapshot_path}")
+        if user:
+            snap = _require_owned_file(str(snap), user, (snaps_dir,))
 
         # copy into outputs as a rollback artifact
         dest_name = spec.dest_name or f"rollback_snapshot_{uuid4().hex[:8]}_{snap.name}"
+        if user and (Path(dest_name).name != dest_name or dest_name in {"", ".", ".."}):
+            raise HTTPException(status_code=400, detail="Invalid rollback filename")
         dest_path = OUTPUTS_DIR / dest_name
+        if user and (desktop_vault.exists(dest_path) or dest_path.is_symlink() or desktop_vault.encrypted_path(dest_path).is_symlink()):
+            raise HTTPException(status_code=409, detail="Rollback output already exists")
         readable = desktop_vault.materialize(snap) if desktop_vault.is_initialized() else snap
         desktop_vault.copy_to_managed_output(readable, dest_path)
+        _write_file_owner(dest_path, user)
         _seal_desktop_artifact(dest_path)
 
         record = {"rollback_snapshot": str(snap), "performed_at": datetime.now(timezone.utc).isoformat().replace('+00:00','Z'), "rollback_path": str(dest_path)}
+        if user:
+            record["owner"] = {"user_id": str(user["id"])}
         out = HISTORY_DIR / f"rollback_snapshot_{uuid4().hex[:8]}.json"
         _write_record(out, record)
         return {"rollback": record}
@@ -5743,6 +5931,9 @@ def _make_invite_token(inviter_id: str, invitee_email: str, team_name: Optional[
 
 
 def _require_auth(request: Request):
+    verified = getattr(request.state, "desktop_verified_user", None)
+    if verified is not None:
+        return verified
     auth = request.headers.get("authorization") or request.headers.get("Authorization")
     if not auth or not auth.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
@@ -5764,7 +5955,9 @@ def _require_job_auth(request: Request):
 
 
 def _require_team_features():
-    if not TEAM_FEATURES_ENABLED:
+    if not TEAM_FEATURES_ENABLED or (
+        _is_local_desktop_mode() and os.environ.get("FALCONBROOM_DESKTOP_ACCOUNT_ISOLATION") == "1"
+    ):
         raise HTTPException(status_code=404, detail="Team and sharing features are disabled")
 
 
@@ -6206,7 +6399,8 @@ def dsar_request(request: Request, payload: dict):
             try:
                 import zipfile
                 export_path = OUTPUTS_DIR / f"{dsar_id}.zip"
-                with zipfile.ZipFile(export_path, "w") as zf:
+                staged_export = desktop_vault.stage_managed_output(export_path) if current_account() is not None else export_path
+                with zipfile.ZipFile(staged_export, "w") as zf:
                     # include user profile
                     ufile = _users_dir() / f"{user.get('id')}.json"
                     if ufile.exists():
@@ -6227,6 +6421,9 @@ def dsar_request(request: Request, payload: dict):
                                 zf.write(str(f), arcname=f.name)
                     except Exception:
                         pass
+                if current_account() is not None:
+                    desktop_vault.publish_staged_output(staged_export, export_path)
+                    _write_file_owner(export_path, user)
                 record["export_path"] = str(export_path)
                 record["status"] = "completed"
                 out.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -6315,7 +6512,10 @@ def clear_desktop_workspace(payload: dict, request: Request):
         raise HTTPException(status_code=403, detail="Only available in the packaged desktop app")
     if payload.get("confirm_text") != "DELETE LOCAL WORKSPACE":
         raise HTTPException(status_code=400, detail="Confirmation text mismatch")
-    roots = (UPLOAD_DIR, OUTPUTS_DIR, RECIPES_DIR, HISTORY_DIR, INSPECTIONS_DIR)
+    roots = tuple(
+        root.base if isinstance(root, WorkspaceDirectory) else root
+        for root in (UPLOAD_DIR, OUTPUTS_DIR, RECIPES_DIR, HISTORY_DIR, INSPECTIONS_DIR)
+    )
     data_dir = Path.cwd().resolve() / "data"
     if data_dir.resolve() != data_dir:
         raise HTTPException(status_code=409, detail="Data directory is redirected; cleanup stopped")
@@ -6350,7 +6550,8 @@ def protect_desktop_inspections(payload: dict, request: Request):
     if payload.get("confirm_text") != "PROTECT INSPECTIONS":
         raise HTTPException(status_code=400, detail="Confirmation text mismatch")
     try:
-        migrated = migrate_inspections(INSPECTIONS_DIR)
+        root = INSPECTIONS_DIR.base if isinstance(INSPECTIONS_DIR, WorkspaceDirectory) else INSPECTIONS_DIR
+        migrated = migrate_inspections(root)
     except (OSError, ValueError, RuntimeError) as error:
         logger.exception("Inspection migration failed")
         raise HTTPException(status_code=500, detail="Inspection migration incomplete; check your backup and retry") from error
@@ -8298,7 +8499,9 @@ def privacy_record(payload: dict):
 
 @app.websocket("/ws/shared")
 async def ws_shared(websocket: WebSocket):
-    if not TEAM_FEATURES_ENABLED:
+    if app.state.desktop_vault_missing_key or not TEAM_FEATURES_ENABLED or (
+        _is_local_desktop_mode() and os.environ.get("FALCONBROOM_DESKTOP_ACCOUNT_ISOLATION") == "1"
+    ):
         await websocket.close(code=1008)
         return
     token = websocket.query_params.get("token") or ""
@@ -8337,7 +8540,19 @@ async def me(request: Request):
             if _TEST_DELETION_MARKER.read_text(encoding="utf-8") != user["id"]:
                 raise HTTPException(status_code=409, detail="Another desktop deletion is pending")
             return {"id": user["id"], "username": user["id"]}
+        verified = None
+        if _is_local_desktop_mode() and os.environ.get("FALCONBROOM_REQUIRE_VERIFIED_ACCOUNT") == "1":
+            project_url = os.environ.get("FALCONBROOM_DESKTOP_ACCOUNT_URL", "")
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+                verified = await verify_desktop_account(
+                    client,
+                    project_url,
+                    request.headers.get("X-FalconBroom-Account-Publishable-Key", ""),
+                    request.headers.get("authorization", ""),
+                )
         user = _require_auth(request)
+        if verified is not None and str(user.get("id")) != verified["id"]:
+            raise HTTPException(status_code=401, detail="Account identity does not match")
         # don't expose password data
         safe = {k: v for k, v in user.items() if k not in ("pw_hash", "pw_salt")}
         if not TEAM_FEATURES_ENABLED:
@@ -8349,6 +8564,90 @@ async def me(request: Request):
     except Exception as e:
         logger.exception("Unhandled error in /me route")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _desktop_account_workflow_path(project_url: str, user_id: str, kind: str) -> Path:
+    if kind not in {"checkpoints", "drafts", "history"}:
+        raise HTTPException(status_code=404, detail="Workflow data not found")
+    root = Path.cwd().resolve() / "data"
+    project = hashlib.sha256(project_url.rstrip("/").lower().encode("utf-8")).hexdigest()
+    components = (root, root / "account_workflows", root / "account_workflows" / project,
+                  root / "account_workflows" / project / str(UUID(user_id)))
+    for directory in components:
+        if directory.is_symlink() or directory.resolve() != directory:
+            raise HTTPException(status_code=409, detail="Workflow storage is redirected")
+        directory.mkdir(exist_ok=True)
+    path = components[-1] / f"{kind}.json"
+    if path.exists() or path.is_symlink() or desktop_vault.encrypted_path(path).is_symlink():
+        raise HTTPException(status_code=409, detail="Workflow storage requires review")
+    return path
+
+
+async def _verified_desktop_workflow_path(request: Request, kind: str) -> Path:
+    if (
+        not _is_local_desktop_mode()
+        or not os.environ.get("FALCONBROOM_DESKTOP_SECRET")
+        or os.environ.get("FALCONBROOM_REQUIRE_VERIFIED_ACCOUNT") != "1"
+        or not desktop_vault.is_initialized()
+    ):
+        raise HTTPException(status_code=503, detail="Verified desktop workflow storage is unavailable")
+    project_url = os.environ.get("FALCONBROOM_DESKTOP_ACCOUNT_URL", "")
+    async with httpx.AsyncClient(timeout=15.0, follow_redirects=False) as client:
+        user = await verify_desktop_account(
+            client,
+            project_url,
+            request.headers.get("X-FalconBroom-Account-Publishable-Key", ""),
+            request.headers.get("authorization", ""),
+        )
+    expected_account = request.headers.get("X-FalconBroom-Expected-Account", "")
+    if expected_account != user["id"]:
+        raise HTTPException(status_code=409, detail="Desktop account changed; reload workflow data")
+    return _desktop_account_workflow_path(project_url, user["id"], kind)
+
+
+def _read_desktop_account_workflow(path: Path, kind: str):
+    if not desktop_vault.encrypted_path(path).exists():
+        return {"data": {} if kind == "drafts" else [], "revision": None}
+    try:
+        raw = desktop_vault.read_bytes(path)
+        data = json.loads(raw)
+    except (OSError, ValueError, desktop_vault.DesktopVaultError) as error:
+        logger.exception("Could not read encrypted account workflow data")
+        raise HTTPException(status_code=500, detail="Could not read account workflow data") from error
+    expected = dict if kind == "drafts" else list
+    if not isinstance(data, expected):
+        raise HTTPException(status_code=500, detail="Invalid account workflow data")
+    return {"data": data, "revision": hashlib.sha256(raw).hexdigest()}
+
+
+@app.get("/desktop/account-workflow/{kind}")
+async def read_desktop_account_workflow(kind: str, request: Request):
+    path = await _verified_desktop_workflow_path(request, kind)
+    return _read_desktop_account_workflow(path, kind)
+
+
+@app.put("/desktop/account-workflow/{kind}")
+async def write_desktop_account_workflow(kind: str, request: Request, payload: dict):
+    path = await _verified_desktop_workflow_path(request, kind)
+    expected = dict if kind == "drafts" else list
+    if set(payload) != {"data", "revision"} or not isinstance(payload["data"], expected):
+        raise HTTPException(status_code=400, detail="Invalid account workflow data")
+    revision = payload["revision"]
+    if revision is not None and (
+        not isinstance(revision, str) or not re.fullmatch(r"[a-f0-9]{64}", revision)
+    ):
+        raise HTTPException(status_code=400, detail="Invalid account workflow revision")
+    raw = json.dumps(payload["data"], ensure_ascii=False).encode("utf-8")
+    if len(raw) > 16 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Account workflow data is too large")
+    if _read_desktop_account_workflow(path, kind)["revision"] != revision:
+        raise HTTPException(status_code=409, detail="Account workflow data changed; reload before saving")
+    try:
+        desktop_vault.write_encrypted_bytes(path, raw)
+    except (OSError, desktop_vault.DesktopVaultError) as error:
+        logger.exception("Could not save encrypted account workflow data")
+        raise HTTPException(status_code=500, detail="Could not save account workflow data") from error
+    return {"ok": True, "revision": hashlib.sha256(raw).hexdigest()}
 
 
 @app.get("/team/invites")

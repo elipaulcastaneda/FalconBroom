@@ -90,3 +90,92 @@ test('loading page waits for the local coordinator in remote mode', async () => 
   assert.equal(healthUrl, local + '/health')
   assert.equal(destination, 'index.html')
 })
+
+test('loading page explains a missing vault key without opening the app', async () => {
+  const source = loadingPage.match(/<script>([\s\S]*?)<\/script>/)[1]
+  const elements = new Map()
+  const element = id => {
+    if (!elements.has(id)) elements.set(id, {
+      textContent: '', hidden: true, value: '', files: [],
+      addEventListener(name, callback) { this[name] = callback },
+      appendChild() {},
+    })
+    return elements.get(id)
+  }
+  const document = { body: { className: '' }, getElementById: element, createElement: () => ({}) }
+  let destination
+  const context = {
+    window: {__FALCONBROOM_CONTROL_URL: local},
+    fetch: async url => url.endsWith('/health')
+      ? new Response(JSON.stringify({code: 'vault_key_missing'}), {status: 503})
+      : new Response(JSON.stringify({current: 'legacy', profiles: ['legacy']}), {status: 200}),
+    location: {replace: value => { destination = value }},
+    document,
+    Date,
+    setTimeout: () => { throw new Error('Missing key must not retry') },
+  }
+  vm.runInNewContext(source, context)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(document.body.className, 'error')
+  assert.match(element('msg').textContent, /key is missing/)
+  assert.equal(element('recovery').hidden, false)
+  assert.equal(destination, undefined)
+})
+
+test('loading page retries unrelated service-unavailable responses', async () => {
+  const source = loadingPage.match(/<script>([\s\S]*?)<\/script>/)[1]
+  let attempts = 0
+  let destination
+  const context = {
+    window: {__FALCONBROOM_CONTROL_URL: local},
+    fetch: async () => ++attempts === 1
+      ? new Response(JSON.stringify({detail: 'busy'}), {status: 503})
+      : new Response('', {status: 200}),
+    location: {replace: value => { destination = value }},
+    document: {body: {className: ''}, getElementById: () => ({textContent: ''})},
+    Date,
+    setTimeout: callback => callback(),
+  }
+  vm.runInNewContext(source, context)
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(attempts, 2)
+  assert.equal(destination, 'index.html')
+})
+
+test('fresh start requires explicit confirmation before selecting a new profile', async () => {
+  const source = loadingPage.match(/<script>([\s\S]*?)<\/script>/)[1]
+  const elements = new Map()
+  const element = id => {
+    if (!elements.has(id)) elements.set(id, {
+      textContent: '', hidden: true, value: '', files: [],
+      addEventListener(name, callback) { this[name] = callback },
+      appendChild() {},
+    })
+    return elements.get(id)
+  }
+  const requests = []
+  const context = {
+    window: {__FALCONBROOM_CONTROL_URL: local},
+    fetch: async (url, init) => {
+      requests.push({url, init})
+      if (url.endsWith('/health')) return new Response(JSON.stringify({code: 'vault_key_missing'}), {status: 503})
+      if (url.endsWith('/profiles')) return new Response(JSON.stringify({current: 'legacy', profiles: ['legacy']}))
+      return new Response(JSON.stringify({status: 'restart_required'}))
+    },
+    document: {body: {className: ''}, getElementById: element, createElement: () => ({})},
+    location: {replace() { throw new Error('Must not open the app') }},
+    Date,
+  }
+  vm.runInNewContext(source, context)
+  await new Promise(resolve => setImmediate(resolve))
+  element('fresh').click()
+  assert.match(element('recovery-status').textContent, /START FRESH/)
+  assert.equal(requests.filter(request => request.url.endsWith('/fresh')).length, 0)
+  element('fresh-confirm').value = 'START FRESH'
+  element('fresh').click()
+  await new Promise(resolve => setImmediate(resolve))
+  const fresh = requests.find(request => request.url.endsWith('/fresh'))
+  assert.deepEqual(JSON.parse(fresh.init.body), {confirmation: 'START FRESH'})
+  assert.equal(element('recovery').hidden, true)
+  assert.match(element('msg').textContent, /restart/)
+})
